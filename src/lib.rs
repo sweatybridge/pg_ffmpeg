@@ -1,9 +1,33 @@
+use pgrx::prelude::*;
+
 ::pgrx::pg_module_magic!();
 
 mod extract_audio;
+mod hls;
 mod media_info;
 mod thumbnail;
 mod transcode;
+
+extension_sql!(
+    r#"
+CREATE TABLE pg_ffmpeg.hls_playlists (
+    id              bigserial PRIMARY KEY,
+    target_duration int NOT NULL,
+    media_sequence  int NOT NULL
+);
+
+CREATE TABLE pg_ffmpeg.hls_segments (
+    id            bigserial PRIMARY KEY,
+    playlist_id   bigint NOT NULL REFERENCES pg_ffmpeg.hls_playlists(id),
+    segment_index int NOT NULL,
+    duration      float8 NOT NULL,
+    data          bytea NOT NULL
+);
+
+CREATE INDEX ON pg_ffmpeg.hls_segments (playlist_id);
+"#,
+    name = "create_hls_tables",
+);
 
 /// Write bytea data to a temporary file with the given suffix.
 pub fn write_to_tempfile(
