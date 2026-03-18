@@ -1,8 +1,66 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use std::fs;
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ptr;
 
 use crate::write_to_tempfile;
+
+use ffmpeg_next::sys::{
+    av_free, avformat_alloc_output_context2, avio_close_dyn_buf, avio_open_dyn_buf, AVDictionary,
+    AVFormatContext, AVIOContext,
+};
+
+/// Shared state for custom HLS I/O callbacks.
+struct HlsIoState {
+    /// Completed files: (filename, data). Last entry wins for duplicates.
+    completed: Vec<(String, Vec<u8>)>,
+    /// Currently open AVIO contexts: ptr address -> filename.
+    open_contexts: HashMap<usize, String>,
+}
+
+/// Custom `io_open` callback: creates an in-memory AVIO context instead of a file.
+unsafe extern "C" fn hls_io_open(
+    s: *mut AVFormatContext,
+    pb: *mut *mut AVIOContext,
+    url: *const c_char,
+    _flags: c_int,
+    _options: *mut *mut AVDictionary,
+) -> c_int {
+    let state = &mut *((*s).opaque as *mut HlsIoState);
+    let filename = CStr::from_ptr(url).to_string_lossy().into_owned();
+
+    let ret = avio_open_dyn_buf(pb);
+    if ret < 0 {
+        return ret;
+    }
+
+    state.open_contexts.insert(*pb as usize, filename);
+    0
+}
+
+/// Custom `io_close2` callback: collects the in-memory buffer into `completed`.
+unsafe extern "C" fn hls_io_close2(
+    s: *mut AVFormatContext,
+    pb: *mut AVIOContext,
+) -> c_int {
+    let state = &mut *((*s).opaque as *mut HlsIoState);
+
+    let mut buf: *mut u8 = ptr::null_mut();
+    let size = avio_close_dyn_buf(pb, &mut buf);
+
+    if let Some(filename) = state.open_contexts.remove(&(pb as usize)) {
+        if size > 0 {
+            let data = std::slice::from_raw_parts(buf, size as usize).to_vec();
+            state.completed.push((filename, data));
+        }
+    }
+
+    if !buf.is_null() {
+        av_free(buf as *mut c_void);
+    }
+    0
+}
 
 /// Parsed segment info from m3u8 playlist.
 struct SegmentInfo {
@@ -17,7 +75,7 @@ struct PlaylistInfo {
     segments: Vec<SegmentInfo>,
 }
 
-/// Parse an m3u8 playlist file into structured data.
+/// Parse an m3u8 playlist string into structured data.
 fn parse_m3u8(content: &str) -> PlaylistInfo {
     let mut target_duration = 0i32;
     let mut media_sequence = 0i32;
@@ -54,24 +112,39 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
 fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
 
+    // Input still needs a temp file (FFmpeg requires a file path)
     let input_tmp = write_to_tempfile(&data, ".input")
         .unwrap_or_else(|e| error!("failed to write input temp file: {e}"));
-
-    let tmp_dir = tempfile::TempDir::new()
-        .unwrap_or_else(|e| error!("failed to create temp directory: {e}"));
-
-    let playlist_path = tmp_dir.path().join("playlist.m3u8");
-    let seg_pattern = tmp_dir
-        .path()
-        .join("seg%03d.ts")
-        .to_string_lossy()
-        .to_string();
 
     let mut ictx = ffmpeg_next::format::input(input_tmp.path())
         .unwrap_or_else(|e| error!("failed to open input: {e}"));
 
-    let mut octx = ffmpeg_next::format::output_as(&playlist_path, "hls")
-        .unwrap_or_else(|e| error!("failed to create HLS output context: {e}"));
+    // Allocate HLS output context with custom in-memory I/O (no temp files)
+    let mut state = Box::new(HlsIoState {
+        completed: Vec::new(),
+        open_contexts: HashMap::new(),
+    });
+
+    let mut octx = unsafe {
+        let mut ps: *mut AVFormatContext = ptr::null_mut();
+        let format = std::ffi::CString::new("hls").unwrap();
+
+        let ret = avformat_alloc_output_context2(
+            &mut ps,
+            ptr::null_mut(),
+            format.as_ptr(),
+            ptr::null(),
+        );
+        if ret < 0 || ps.is_null() {
+            error!("failed to allocate HLS output context");
+        }
+
+        (*ps).io_open = Some(hls_io_open);
+        (*ps).io_close2 = Some(hls_io_close2);
+        (*ps).opaque = &mut *state as *mut HlsIoState as *mut c_void;
+
+        ffmpeg_next::format::context::Output::wrap(ps)
+    };
 
     // Copy all streams (remux without re-encoding)
     let mut stream_mapping = vec![];
@@ -96,7 +169,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     // Configure HLS options
     let mut opts = ffmpeg_next::Dictionary::new();
     opts.set("hls_time", &segment_duration.to_string());
-    opts.set("hls_segment_filename", &seg_pattern);
+    opts.set("hls_segment_filename", "seg%03d.ts");
     opts.set("hls_list_size", "0");
 
     octx.write_header_with(opts)
@@ -119,19 +192,31 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    // Parse the m3u8 playlist
-    let m3u8_content = fs::read_to_string(&playlist_path)
-        .unwrap_or_else(|e| error!("failed to read m3u8 playlist: {e}"));
+    // Drop output context before consuming state
+    drop(octx);
+
+    let HlsIoState { completed, .. } = *state;
+
+    // Parse the m3u8 playlist from in-memory buffers
+    let m3u8_content = completed
+        .iter()
+        .rev()
+        .find(|(name, _)| name.ends_with(".m3u8"))
+        .map(|(_, data)| String::from_utf8_lossy(data).into_owned())
+        .unwrap_or_else(|| error!("no m3u8 playlist found in output"));
+
     let playlist_info = parse_m3u8(&m3u8_content);
 
-    // Read segment files
-    let mut segment_data: Vec<(f64, Vec<u8>)> = Vec::new();
-    for seg in &playlist_info.segments {
-        let seg_path = tmp_dir.path().join(&seg.filename);
-        let data = fs::read(&seg_path)
-            .unwrap_or_else(|e| error!("failed to read segment {}: {e}", seg.filename));
-        segment_data.push((seg.duration, data));
-    }
+    // Build lookup of segment data by filename
+    let segment_files: HashMap<&str, &[u8]> = completed
+        .iter()
+        .filter(|(name, _)| name.ends_with(".ts"))
+        .map(|(name, data)| {
+            // Strip any path prefix, keep just the filename
+            let basename = name.rsplit('/').next().unwrap_or(name);
+            (basename, data.as_slice())
+        })
+        .collect();
 
     // Insert into database via SPI
     Spi::connect_mut(|client| {
@@ -150,7 +235,11 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
             .unwrap_or_else(|e| error!("failed to get playlist id: {e}"))
             .unwrap_or_else(|| error!("playlist id was null"));
 
-        for (i, (duration, data)) in segment_data.into_iter().enumerate() {
+        for (i, seg) in playlist_info.segments.iter().enumerate() {
+            let seg_data = segment_files
+                .get(seg.filename.as_str())
+                .unwrap_or_else(|| error!("missing segment data for {}", seg.filename));
+
             client
                 .update(
                     "INSERT INTO pg_ffmpeg.hls_segments (playlist_id, segment_index, duration, data) VALUES ($1, $2, $3, $4)",
@@ -158,8 +247,8 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
                     &[
                         DatumWithOid::from(playlist_id),
                         DatumWithOid::from(i as i32),
-                        DatumWithOid::from(duration),
-                        DatumWithOid::from(data),
+                        DatumWithOid::from(seg.duration),
+                        DatumWithOid::from(seg_data.to_vec()),
                     ],
                 )
                 .unwrap_or_else(|e| error!("failed to insert segment {i}: {e}"));
