@@ -4,14 +4,55 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
-use crate::write_to_tempfile;
-
 use ffmpeg_next::sys::{
-    av_free, avformat_alloc_output_context2, avio_close_dyn_buf, avio_open_dyn_buf, AVDictionary,
-    AVFormatContext, AVIOContext,
+    av_free, av_malloc, avformat_alloc_context, avformat_alloc_output_context2,
+    avformat_find_stream_info, avformat_open_input, avio_alloc_context, avio_close_dyn_buf,
+    avio_context_free, avio_open_dyn_buf, AVDictionary, AVFormatContext, AVIOContext, AVSEEK_SIZE,
 };
 
-/// Shared state for custom HLS I/O callbacks.
+const AVIO_BUF_SIZE: c_int = 4096;
+
+// --- Input AVIO: read from in-memory buffer ---
+
+/// State for the input read AVIO callbacks.
+struct InputIoState {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+unsafe extern "C" fn input_read(opaque: *mut c_void, buf: *mut u8, buf_size: c_int) -> c_int {
+    let state = &mut *(opaque as *mut InputIoState);
+    let remaining = state.data.len() - state.pos;
+    let to_read = std::cmp::min(remaining, buf_size as usize);
+    if to_read == 0 {
+        return ffmpeg_next::sys::AVERROR_EOF;
+    }
+    ptr::copy_nonoverlapping(state.data.as_ptr().add(state.pos), buf, to_read);
+    state.pos += to_read;
+    to_read as c_int
+}
+
+unsafe extern "C" fn input_seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
+    let state = &mut *(opaque as *mut InputIoState);
+    if whence == AVSEEK_SIZE {
+        return state.data.len() as i64;
+    }
+    let new_pos = match whence & 0xFF {
+        0 => offset,                         // SEEK_SET
+        1 => state.pos as i64 + offset,      // SEEK_CUR
+        2 => state.data.len() as i64 + offset, // SEEK_END
+        _ => return -1,
+    };
+    if new_pos < 0 || new_pos > state.data.len() as i64 {
+        return -1;
+    }
+    state.pos = new_pos as usize;
+    new_pos
+}
+
+// --- Output AVIO: HLS muxer writes segments to memory ---
+
+/// Shared state for custom HLS output I/O callbacks.
 struct HlsIoState {
     /// Completed files: (filename, data). Last entry wins for duplicates.
     completed: Vec<(String, Vec<u8>)>,
@@ -62,20 +103,19 @@ unsafe extern "C" fn hls_io_close2(
     0
 }
 
-/// Parsed segment info from m3u8 playlist.
+// --- m3u8 parsing ---
+
 struct SegmentInfo {
     filename: String,
     duration: f64,
 }
 
-/// Parsed m3u8 playlist metadata.
 struct PlaylistInfo {
     target_duration: i32,
     media_sequence: i32,
     segments: Vec<SegmentInfo>,
 }
 
-/// Parse an m3u8 playlist string into structured data.
 fn parse_m3u8(content: &str) -> PlaylistInfo {
     let mut target_duration = 0i32;
     let mut media_sequence = 0i32;
@@ -108,19 +148,60 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
     }
 }
 
+// --- Main function ---
+
 #[pg_extern(schema = "pg_ffmpeg")]
 fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
 
-    // Input still needs a temp file (FFmpeg requires a file path)
-    let input_tmp = write_to_tempfile(&data, ".input")
-        .unwrap_or_else(|e| error!("failed to write input temp file: {e}"));
+    // Open input from memory via custom AVIO
+    let mut input_state = Box::new(InputIoState { data, pos: 0 });
+    let mut avio_ctx_ptr: *mut AVIOContext;
 
-    let mut ictx = ffmpeg_next::format::input(input_tmp.path())
-        .unwrap_or_else(|e| error!("failed to open input: {e}"));
+    let mut ictx = unsafe {
+        let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
+        if avio_buf.is_null() {
+            error!("failed to allocate AVIO buffer");
+        }
 
-    // Allocate HLS output context with custom in-memory I/O (no temp files)
-    let mut state = Box::new(HlsIoState {
+        avio_ctx_ptr = avio_alloc_context(
+            avio_buf,
+            AVIO_BUF_SIZE,
+            0, // read-only
+            &mut *input_state as *mut InputIoState as *mut c_void,
+            Some(input_read),
+            None,
+            Some(input_seek),
+        );
+        if avio_ctx_ptr.is_null() {
+            av_free(avio_buf as *mut c_void);
+            error!("failed to allocate AVIO context");
+        }
+
+        let ps = avformat_alloc_context();
+        if ps.is_null() {
+            avio_context_free(&mut avio_ctx_ptr);
+            error!("failed to allocate format context");
+        }
+        (*ps).pb = avio_ctx_ptr;
+
+        let ret = avformat_open_input(&mut (ps as *mut _), ptr::null(), ptr::null(), ptr::null_mut());
+        if ret < 0 {
+            // avformat_open_input frees ps on failure
+            avio_context_free(&mut avio_ctx_ptr);
+            error!("failed to open input: error code {ret}");
+        }
+
+        let ret = avformat_find_stream_info(ps, ptr::null_mut());
+        if ret < 0 {
+            error!("failed to find stream info: error code {ret}");
+        }
+
+        ffmpeg_next::format::context::Input::wrap(ps)
+    };
+
+    // Allocate HLS output context with custom in-memory I/O
+    let mut output_state = Box::new(HlsIoState {
         completed: Vec::new(),
         open_contexts: HashMap::new(),
     });
@@ -141,7 +222,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
 
         (*ps).io_open = Some(hls_io_open);
         (*ps).io_close2 = Some(hls_io_close2);
-        (*ps).opaque = &mut *state as *mut HlsIoState as *mut c_void;
+        (*ps).opaque = &mut *output_state as *mut HlsIoState as *mut c_void;
 
         ffmpeg_next::format::context::Output::wrap(ps)
     };
@@ -192,10 +273,17 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    // Drop output context before consuming state
+    // Drop contexts before consuming state
     drop(octx);
+    drop(ictx);
 
-    let HlsIoState { completed, .. } = *state;
+    // Clean up input AVIO (avformat_close_input doesn't free custom IO)
+    unsafe {
+        avio_context_free(&mut avio_ctx_ptr);
+    }
+    drop(input_state);
+
+    let HlsIoState { completed, .. } = *output_state;
 
     // Parse the m3u8 playlist from in-memory buffers
     let m3u8_content = completed
@@ -212,7 +300,6 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         .iter()
         .filter(|(name, _)| name.ends_with(".ts"))
         .map(|(name, data)| {
-            // Strip any path prefix, keep just the filename
             let basename = name.rsplit('/').next().unwrap_or(name);
             (basename, data.as_slice())
         })
