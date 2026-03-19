@@ -1,5 +1,5 @@
 use pgrx::prelude::*;
-use pgrx::{IntoDatum, PgRelation};
+use pgrx::PgRelation;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
@@ -64,6 +64,8 @@ struct HlsIoState {
     segments_rel: pg_sys::Relation,
     /// Tuple descriptor for hls_segments.
     segments_tupdesc: pg_sys::TupleDesc,
+    /// Reusable tuple table slot (created once, reused for all inserts).
+    slot: *mut pg_sys::TupleTableSlot,
 }
 
 unsafe extern "C" fn hls_io_open(
@@ -100,19 +102,23 @@ unsafe extern "C" fn hls_io_close2(
     if let Some(filename) = state.open_contexts.remove(&(pb as usize)) {
         if size > 0 {
             if filename.ends_with(".ts") {
-                let data = std::slice::from_raw_parts(buf, size as usize).to_vec();
                 let idx = state.segment_index;
                 state.segment_index += 1;
 
-                // Direct heap insert — no SPI overhead
-                insert_segment(
+                // Build bytea varlena directly from FFmpeg's buffer — single copy into palloc'd memory.
+                // Then heap_form_tuple copies into the tuple. Total: 2 copies (was 3).
+                let bytea_datum = raw_to_bytea_datum(buf, size as usize);
+
+                insert_segment_raw(
                     state.segments_rel,
                     state.segments_tupdesc,
+                    state.slot,
                     state.playlist_id,
                     idx,
-                    data,
+                    bytea_datum,
                 );
             } else if filename.ends_with(".m3u8") {
+                // m3u8 is small text — copy is negligible
                 state.m3u8_data =
                     Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
             }
@@ -125,43 +131,50 @@ unsafe extern "C" fn hls_io_close2(
     0
 }
 
-/// Insert a segment row directly via heap_form_tuple + simple_table_tuple_insert.
-/// Columns: id (serial, default), playlist_id, segment_index, duration (NULL), data.
-unsafe fn insert_segment(
+/// Build a bytea Datum directly from a raw pointer, avoiding intermediate Vec allocation.
+/// Performs a single palloc + copy from src into a properly-headered varlena.
+#[inline]
+unsafe fn raw_to_bytea_datum(src: *const u8, len: usize) -> pg_sys::Datum {
+    let total = len + pg_sys::VARHDRSZ;
+    let varlena = pg_sys::palloc(total) as *mut pg_sys::varlena;
+    pgrx::set_varsize_4b(varlena, total as i32);
+    ptr::copy_nonoverlapping(
+        src,
+        (varlena as *mut u8).add(pg_sys::VARHDRSZ),
+        len,
+    );
+    pg_sys::Datum::from(varlena)
+}
+
+/// Insert a segment row using pre-built datums. Reuses the TupleTableSlot.
+/// Stack-allocated arrays (5 columns: id, playlist_id, segment_index, duration, data).
+#[inline]
+unsafe fn insert_segment_raw(
     rel: pg_sys::Relation,
     tupdesc: pg_sys::TupleDesc,
+    slot: *mut pg_sys::TupleTableSlot,
     playlist_id: i64,
     segment_index: i32,
-    data: Vec<u8>,
+    bytea_datum: pg_sys::Datum,
 ) {
-    // hls_segments has 5 columns: id, playlist_id, segment_index, duration, data
-    let natts = (*tupdesc).natts as usize;
-    let mut values = vec![pg_sys::Datum::from(0); natts];
-    let mut nulls = vec![true; natts];
+    // Stack arrays — no heap allocation
+    let mut values: [pg_sys::Datum; 5] = [pg_sys::Datum::from(0); 5];
+    let mut nulls: [bool; 5] = [true, false, false, true, false];
 
-    // Column 0: id — leave NULL, let the serial default fill it
-    // Column 1: playlist_id (int8)
-    if let Some(d) = playlist_id.into_datum() {
-        values[1] = d;
-        nulls[1] = false;
-    }
-    // Column 2: segment_index (int4)
-    if let Some(d) = segment_index.into_datum() {
-        values[2] = d;
-        nulls[2] = false;
-    }
-    // Column 3: duration (float8) — NULL for now, updated after muxing
-    // Column 4: data (bytea)
-    if let Some(d) = data.into_datum() {
-        values[4] = d;
-        nulls[4] = false;
-    }
+    // Column 0: id — NULL, serial default
+    // Column 1: playlist_id (int8) — always non-null
+    values[1] = pg_sys::Datum::from(playlist_id);
+    // Column 2: segment_index (int4) — always non-null
+    values[2] = pg_sys::Datum::from(segment_index as i64);
+    // Column 3: duration — NULL, updated after muxing
+    // Column 4: data (bytea) — pre-built varlena datum
+    values[4] = bytea_datum;
 
     let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
-    let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
-    pg_sys::ExecStoreHeapTuple(tuple, slot, false);
+
+    pg_sys::ExecClearTuple(slot);
+    pg_sys::ExecStoreHeapTuple(tuple, slot, true);
     pg_sys::simple_table_tuple_insert(rel, slot);
-    pg_sys::ExecDropSingleTupleTableSlot(slot);
 }
 
 // --- m3u8 parsing ---
@@ -236,6 +249,9 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         pg_sys::relation_open(oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE)
     };
     let segments_tupdesc = unsafe { (*segments_rel).rd_att };
+    let segments_slot = unsafe {
+        pg_sys::MakeSingleTupleTableSlot(segments_tupdesc, &pg_sys::TTSOpsHeapTuple)
+    };
 
     // Open input from memory via custom AVIO
     let mut input_state = Box::new(InputIoState { data, pos: 0 });
@@ -291,6 +307,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         open_contexts: HashMap::new(),
         segments_rel,
         segments_tupdesc,
+        slot: segments_slot,
     });
 
     let mut octx = unsafe {
@@ -369,8 +386,9 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     }
     drop(input_state);
 
-    // Close hls_segments relation
+    // Clean up slot and close relation
     unsafe {
+        pg_sys::ExecDropSingleTupleTableSlot(segments_slot);
         pg_sys::relation_close(segments_rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
     }
 
