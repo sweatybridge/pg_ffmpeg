@@ -1,0 +1,104 @@
+name: Build Debian Packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:${{ matrix.debian }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [16, 17, 18]
+        debian: [buster, trixie]
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            curl ca-certificates gnupg lsb-release \
+            build-essential pkg-config \
+            libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libavfilter-dev libavdevice-dev \
+            git
+
+      - name: Add PostgreSQL APT repository
+        run: |
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+
+      - name: Install PostgreSQL development files
+        run: |
+          apt-get install -y postgresql-server-dev-${{ matrix.pg_version }}
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-pgrx
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
+          cargo pgrx init "--pg${{ matrix.pg_version }}=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config"
+
+      - name: Build extension
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx package \
+            --pg-config "/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config" \
+            --features "pg${{ matrix.pg_version }}" \
+            --no-default-features
+
+      - name: Create Debian package
+        run: |
+          . "$HOME/.cargo/env"
+          PKG_VERSION=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          PG_VERSION=${{ matrix.pg_version }}
+          DEBIAN_CODENAME=${{ matrix.debian }}
+          ARCH=$(dpkg --print-architecture)
+          PKG_NAME="pg-ffmpeg-pg${PG_VERSION}"
+          PKG_DIR="${PKG_NAME}_${PKG_VERSION}-1_${ARCH}"
+
+          # cargo pgrx package outputs to target/release/pg_ffmpeg-pg$VER/
+          SRC_DIR="target/release/pg_ffmpeg-pg${PG_VERSION}"
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          cp -a "${SRC_DIR}/." "${PKG_DIR}/"
+
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: ${PKG_NAME}
+          Version: ${PKG_VERSION}-1
+          Section: database
+          Priority: optional
+          Architecture: ${ARCH}
+          Depends: postgresql-${PG_VERSION}, libavcodec-dev | libavcodec60 | libavcodec58, libavformat-dev | libavformat60 | libavformat58, libavutil-dev | libavutil58 | libavutil56
+          Maintainer: pg_ffmpeg contributors
+          Description: FFmpeg media processing functions for PostgreSQL
+           pg_ffmpeg provides PostgreSQL functions for media processing
+           using FFmpeg, including media info extraction, thumbnail
+           generation, transcoding, audio extraction, and HLS support.
+          EOF
+
+          # Remove leading spaces from control file
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+
+          dpkg-deb --build "${PKG_DIR}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-ffmpeg-pg${{ matrix.pg_version }}-${{ matrix.debian }}
+          path: "*.deb"
