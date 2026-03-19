@@ -1,6 +1,5 @@
 use pgrx::prelude::*;
 use pgrx::PgRelation;
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
@@ -45,18 +44,14 @@ unsafe extern "C" fn segment_write(
     size
 }
 
-/// Tracks whether an open AVIO is a .ts segment (custom write) or .m3u8 (dyn_buf).
-enum OpenContext {
-    Segment(*mut SegmentBuf), // .ts — custom write AVIO, owns the SegmentBuf
-    Playlist,                 // .m3u8 — avio_open_dyn_buf
-}
-
 struct HlsIoState {
     playlist_id: i64,
     segment_index: i32,
     m3u8_data: Option<Vec<u8>>,
-    /// Maps AVIO ptr address -> open context type.
-    open_contexts: HashMap<usize, OpenContext>,
+    /// Reusable segment buffer — reset (len=0) on each segment open, kept across segments.
+    seg_buf: SegmentBuf,
+    /// AVIO pointer for the currently open .ts segment (null when none open).
+    segment_pb: *mut AVIOContext,
     segments_rel: pg_sys::Relation,
     segments_tupdesc: pg_sys::TupleDesc,
     slot: *mut pg_sys::TupleTableSlot,
@@ -74,16 +69,11 @@ unsafe extern "C" fn hls_io_open(
     let is_ts = url_bytes.ends_with(b".ts");
 
     if is_ts {
-        // Custom write AVIO: writes directly into palloc'd varlena buffer
-        let seg = Box::into_raw(Box::new(SegmentBuf {
-            ptr: pg_sys::palloc(SEGMENT_BUF_INITIAL) as *mut u8,
-            len: 0,
-            cap: SEGMENT_BUF_INITIAL,
-        }));
+        // Reuse the segment buffer — just reset the write position
+        state.seg_buf.len = 0;
 
         let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
         if avio_buf.is_null() {
-            drop(Box::from_raw(seg));
             return ffmpeg_next::sys::AVERROR_EOF; // OOM
         }
 
@@ -91,26 +81,24 @@ unsafe extern "C" fn hls_io_open(
             avio_buf,
             AVIO_BUF_SIZE,
             1, // write mode
-            seg as *mut c_void,
+            &mut state.seg_buf as *mut SegmentBuf as *mut c_void,
             None,
             Some(segment_write),
             None,
         );
         if ctx.is_null() {
             av_free(avio_buf as *mut c_void);
-            drop(Box::from_raw(seg));
             return ffmpeg_next::sys::AVERROR_EOF;
         }
 
         *pb = ctx;
-        state.open_contexts.insert(ctx as usize, OpenContext::Segment(seg));
+        state.segment_pb = ctx;
     } else {
         // m3u8 and other small files: use dyn_buf as before
         let ret = avio_open_dyn_buf(pb);
         if ret < 0 {
             return ret;
         }
-        state.open_contexts.insert(*pb as usize, OpenContext::Playlist);
     }
 
     0
@@ -122,51 +110,45 @@ unsafe extern "C" fn hls_io_close2(
 ) -> c_int {
     let state = &mut *((*s).opaque as *mut HlsIoState);
 
-    if let Some(ctx) = state.open_contexts.remove(&(pb as usize)) {
-        match ctx {
-            OpenContext::Segment(seg_ptr) => {
-                let seg = Box::from_raw(seg_ptr);
+    if pb == state.segment_pb {
+        // .ts segment — data is in the reusable seg_buf
+        state.segment_pb = ptr::null_mut();
 
-                if seg.len > 0 {
-                    // Set varlena header — buffer is already the bytea datum
-                    let total = pg_sys::VARHDRSZ + seg.len;
-                    pgrx::set_varsize_4b(seg.ptr as *mut pg_sys::varlena, total as i32);
-                    let datum = pg_sys::Datum::from(seg.ptr as *mut pg_sys::varlena);
+        if state.seg_buf.len > 0 {
+            // Set varlena header — buffer is already the bytea datum
+            let total = pg_sys::VARHDRSZ + state.seg_buf.len;
+            pgrx::set_varsize_4b(state.seg_buf.ptr as *mut pg_sys::varlena, total as i32);
+            let datum = pg_sys::Datum::from(state.seg_buf.ptr as *mut pg_sys::varlena);
 
-                    let idx = state.segment_index;
-                    state.segment_index += 1;
+            let idx = state.segment_index;
+            state.segment_index += 1;
 
-                    insert_segment_raw(
-                        state.segments_rel,
-                        state.segments_tupdesc,
-                        state.slot,
-                        state.playlist_id,
-                        idx,
-                        datum,
-                    );
+            // heap_form_tuple copies the datum, so seg_buf can be reused
+            insert_segment_raw(
+                state.segments_rel,
+                state.segments_tupdesc,
+                state.slot,
+                state.playlist_id,
+                idx,
+                datum,
+            );
+        }
 
-                    pg_sys::pfree(seg.ptr as *mut c_void);
-                } else {
-                    pg_sys::pfree(seg.ptr as *mut c_void);
-                }
+        // Free the AVIOContext + its internal buffer (seg_buf itself is reused)
+        let mut pb_mut = pb;
+        avio_context_free(&mut pb_mut);
+    } else {
+        // .m3u8 playlist
+        let mut buf: *mut u8 = ptr::null_mut();
+        let size = avio_close_dyn_buf(pb, &mut buf);
 
-                // Free the AVIOContext + its internal buffer
-                let mut pb_mut = pb;
-                avio_context_free(&mut pb_mut);
-            }
-            OpenContext::Playlist => {
-                let mut buf: *mut u8 = ptr::null_mut();
-                let size = avio_close_dyn_buf(pb, &mut buf);
+        if size > 0 {
+            state.m3u8_data =
+                Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
+        }
 
-                if size > 0 {
-                    state.m3u8_data =
-                        Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
-                }
-
-                if !buf.is_null() {
-                    av_free(buf as *mut c_void);
-                }
-            }
+        if !buf.is_null() {
+            av_free(buf as *mut c_void);
         }
     }
 
@@ -278,15 +260,22 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
         .unwrap_or_else(|e| error!("failed to open input url: {e}"));
 
     // Allocate HLS output context with streaming I/O callbacks
-    let mut output_state = Box::new(HlsIoState {
-        playlist_id,
-        segment_index: 0,
-        m3u8_data: None,
-        open_contexts: HashMap::new(),
-        segments_rel,
-        segments_tupdesc,
-        slot: segments_slot,
-    });
+    let mut output_state = unsafe {
+        Box::new(HlsIoState {
+            playlist_id,
+            segment_index: 0,
+            m3u8_data: None,
+            seg_buf: SegmentBuf {
+                ptr: pg_sys::palloc(SEGMENT_BUF_INITIAL) as *mut u8,
+                len: 0,
+                cap: SEGMENT_BUF_INITIAL,
+            },
+            segment_pb: ptr::null_mut(),
+            segments_rel,
+            segments_tupdesc,
+            slot: segments_slot,
+        })
+    };
 
     let mut octx = unsafe {
         let mut ps: *mut AVFormatContext = ptr::null_mut();
@@ -359,6 +348,11 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     // Clean up FFmpeg contexts
     drop(octx);
     drop(ictx);
+
+    // Free the reusable segment buffer
+    unsafe {
+        pg_sys::pfree(output_state.seg_buf.ptr as *mut c_void);
+    }
 
     // Clean up slot and close relation
     unsafe {
