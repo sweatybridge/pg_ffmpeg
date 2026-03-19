@@ -417,3 +417,216 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
 
     playlist_id
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+
+    // --- Unit tests for parse_m3u8 (no PostgreSQL needed) ---
+
+    #[test]
+    fn test_parse_m3u8_basic() {
+        let m3u8 = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:5.005333,
+seg000.ts
+#EXTINF:4.838167,
+seg001.ts
+#EXTINF:2.135467,
+seg002.ts
+#EXT-X-ENDLIST
+";
+        let info = parse_m3u8(m3u8);
+        assert_eq!(info.target_duration, 6);
+        assert_eq!(info.media_sequence, 0);
+        assert_eq!(info.segments.len(), 3);
+        assert!((info.segments[0].duration - 5.005333).abs() < 1e-6);
+        assert!((info.segments[1].duration - 4.838167).abs() < 1e-6);
+        assert!((info.segments[2].duration - 2.135467).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_m3u8_nonzero_sequence() {
+        let m3u8 = "\
+#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:42
+#EXTINF:9.9,
+seg042.ts
+#EXT-X-ENDLIST
+";
+        let info = parse_m3u8(m3u8);
+        assert_eq!(info.target_duration, 10);
+        assert_eq!(info.media_sequence, 42);
+        assert_eq!(info.segments.len(), 1);
+        assert!((info.segments[0].duration - 9.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_m3u8_empty() {
+        let info = parse_m3u8("#EXTM3U\n#EXT-X-ENDLIST\n");
+        assert_eq!(info.target_duration, 0);
+        assert_eq!(info.media_sequence, 0);
+        assert!(info.segments.is_empty());
+    }
+
+    #[test]
+    fn test_parse_m3u8_trailing_comma_stripped() {
+        let m3u8 = "#EXTINF:3.500000,\nseg.ts\n";
+        let info = parse_m3u8(m3u8);
+        assert_eq!(info.segments.len(), 1);
+        assert!((info.segments[0].duration - 3.5).abs() < 1e-6);
+    }
+
+    // --- Integration test requiring PostgreSQL ---
+
+    /// Generate a minimal test video file using ffmpeg CLI.
+    /// Returns the path to the generated file.
+    fn generate_test_video(path: &std::path::Path) {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f", "lavfi",
+                "-i", "testsrc=duration=3:size=64x64:rate=10",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+            ])
+            .arg(path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run ffmpeg");
+        assert!(status.success(), "ffmpeg test video generation failed");
+    }
+
+    #[pg_test]
+    fn test_hls_creates_playlist_and_segments() {
+        // Generate a short test video
+        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp); // release the fd so ffmpeg can write
+        generate_test_video(&video_path);
+
+        let url = format!("file://{}", video_path.display());
+        let playlist_id = crate::hls::hls(&url, 2);
+
+        assert!(playlist_id > 0);
+
+        // Verify playlist metadata was set
+        let row = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT target_duration, media_sequence FROM pg_ffmpeg.hls_playlists WHERE id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                )
+                .unwrap()
+                .first()
+                .get_two::<i32, i32>()
+                .unwrap()
+        });
+        let (target_dur, media_seq) = row;
+        assert!(target_dur.unwrap() > 0, "target_duration should be set");
+        assert_eq!(media_seq.unwrap(), 0);
+
+        // Verify segments were created
+        let seg_count = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT count(*)::int4 FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<i32>()
+                .unwrap()
+                .unwrap()
+        });
+        assert!(seg_count > 0, "should have at least one segment");
+
+        // Verify segments have data and sequential indices
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT segment_index, duration, octet_length(data) \
+                     FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1 ORDER BY segment_index",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<i32>(1).unwrap().unwrap(),
+                        row.get::<f64>(2).unwrap(),
+                        row.get::<i32>(3).unwrap().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for (i, (seg_idx, duration, data_len)) in rows.iter().enumerate() {
+            assert_eq!(*seg_idx, i as i32, "segment_index should be sequential");
+            assert!(duration.is_some(), "duration should be set for segment {i}");
+            assert!(duration.unwrap() > 0.0, "duration should be positive for segment {i}");
+            assert!(*data_len > 0, "segment {i} should have data");
+        }
+
+        // Clean up test file
+        let _ = std::fs::remove_file(&video_path);
+    }
+
+    #[pg_test]
+    fn test_hls_custom_segment_duration() {
+        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp);
+        generate_test_video(&video_path);
+
+        let url = format!("file://{}", video_path.display());
+
+        // Use 1-second segments on a 3-second video — should produce more segments
+        let playlist_id_short = crate::hls::hls(&url, 1);
+        let count_short = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT count(*)::int4 FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id_short)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<i32>()
+                .unwrap()
+                .unwrap()
+        });
+
+        // Use 10-second segments — should produce fewer (likely 1) segment
+        let playlist_id_long = crate::hls::hls(&url, 10);
+        let count_long = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT count(*)::int4 FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id_long)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<i32>()
+                .unwrap()
+                .unwrap()
+        });
+
+        assert!(
+            count_short >= count_long,
+            "shorter segment_duration ({count_short} segs) should produce >= segments than longer ({count_long} segs)"
+        );
+
+        let _ = std::fs::remove_file(&video_path);
+    }
+}
