@@ -1,5 +1,5 @@
-use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
+use pgrx::{IntoDatum, PgRelation};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
@@ -60,6 +60,10 @@ struct HlsIoState {
     m3u8_data: Option<Vec<u8>>,
     /// Currently open AVIO contexts: ptr address -> filename.
     open_contexts: HashMap<usize, String>,
+    /// Open relation for hls_segments (held for duration of muxing).
+    segments_rel: pg_sys::Relation,
+    /// Tuple descriptor for hls_segments.
+    segments_tupdesc: pg_sys::TupleDesc,
 }
 
 unsafe extern "C" fn hls_io_open(
@@ -82,7 +86,7 @@ unsafe extern "C" fn hls_io_open(
 }
 
 /// Called when FFmpeg closes a segment or playlist file.
-/// For .ts segments: INSERT into hls_segments immediately and free data.
+/// For .ts segments: direct heap INSERT into hls_segments and free data.
 /// For .m3u8: keep the small text for post-mux metadata update.
 unsafe extern "C" fn hls_io_close2(
     s: *mut AVFormatContext,
@@ -96,27 +100,19 @@ unsafe extern "C" fn hls_io_close2(
     if let Some(filename) = state.open_contexts.remove(&(pb as usize)) {
         if size > 0 {
             if filename.ends_with(".ts") {
-                // Stream segment directly to DB, then free buffer
                 let data = std::slice::from_raw_parts(buf, size as usize).to_vec();
                 let idx = state.segment_index;
-                let pid = state.playlist_id;
                 state.segment_index += 1;
 
-                Spi::connect_mut(|client| {
-                    client
-                        .update(
-                            "INSERT INTO pg_ffmpeg.hls_segments (playlist_id, segment_index, data) VALUES ($1, $2, $3)",
-                            None,
-                            &[
-                                DatumWithOid::from(pid),
-                                DatumWithOid::from(idx),
-                                DatumWithOid::from(data),
-                            ],
-                        )
-                        .unwrap_or_else(|e| error!("failed to insert segment {idx}: {e}"));
-                });
+                // Direct heap insert — no SPI overhead
+                insert_segment(
+                    state.segments_rel,
+                    state.segments_tupdesc,
+                    state.playlist_id,
+                    idx,
+                    data,
+                );
             } else if filename.ends_with(".m3u8") {
-                // Keep the latest m3u8 (overwritten after each segment)
                 state.m3u8_data =
                     Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
             }
@@ -127,6 +123,45 @@ unsafe extern "C" fn hls_io_close2(
         av_free(buf as *mut c_void);
     }
     0
+}
+
+/// Insert a segment row directly via heap_form_tuple + simple_table_tuple_insert.
+/// Columns: id (serial, default), playlist_id, segment_index, duration (NULL), data.
+unsafe fn insert_segment(
+    rel: pg_sys::Relation,
+    tupdesc: pg_sys::TupleDesc,
+    playlist_id: i64,
+    segment_index: i32,
+    data: Vec<u8>,
+) {
+    // hls_segments has 5 columns: id, playlist_id, segment_index, duration, data
+    let natts = (*tupdesc).natts as usize;
+    let mut values = vec![pg_sys::Datum::from(0); natts];
+    let mut nulls = vec![true; natts];
+
+    // Column 0: id — leave NULL, let the serial default fill it
+    // Column 1: playlist_id (int8)
+    if let Some(d) = playlist_id.into_datum() {
+        values[1] = d;
+        nulls[1] = false;
+    }
+    // Column 2: segment_index (int4)
+    if let Some(d) = segment_index.into_datum() {
+        values[2] = d;
+        nulls[2] = false;
+    }
+    // Column 3: duration (float8) — NULL for now, updated after muxing
+    // Column 4: data (bytea)
+    if let Some(d) = data.into_datum() {
+        values[4] = d;
+        nulls[4] = false;
+    }
+
+    let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
+    let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+    pg_sys::ExecStoreHeapTuple(tuple, slot, false);
+    pg_sys::simple_table_tuple_insert(rel, slot);
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
 }
 
 // --- m3u8 parsing ---
@@ -176,7 +211,7 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
 fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
 
-    // Pre-allocate playlist row to get playlist_id before muxing
+    // Pre-allocate playlist row to get playlist_id
     let playlist_id = Spi::connect_mut(|client| {
         client
             .update(
@@ -190,6 +225,17 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
             .unwrap_or_else(|e| error!("failed to get playlist id: {e}"))
             .unwrap_or_else(|| error!("playlist id was null"))
     });
+
+    // Open hls_segments relation for direct inserts (held during muxing)
+    let segments_rel = unsafe {
+        let rel = PgRelation::open_with_name("pg_ffmpeg.hls_segments")
+            .unwrap_or_else(|_| error!("failed to open hls_segments"));
+        // Re-open with RowExclusiveLock for writes
+        let oid = rel.oid();
+        drop(rel);
+        pg_sys::relation_open(oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE)
+    };
+    let segments_tupdesc = unsafe { (*segments_rel).rd_att };
 
     // Open input from memory via custom AVIO
     let mut input_state = Box::new(InputIoState { data, pos: 0 });
@@ -243,6 +289,8 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         segment_index: 0,
         m3u8_data: None,
         open_contexts: HashMap::new(),
+        segments_rel,
+        segments_tupdesc,
     });
 
     let mut octx = unsafe {
@@ -321,7 +369,12 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     }
     drop(input_state);
 
-    // Parse m3u8 and update playlist metadata + segment durations
+    // Close hls_segments relation
+    unsafe {
+        pg_sys::relation_close(segments_rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+    }
+
+    // Parse m3u8 and update playlist metadata + segment durations via SPI
     let m3u8_bytes = output_state
         .m3u8_data
         .take()
@@ -330,29 +383,27 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     let playlist_info = parse_m3u8(&m3u8_content);
 
     Spi::connect_mut(|client| {
-        // Update playlist metadata
         client
             .update(
                 "UPDATE pg_ffmpeg.hls_playlists SET target_duration = $1, media_sequence = $2 WHERE id = $3",
                 None,
                 &[
-                    DatumWithOid::from(playlist_info.target_duration),
-                    DatumWithOid::from(playlist_info.media_sequence),
-                    DatumWithOid::from(playlist_id),
+                    pgrx::datum::DatumWithOid::from(playlist_info.target_duration),
+                    pgrx::datum::DatumWithOid::from(playlist_info.media_sequence),
+                    pgrx::datum::DatumWithOid::from(playlist_id),
                 ],
             )
             .unwrap_or_else(|e| error!("failed to update playlist: {e}"));
 
-        // Update segment durations
         for (i, seg) in playlist_info.segments.iter().enumerate() {
             client
                 .update(
                     "UPDATE pg_ffmpeg.hls_segments SET duration = $1 WHERE playlist_id = $2 AND segment_index = $3",
                     None,
                     &[
-                        DatumWithOid::from(seg.duration),
-                        DatumWithOid::from(playlist_id),
-                        DatumWithOid::from(i as i32),
+                        pgrx::datum::DatumWithOid::from(seg.duration),
+                        pgrx::datum::DatumWithOid::from(playlist_id),
+                        pgrx::datum::DatumWithOid::from(i as i32),
                     ],
                 )
                 .unwrap_or_else(|e| error!("failed to update segment duration {i}: {e}"));
