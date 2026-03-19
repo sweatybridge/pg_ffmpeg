@@ -25,7 +25,7 @@ struct SegmentBuf {
 /// Custom write callback: appends directly into a palloc'd varlena buffer.
 unsafe extern "C" fn segment_write(
     opaque: *mut c_void,
-    data: *mut u8,
+    data: *const u8,
     size: c_int,
 ) -> c_int {
     let seg = &mut *(opaque as *mut SegmentBuf);
