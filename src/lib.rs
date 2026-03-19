@@ -12,15 +12,15 @@ extension_sql!(
     r#"
 CREATE TABLE pg_ffmpeg.hls_playlists (
     id              bigserial PRIMARY KEY,
-    target_duration int NOT NULL,
-    media_sequence  int NOT NULL
+    target_duration int NOT NULL DEFAULT 0,
+    media_sequence  int NOT NULL DEFAULT 0
 );
 
 CREATE TABLE pg_ffmpeg.hls_segments (
     id            bigserial PRIMARY KEY,
     playlist_id   bigint NOT NULL REFERENCES pg_ffmpeg.hls_playlists(id),
     segment_index int NOT NULL,
-    duration      float8 NOT NULL,
+    duration      float8,
     data          bytea NOT NULL
 );
 

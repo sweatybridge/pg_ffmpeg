@@ -14,7 +14,6 @@ const AVIO_BUF_SIZE: c_int = 4096;
 
 // --- Input AVIO: read from in-memory buffer ---
 
-/// State for the input read AVIO callbacks.
 struct InputIoState {
     data: Vec<u8>,
     pos: usize,
@@ -38,9 +37,9 @@ unsafe extern "C" fn input_seek(opaque: *mut c_void, offset: i64, whence: c_int)
         return state.data.len() as i64;
     }
     let new_pos = match whence & 0xFF {
-        0 => offset,                         // SEEK_SET
-        1 => state.pos as i64 + offset,      // SEEK_CUR
-        2 => state.data.len() as i64 + offset, // SEEK_END
+        0 => offset,                            // SEEK_SET
+        1 => state.pos as i64 + offset,         // SEEK_CUR
+        2 => state.data.len() as i64 + offset,  // SEEK_END
         _ => return -1,
     };
     if new_pos < 0 || new_pos > state.data.len() as i64 {
@@ -50,17 +49,19 @@ unsafe extern "C" fn input_seek(opaque: *mut c_void, offset: i64, whence: c_int)
     new_pos
 }
 
-// --- Output AVIO: HLS muxer writes segments to memory ---
+// --- Output AVIO: HLS muxer streams segments directly to DB ---
 
-/// Shared state for custom HLS output I/O callbacks.
 struct HlsIoState {
-    /// Completed files: (filename, data). Last entry wins for duplicates.
-    completed: Vec<(String, Vec<u8>)>,
+    /// Playlist ID (pre-allocated before muxing starts).
+    playlist_id: i64,
+    /// Counter for segment ordering.
+    segment_index: i32,
+    /// Final m3u8 content (small text, kept for post-mux metadata update).
+    m3u8_data: Option<Vec<u8>>,
     /// Currently open AVIO contexts: ptr address -> filename.
     open_contexts: HashMap<usize, String>,
 }
 
-/// Custom `io_open` callback: creates an in-memory AVIO context instead of a file.
 unsafe extern "C" fn hls_io_open(
     s: *mut AVFormatContext,
     pb: *mut *mut AVIOContext,
@@ -80,7 +81,9 @@ unsafe extern "C" fn hls_io_open(
     0
 }
 
-/// Custom `io_close2` callback: collects the in-memory buffer into `completed`.
+/// Called when FFmpeg closes a segment or playlist file.
+/// For .ts segments: INSERT into hls_segments immediately and free data.
+/// For .m3u8: keep the small text for post-mux metadata update.
 unsafe extern "C" fn hls_io_close2(
     s: *mut AVFormatContext,
     pb: *mut AVIOContext,
@@ -92,8 +95,31 @@ unsafe extern "C" fn hls_io_close2(
 
     if let Some(filename) = state.open_contexts.remove(&(pb as usize)) {
         if size > 0 {
-            let data = std::slice::from_raw_parts(buf, size as usize).to_vec();
-            state.completed.push((filename, data));
+            if filename.ends_with(".ts") {
+                // Stream segment directly to DB, then free buffer
+                let data = std::slice::from_raw_parts(buf, size as usize).to_vec();
+                let idx = state.segment_index;
+                let pid = state.playlist_id;
+                state.segment_index += 1;
+
+                Spi::connect_mut(|client| {
+                    client
+                        .update(
+                            "INSERT INTO pg_ffmpeg.hls_segments (playlist_id, segment_index, data) VALUES ($1, $2, $3)",
+                            None,
+                            &[
+                                DatumWithOid::from(pid),
+                                DatumWithOid::from(idx),
+                                DatumWithOid::from(data),
+                            ],
+                        )
+                        .unwrap_or_else(|e| error!("failed to insert segment {idx}: {e}"));
+                });
+            } else if filename.ends_with(".m3u8") {
+                // Keep the latest m3u8 (overwritten after each segment)
+                state.m3u8_data =
+                    Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
+            }
         }
     }
 
@@ -106,7 +132,6 @@ unsafe extern "C" fn hls_io_close2(
 // --- m3u8 parsing ---
 
 struct SegmentInfo {
-    filename: String,
     duration: f64,
 }
 
@@ -133,10 +158,7 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
             pending_duration = dur_str.parse().ok();
         } else if !line.starts_with('#') && !line.is_empty() {
             if let Some(duration) = pending_duration.take() {
-                segments.push(SegmentInfo {
-                    filename: line.to_string(),
-                    duration,
-                });
+                segments.push(SegmentInfo { duration });
             }
         }
     }
@@ -154,6 +176,21 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
 fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
 
+    // Pre-allocate playlist row to get playlist_id before muxing
+    let playlist_id = Spi::connect_mut(|client| {
+        client
+            .update(
+                "INSERT INTO pg_ffmpeg.hls_playlists DEFAULT VALUES RETURNING id",
+                None,
+                &[],
+            )
+            .unwrap_or_else(|e| error!("failed to insert playlist: {e}"))
+            .first()
+            .get_one::<i64>()
+            .unwrap_or_else(|e| error!("failed to get playlist id: {e}"))
+            .unwrap_or_else(|| error!("playlist id was null"))
+    });
+
     // Open input from memory via custom AVIO
     let mut input_state = Box::new(InputIoState { data, pos: 0 });
     let mut avio_ctx_ptr: *mut AVIOContext;
@@ -167,7 +204,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         avio_ctx_ptr = avio_alloc_context(
             avio_buf,
             AVIO_BUF_SIZE,
-            0, // read-only
+            0,
             &mut *input_state as *mut InputIoState as *mut c_void,
             Some(input_read),
             None,
@@ -185,9 +222,9 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         }
         (*ps).pb = avio_ctx_ptr;
 
-        let ret = avformat_open_input(&mut (ps as *mut _), ptr::null(), ptr::null(), ptr::null_mut());
+        let ret =
+            avformat_open_input(&mut (ps as *mut _), ptr::null(), ptr::null(), ptr::null_mut());
         if ret < 0 {
-            // avformat_open_input frees ps on failure
             avio_context_free(&mut avio_ctx_ptr);
             error!("failed to open input: error code {ret}");
         }
@@ -200,9 +237,11 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         ffmpeg_next::format::context::Input::wrap(ps)
     };
 
-    // Allocate HLS output context with custom in-memory I/O
+    // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
-        completed: Vec::new(),
+        playlist_id,
+        segment_index: 0,
+        m3u8_data: None,
         open_contexts: HashMap::new(),
     });
 
@@ -256,6 +295,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
 
+    // Remux packets — segments are streamed to DB as they complete
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
         if let Some(Some(out_idx)) = stream_mapping.get(input_index) {
@@ -273,74 +313,51 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    // Drop contexts before consuming state
+    // Clean up FFmpeg contexts
     drop(octx);
     drop(ictx);
-
-    // Clean up input AVIO (avformat_close_input doesn't free custom IO)
     unsafe {
         avio_context_free(&mut avio_ctx_ptr);
     }
     drop(input_state);
 
-    let HlsIoState { completed, .. } = *output_state;
-
-    // Parse the m3u8 playlist from in-memory buffers
-    let m3u8_content = completed
-        .iter()
-        .rev()
-        .find(|(name, _)| name.ends_with(".m3u8"))
-        .map(|(_, data)| String::from_utf8_lossy(data).into_owned())
+    // Parse m3u8 and update playlist metadata + segment durations
+    let m3u8_bytes = output_state
+        .m3u8_data
+        .take()
         .unwrap_or_else(|| error!("no m3u8 playlist found in output"));
-
+    let m3u8_content = String::from_utf8_lossy(&m3u8_bytes);
     let playlist_info = parse_m3u8(&m3u8_content);
 
-    // Build lookup of segment data by filename
-    let segment_files: HashMap<&str, &[u8]> = completed
-        .iter()
-        .filter(|(name, _)| name.ends_with(".ts"))
-        .map(|(name, data)| {
-            let basename = name.rsplit('/').next().unwrap_or(name);
-            (basename, data.as_slice())
-        })
-        .collect();
-
-    // Insert into database via SPI
     Spi::connect_mut(|client| {
-        let playlist_id = client
+        // Update playlist metadata
+        client
             .update(
-                "INSERT INTO pg_ffmpeg.hls_playlists (target_duration, media_sequence) VALUES ($1, $2) RETURNING id",
+                "UPDATE pg_ffmpeg.hls_playlists SET target_duration = $1, media_sequence = $2 WHERE id = $3",
                 None,
                 &[
                     DatumWithOid::from(playlist_info.target_duration),
                     DatumWithOid::from(playlist_info.media_sequence),
+                    DatumWithOid::from(playlist_id),
                 ],
             )
-            .unwrap_or_else(|e| error!("failed to insert playlist: {e}"))
-            .first()
-            .get_one::<i64>()
-            .unwrap_or_else(|e| error!("failed to get playlist id: {e}"))
-            .unwrap_or_else(|| error!("playlist id was null"));
+            .unwrap_or_else(|e| error!("failed to update playlist: {e}"));
 
+        // Update segment durations
         for (i, seg) in playlist_info.segments.iter().enumerate() {
-            let seg_data = segment_files
-                .get(seg.filename.as_str())
-                .unwrap_or_else(|| error!("missing segment data for {}", seg.filename));
-
             client
                 .update(
-                    "INSERT INTO pg_ffmpeg.hls_segments (playlist_id, segment_index, duration, data) VALUES ($1, $2, $3, $4)",
+                    "UPDATE pg_ffmpeg.hls_segments SET duration = $1 WHERE playlist_id = $2 AND segment_index = $3",
                     None,
                     &[
+                        DatumWithOid::from(seg.duration),
                         DatumWithOid::from(playlist_id),
                         DatumWithOid::from(i as i32),
-                        DatumWithOid::from(seg.duration),
-                        DatumWithOid::from(seg_data.to_vec()),
                     ],
                 )
-                .unwrap_or_else(|e| error!("failed to insert segment {i}: {e}"));
+                .unwrap_or_else(|e| error!("failed to update segment duration {i}: {e}"));
         }
+    });
 
-        playlist_id
-    })
+    playlist_id
 }
