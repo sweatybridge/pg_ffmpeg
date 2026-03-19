@@ -11,6 +11,7 @@ use ffmpeg_next::sys::{
 };
 
 const AVIO_BUF_SIZE: c_int = 4096;
+const SEGMENT_BUF_INITIAL: usize = 256 * 1024; // 256 KB
 
 // --- Input AVIO: read from in-memory buffer ---
 
@@ -51,20 +52,50 @@ unsafe extern "C" fn input_seek(opaque: *mut c_void, offset: i64, whence: c_int)
 
 // --- Output AVIO: HLS muxer streams segments directly to DB ---
 
+/// Growing palloc'd buffer used as write target for segment AVIO.
+/// Data starts at offset VARHDRSZ so the buffer is a ready-made varlena when done.
+struct SegmentBuf {
+    ptr: *mut u8,
+    len: usize, // bytes of payload written (not counting VARHDRSZ)
+    cap: usize, // total allocated bytes
+}
+
+/// Custom write callback: appends directly into a palloc'd varlena buffer.
+unsafe extern "C" fn segment_write(
+    opaque: *mut c_void,
+    data: *mut u8,
+    size: c_int,
+) -> c_int {
+    let seg = &mut *(opaque as *mut SegmentBuf);
+    let needed = pg_sys::VARHDRSZ + seg.len + size as usize;
+    if needed > seg.cap {
+        let new_cap = needed.next_power_of_two();
+        seg.ptr = pg_sys::repalloc(seg.ptr as *mut c_void, new_cap) as *mut u8;
+        seg.cap = new_cap;
+    }
+    ptr::copy_nonoverlapping(
+        data,
+        seg.ptr.add(pg_sys::VARHDRSZ + seg.len),
+        size as usize,
+    );
+    seg.len += size as usize;
+    size
+}
+
+/// Tracks whether an open AVIO is a .ts segment (custom write) or .m3u8 (dyn_buf).
+enum OpenContext {
+    Segment(*mut SegmentBuf), // .ts — custom write AVIO, owns the SegmentBuf
+    Playlist,                 // .m3u8 — avio_open_dyn_buf
+}
+
 struct HlsIoState {
-    /// Playlist ID (pre-allocated before muxing starts).
     playlist_id: i64,
-    /// Counter for segment ordering.
     segment_index: i32,
-    /// Final m3u8 content (small text, kept for post-mux metadata update).
     m3u8_data: Option<Vec<u8>>,
-    /// Currently open AVIO contexts: ptr address -> filename.
-    open_contexts: HashMap<usize, String>,
-    /// Open relation for hls_segments (held for duration of muxing).
+    /// Maps AVIO ptr address -> open context type.
+    open_contexts: HashMap<usize, OpenContext>,
     segments_rel: pg_sys::Relation,
-    /// Tuple descriptor for hls_segments.
     segments_tupdesc: pg_sys::TupleDesc,
-    /// Reusable tuple table slot (created once, reused for all inserts).
     slot: *mut pg_sys::TupleTableSlot,
 }
 
@@ -76,78 +107,110 @@ unsafe extern "C" fn hls_io_open(
     _options: *mut *mut AVDictionary,
 ) -> c_int {
     let state = &mut *((*s).opaque as *mut HlsIoState);
-    let filename = CStr::from_ptr(url).to_string_lossy().into_owned();
+    let url_bytes = CStr::from_ptr(url).to_bytes();
+    let is_ts = url_bytes.ends_with(b".ts");
 
-    let ret = avio_open_dyn_buf(pb);
-    if ret < 0 {
-        return ret;
+    if is_ts {
+        // Custom write AVIO: writes directly into palloc'd varlena buffer
+        let seg = Box::into_raw(Box::new(SegmentBuf {
+            ptr: pg_sys::palloc(SEGMENT_BUF_INITIAL) as *mut u8,
+            len: 0,
+            cap: SEGMENT_BUF_INITIAL,
+        }));
+
+        let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
+        if avio_buf.is_null() {
+            drop(Box::from_raw(seg));
+            return ffmpeg_next::sys::AVERROR_EOF; // OOM
+        }
+
+        let ctx = avio_alloc_context(
+            avio_buf,
+            AVIO_BUF_SIZE,
+            1, // write mode
+            seg as *mut c_void,
+            None,
+            Some(segment_write),
+            None,
+        );
+        if ctx.is_null() {
+            av_free(avio_buf as *mut c_void);
+            drop(Box::from_raw(seg));
+            return ffmpeg_next::sys::AVERROR_EOF;
+        }
+
+        *pb = ctx;
+        state.open_contexts.insert(ctx as usize, OpenContext::Segment(seg));
+    } else {
+        // m3u8 and other small files: use dyn_buf as before
+        let ret = avio_open_dyn_buf(pb);
+        if ret < 0 {
+            return ret;
+        }
+        state.open_contexts.insert(*pb as usize, OpenContext::Playlist);
     }
 
-    state.open_contexts.insert(*pb as usize, filename);
     0
 }
 
-/// Called when FFmpeg closes a segment or playlist file.
-/// For .ts segments: direct heap INSERT into hls_segments and free data.
-/// For .m3u8: keep the small text for post-mux metadata update.
 unsafe extern "C" fn hls_io_close2(
     s: *mut AVFormatContext,
     pb: *mut AVIOContext,
 ) -> c_int {
     let state = &mut *((*s).opaque as *mut HlsIoState);
 
-    let mut buf: *mut u8 = ptr::null_mut();
-    let size = avio_close_dyn_buf(pb, &mut buf);
+    if let Some(ctx) = state.open_contexts.remove(&(pb as usize)) {
+        match ctx {
+            OpenContext::Segment(seg_ptr) => {
+                let seg = Box::from_raw(seg_ptr);
 
-    if let Some(filename) = state.open_contexts.remove(&(pb as usize)) {
-        if size > 0 {
-            if filename.ends_with(".ts") {
-                let idx = state.segment_index;
-                state.segment_index += 1;
+                if seg.len > 0 {
+                    // Set varlena header — buffer is already the bytea datum
+                    let total = pg_sys::VARHDRSZ + seg.len;
+                    pgrx::set_varsize_4b(seg.ptr as *mut pg_sys::varlena, total as i32);
+                    let datum = pg_sys::Datum::from(seg.ptr as *mut pg_sys::varlena);
 
-                // Build bytea varlena directly from FFmpeg's buffer — single copy into palloc'd memory.
-                // Then heap_form_tuple copies into the tuple. Total: 2 copies (was 3).
-                let bytea_datum = raw_to_bytea_datum(buf, size as usize);
+                    let idx = state.segment_index;
+                    state.segment_index += 1;
 
-                insert_segment_raw(
-                    state.segments_rel,
-                    state.segments_tupdesc,
-                    state.slot,
-                    state.playlist_id,
-                    idx,
-                    bytea_datum,
-                );
-            } else if filename.ends_with(".m3u8") {
-                // m3u8 is small text — copy is negligible
-                state.m3u8_data =
-                    Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
+                    insert_segment_raw(
+                        state.segments_rel,
+                        state.segments_tupdesc,
+                        state.slot,
+                        state.playlist_id,
+                        idx,
+                        datum,
+                    );
+
+                    pg_sys::pfree(seg.ptr as *mut c_void);
+                } else {
+                    pg_sys::pfree(seg.ptr as *mut c_void);
+                }
+
+                // Free the AVIOContext + its internal buffer
+                let mut pb_mut = pb;
+                avio_context_free(&mut pb_mut);
+            }
+            OpenContext::Playlist => {
+                let mut buf: *mut u8 = ptr::null_mut();
+                let size = avio_close_dyn_buf(pb, &mut buf);
+
+                if size > 0 {
+                    state.m3u8_data =
+                        Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
+                }
+
+                if !buf.is_null() {
+                    av_free(buf as *mut c_void);
+                }
             }
         }
     }
 
-    if !buf.is_null() {
-        av_free(buf as *mut c_void);
-    }
     0
 }
 
-/// Build a bytea Datum directly from a raw pointer, avoiding intermediate Vec allocation.
-/// Performs a single palloc + copy from src into a properly-headered varlena.
-#[inline]
-unsafe fn raw_to_bytea_datum(src: *const u8, len: usize) -> pg_sys::Datum {
-    let total = len + pg_sys::VARHDRSZ;
-    let varlena = pg_sys::palloc(total) as *mut pg_sys::varlena;
-    pgrx::set_varsize_4b(varlena, total as i32);
-    ptr::copy_nonoverlapping(
-        src,
-        (varlena as *mut u8).add(pg_sys::VARHDRSZ),
-        len,
-    );
-    pg_sys::Datum::from(varlena)
-}
-
-/// Insert a segment row using pre-built datums. Reuses the TupleTableSlot.
-/// Stack-allocated arrays (5 columns: id, playlist_id, segment_index, duration, data).
+/// Insert a segment row. Reuses TupleTableSlot and stack-allocated arrays.
 #[inline]
 unsafe fn insert_segment_raw(
     rel: pg_sys::Relation,
@@ -157,17 +220,11 @@ unsafe fn insert_segment_raw(
     segment_index: i32,
     bytea_datum: pg_sys::Datum,
 ) {
-    // Stack arrays — no heap allocation
     let mut values: [pg_sys::Datum; 5] = [pg_sys::Datum::from(0); 5];
     let mut nulls: [bool; 5] = [true, false, false, true, false];
 
-    // Column 0: id — NULL, serial default
-    // Column 1: playlist_id (int8) — always non-null
     values[1] = pg_sys::Datum::from(playlist_id);
-    // Column 2: segment_index (int4) — always non-null
     values[2] = pg_sys::Datum::from(segment_index as i64);
-    // Column 3: duration — NULL, updated after muxing
-    // Column 4: data (bytea) — pre-built varlena datum
     values[4] = bytea_datum;
 
     let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
@@ -239,11 +296,10 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
             .unwrap_or_else(|| error!("playlist id was null"))
     });
 
-    // Open hls_segments relation for direct inserts (held during muxing)
+    // Open hls_segments relation for direct inserts
     let segments_rel = unsafe {
         let rel = PgRelation::open_with_name("pg_ffmpeg.hls_segments")
             .unwrap_or_else(|_| error!("failed to open hls_segments"));
-        // Re-open with RowExclusiveLock for writes
         let oid = rel.oid();
         drop(rel);
         pg_sys::relation_open(oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE)
@@ -360,7 +416,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
 
-    // Remux packets — segments are streamed to DB as they complete
+    // Remux packets — segments stream to DB as they complete
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
         if let Some(Some(out_idx)) = stream_mapping.get(input_index) {
@@ -392,7 +448,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         pg_sys::relation_close(segments_rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
     }
 
-    // Parse m3u8 and update playlist metadata + segment durations via SPI
+    // Parse m3u8 and update playlist metadata + segment durations
     let m3u8_bytes = output_state
         .m3u8_data
         .take()
@@ -401,6 +457,7 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     let playlist_info = parse_m3u8(&m3u8_content);
 
     Spi::connect_mut(|client| {
+        // Update playlist metadata
         client
             .update(
                 "UPDATE pg_ffmpeg.hls_playlists SET target_duration = $1, media_sequence = $2 WHERE id = $3",
@@ -413,18 +470,30 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
             )
             .unwrap_or_else(|e| error!("failed to update playlist: {e}"));
 
-        for (i, seg) in playlist_info.segments.iter().enumerate() {
+        // Batch update all segment durations in a single query
+        if !playlist_info.segments.is_empty() {
+            let indices: Vec<Option<i32>> = (0..playlist_info.segments.len() as i32)
+                .map(|i| Some(i))
+                .collect();
+            let durations: Vec<Option<f64>> = playlist_info
+                .segments
+                .iter()
+                .map(|s| Some(s.duration))
+                .collect();
+
             client
                 .update(
-                    "UPDATE pg_ffmpeg.hls_segments SET duration = $1 WHERE playlist_id = $2 AND segment_index = $3",
+                    "UPDATE pg_ffmpeg.hls_segments s SET duration = v.duration \
+                     FROM unnest($1::int4[], $2::float8[]) AS v(segment_index, duration) \
+                     WHERE s.playlist_id = $3 AND s.segment_index = v.segment_index",
                     None,
                     &[
-                        pgrx::datum::DatumWithOid::from(seg.duration),
+                        pgrx::datum::DatumWithOid::from(indices),
+                        pgrx::datum::DatumWithOid::from(durations),
                         pgrx::datum::DatumWithOid::from(playlist_id),
-                        pgrx::datum::DatumWithOid::from(i as i32),
                     ],
                 )
-                .unwrap_or_else(|e| error!("failed to update segment duration {i}: {e}"));
+                .unwrap_or_else(|e| error!("failed to update segment durations: {e}"));
         }
     });
 
