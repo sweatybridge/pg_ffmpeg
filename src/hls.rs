@@ -5,50 +5,13 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
 use ffmpeg_next::sys::{
-    av_free, av_malloc, avformat_alloc_context, avformat_alloc_output_context2,
-    avformat_find_stream_info, avformat_open_input, avio_alloc_context, avio_close_dyn_buf,
-    avio_context_free, avio_open_dyn_buf, AVDictionary, AVFormatContext, AVIOContext, AVSEEK_SIZE,
+    av_free, av_malloc, avformat_alloc_output_context2,
+    avio_alloc_context, avio_close_dyn_buf,
+    avio_context_free, avio_open_dyn_buf, AVDictionary, AVFormatContext, AVIOContext,
 };
 
 const AVIO_BUF_SIZE: c_int = 4096;
 const SEGMENT_BUF_INITIAL: usize = 256 * 1024; // 256 KB
-
-// --- Input AVIO: read from in-memory buffer ---
-
-struct InputIoState {
-    data: Vec<u8>,
-    pos: usize,
-}
-
-unsafe extern "C" fn input_read(opaque: *mut c_void, buf: *mut u8, buf_size: c_int) -> c_int {
-    let state = &mut *(opaque as *mut InputIoState);
-    let remaining = state.data.len() - state.pos;
-    let to_read = std::cmp::min(remaining, buf_size as usize);
-    if to_read == 0 {
-        return ffmpeg_next::sys::AVERROR_EOF;
-    }
-    ptr::copy_nonoverlapping(state.data.as_ptr().add(state.pos), buf, to_read);
-    state.pos += to_read;
-    to_read as c_int
-}
-
-unsafe extern "C" fn input_seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
-    let state = &mut *(opaque as *mut InputIoState);
-    if whence == AVSEEK_SIZE {
-        return state.data.len() as i64;
-    }
-    let new_pos = match whence & 0xFF {
-        0 => offset,                            // SEEK_SET
-        1 => state.pos as i64 + offset,         // SEEK_CUR
-        2 => state.data.len() as i64 + offset,  // SEEK_END
-        _ => return -1,
-    };
-    if new_pos < 0 || new_pos > state.data.len() as i64 {
-        return -1;
-    }
-    state.pos = new_pos as usize;
-    new_pos
-}
 
 // --- Output AVIO: HLS muxer streams segments directly to DB ---
 
@@ -278,8 +241,9 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
 // --- Main function ---
 
 #[pg_extern(schema = "pg_ffmpeg")]
-fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
+fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
+    ffmpeg_next::format::network::init();
 
     // Pre-allocate playlist row to get playlist_id
     let playlist_id = Spi::connect_mut(|client| {
@@ -309,51 +273,9 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
         pg_sys::MakeSingleTupleTableSlot(segments_tupdesc, &pg_sys::TTSOpsHeapTuple)
     };
 
-    // Open input from memory via custom AVIO
-    let mut input_state = Box::new(InputIoState { data, pos: 0 });
-    let mut avio_ctx_ptr: *mut AVIOContext;
-
-    let mut ictx = unsafe {
-        let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
-        if avio_buf.is_null() {
-            error!("failed to allocate AVIO buffer");
-        }
-
-        avio_ctx_ptr = avio_alloc_context(
-            avio_buf,
-            AVIO_BUF_SIZE,
-            0,
-            &mut *input_state as *mut InputIoState as *mut c_void,
-            Some(input_read),
-            None,
-            Some(input_seek),
-        );
-        if avio_ctx_ptr.is_null() {
-            av_free(avio_buf as *mut c_void);
-            error!("failed to allocate AVIO context");
-        }
-
-        let ps = avformat_alloc_context();
-        if ps.is_null() {
-            avio_context_free(&mut avio_ctx_ptr);
-            error!("failed to allocate format context");
-        }
-        (*ps).pb = avio_ctx_ptr;
-
-        let ret =
-            avformat_open_input(&mut (ps as *mut _), ptr::null(), ptr::null(), ptr::null_mut());
-        if ret < 0 {
-            avio_context_free(&mut avio_ctx_ptr);
-            error!("failed to open input: error code {ret}");
-        }
-
-        let ret = avformat_find_stream_info(ps, ptr::null_mut());
-        if ret < 0 {
-            error!("failed to find stream info: error code {ret}");
-        }
-
-        ffmpeg_next::format::context::Input::wrap(ps)
-    };
+    // Open input directly from URL — FFmpeg handles protocol decoding
+    let mut ictx = ffmpeg_next::format::input(&url)
+        .unwrap_or_else(|e| error!("failed to open input url: {e}"));
 
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
@@ -437,10 +359,6 @@ fn hls(data: Vec<u8>, segment_duration: default!(i32, 6)) -> i64 {
     // Clean up FFmpeg contexts
     drop(octx);
     drop(ictx);
-    unsafe {
-        avio_context_free(&mut avio_ctx_ptr);
-    }
-    drop(input_state);
 
     // Clean up slot and close relation
     unsafe {
