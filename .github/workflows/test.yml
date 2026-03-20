@@ -39,7 +39,7 @@ jobs:
         run: cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init
+        run: cargo pgrx init --pg16 download --pg17 download --pg18 download
 
       - name: Test
         run: cargo pgrx test all
