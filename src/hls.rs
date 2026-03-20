@@ -224,7 +224,7 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
 
 // --- Main function ---
 
-#[pg_extern(schema = "ffmpeg")]
+#[pg_extern]
 fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
     ffmpeg_next::format::network::init();

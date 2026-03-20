@@ -3,7 +3,7 @@ use std::fs;
 
 use crate::write_to_tempfile;
 
-#[pg_extern(schema = "ffmpeg")]
+#[pg_extern]
 fn extract_audio(data: Vec<u8>, format: default!(&str, "'mp3'")) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 

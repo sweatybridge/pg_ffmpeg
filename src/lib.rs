@@ -2,9 +2,6 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
-#[pg_schema]
-mod ffmpeg {}
-
 mod extract_audio;
 mod hls;
 mod media_info;
@@ -13,21 +10,21 @@ mod transcode;
 
 extension_sql!(
     r#"
-CREATE TABLE ffmpeg.hls_playlists (
+CREATE TABLE hls_playlists (
     id              bigserial PRIMARY KEY,
     target_duration int NOT NULL DEFAULT 0,
     media_sequence  int NOT NULL DEFAULT 0
 );
 
-CREATE TABLE ffmpeg.hls_segments (
+CREATE TABLE hls_segments (
     id            bigserial PRIMARY KEY,
-    playlist_id   bigint NOT NULL REFERENCES ffmpeg.hls_playlists(id),
+    playlist_id   bigint NOT NULL REFERENCES hls_playlists(id),
     segment_index int NOT NULL,
     duration      float8,
     data          bytea NOT NULL
 );
 
-CREATE INDEX ON ffmpeg.hls_segments (playlist_id);
+CREATE INDEX ON hls_segments (playlist_id);
 "#,
     name = "create_hls_tables",
 );
