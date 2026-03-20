@@ -514,6 +514,8 @@ seg042.ts
 
         let mut encoder = encoder.open().expect("failed to open encoder");
         stream.set_parameters(&encoder);
+        let out_time_base = stream.time_base();
+        drop(stream);
 
         octx.write_header().expect("failed to write header");
 
@@ -537,7 +539,7 @@ seg042.ts
             encoder.send_frame(&frame).expect("failed to send frame");
             while encoder.receive_packet(&mut packet).is_ok() {
                 packet.set_stream(0);
-                packet.rescale_ts((1, fps), stream.time_base());
+                packet.rescale_ts((1, fps), out_time_base);
                 packet
                     .write_interleaved(&mut octx)
                     .expect("failed to write packet");
@@ -547,7 +549,7 @@ seg042.ts
         encoder.send_eof().expect("failed to send eof");
         while encoder.receive_packet(&mut packet).is_ok() {
             packet.set_stream(0);
-            packet.rescale_ts((1, fps), stream.time_base());
+            packet.rescale_ts((1, fps), out_time_base);
             packet
                 .write_interleaved(&mut octx)
                 .expect("failed to write packet");
