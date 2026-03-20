@@ -3,7 +3,7 @@ use std::fs;
 
 use crate::write_to_tempfile;
 
-#[pg_extern(schema = "pg_ffmpeg")]
+#[pg_extern]
 fn transcode(data: Vec<u8>, format: &str) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 

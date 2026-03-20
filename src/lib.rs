@@ -10,21 +10,21 @@ mod transcode;
 
 extension_sql!(
     r#"
-CREATE TABLE pg_ffmpeg.hls_playlists (
+CREATE TABLE hls_playlists (
     id              bigserial PRIMARY KEY,
     target_duration int NOT NULL DEFAULT 0,
     media_sequence  int NOT NULL DEFAULT 0
 );
 
-CREATE TABLE pg_ffmpeg.hls_segments (
+CREATE TABLE hls_segments (
     id            bigserial PRIMARY KEY,
-    playlist_id   bigint NOT NULL REFERENCES pg_ffmpeg.hls_playlists(id),
+    playlist_id   bigint NOT NULL REFERENCES hls_playlists(id),
     segment_index int NOT NULL,
     duration      float8,
     data          bytea NOT NULL
 );
 
-CREATE INDEX ON pg_ffmpeg.hls_segments (playlist_id);
+CREATE INDEX ON hls_segments (playlist_id);
 "#,
     name = "create_hls_tables",
 );
