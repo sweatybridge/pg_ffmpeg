@@ -17,42 +17,11 @@ jobs:
         debian: [bookworm, trixie]
 
     steps:
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            curl ca-certificates gnupg lsb-release \
-            build-essential pkg-config \
-            libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
-            git
-
-      - name: Add PostgreSQL APT repository
-        run: |
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            > /etc/apt/sources.list.d/pgdg.list
-          apt-get update
-
-      - name: Install PostgreSQL development files
-        run: |
-          apt-get install -y postgresql-server-dev-${{ matrix.pg_version }}
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - uses: actions/checkout@v4
 
-      - name: Install cargo-pgrx
-        run: |
-          . "$HOME/.cargo/env"
-          cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
-          cargo pgrx init "--pg${{ matrix.pg_version }}=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config"
+      - uses: ./.github/actions/setup-pgrx
+        with:
+          pg_version: ${{ matrix.pg_version }}
 
       - name: Build extension
         run: |
