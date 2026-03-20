@@ -480,24 +480,80 @@ seg042.ts
 
     // --- Integration test requiring PostgreSQL ---
 
-    /// Generate a minimal test video file using ffmpeg CLI.
-    /// Returns the path to the generated file.
+    /// Generate a minimal 3-second test video file using the ffmpeg library.
     fn generate_test_video(path: &std::path::Path) {
-        let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f", "lavfi",
-                "-i", "testsrc=duration=3:size=64x64:rate=10",
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-            ])
-            .arg(path)
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("failed to run ffmpeg");
-        assert!(status.success(), "ffmpeg test video generation failed");
+        use ffmpeg_next::codec;
+        use ffmpeg_next::format::Pixel;
+        use ffmpeg_next::util::frame::video::Video;
+
+        ffmpeg_next::init().unwrap();
+
+        let width = 64u32;
+        let height = 64u32;
+        let fps = 10;
+        let duration_secs = 3;
+        let total_frames = fps * duration_secs;
+
+        let codec = ffmpeg_next::encoder::find(codec::Id::MPEG4)
+            .expect("MPEG4 encoder not found");
+
+        let mut octx = ffmpeg_next::format::output(path)
+            .expect("failed to create output context");
+
+        let mut stream = octx.add_stream(codec).expect("failed to add stream");
+        stream.set_time_base((1, fps));
+
+        let ctx = codec::context::Context::new_with_codec(codec);
+        let mut encoder = ctx.encoder().video().expect("failed to create encoder");
+        encoder.set_width(width);
+        encoder.set_height(height);
+        encoder.set_format(Pixel::YUV420P);
+        encoder.set_gop(12);
+        encoder.set_frame_rate(Some((fps, 1)));
+        encoder.set_time_base((1, fps));
+
+        let mut encoder = encoder.open().expect("failed to open encoder");
+        stream.set_parameters(&encoder);
+
+        octx.write_header().expect("failed to write header");
+
+        let mut packet = ffmpeg_next::Packet::empty();
+
+        for i in 0..total_frames {
+            let mut frame = Video::new(Pixel::YUV420P, width, height);
+            // Fill Y plane with a shifting pattern so frames differ
+            let y_data = frame.data_mut(0);
+            for (j, byte) in y_data.iter_mut().enumerate() {
+                *byte = ((i * 3 + j) % 256) as u8;
+            }
+            // Fill U and V planes with 128 (neutral chroma)
+            for plane in 1..=2 {
+                for byte in frame.data_mut(plane).iter_mut() {
+                    *byte = 128;
+                }
+            }
+            frame.set_pts(Some(i as i64));
+
+            encoder.send_frame(&frame).expect("failed to send frame");
+            while encoder.receive_packet(&mut packet).is_ok() {
+                packet.set_stream(0);
+                packet.rescale_ts((1, fps), stream.time_base());
+                packet
+                    .write_interleaved(&mut octx)
+                    .expect("failed to write packet");
+            }
+        }
+
+        encoder.send_eof().expect("failed to send eof");
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.rescale_ts((1, fps), stream.time_base());
+            packet
+                .write_interleaved(&mut octx)
+                .expect("failed to write packet");
+        }
+
+        octx.write_trailer().expect("failed to write trailer");
     }
 
     #[pg_test]
