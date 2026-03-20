@@ -494,8 +494,8 @@ seg042.ts
         let duration_secs = 3;
         let total_frames = fps * duration_secs;
 
-        let codec = ffmpeg_next::encoder::find(codec::Id::MPEG4)
-            .expect("MPEG4 encoder not found");
+        let codec = ffmpeg_next::encoder::find(codec::Id::MPEG1VIDEO)
+            .expect("MPEG1VIDEO encoder not found");
 
         let mut octx = ffmpeg_next::format::output(path)
             .expect("failed to create output context");
@@ -561,7 +561,7 @@ seg042.ts
     #[pg_test]
     fn test_hls_creates_playlist_and_segments() {
         // Generate a short test video
-        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let tmp = tempfile::Builder::new().suffix(".mpg").tempfile().unwrap();
         let video_path = tmp.path().to_path_buf();
         drop(tmp); // release the fd so ffmpeg can write
         generate_test_video(&video_path);
@@ -637,7 +637,7 @@ seg042.ts
 
     #[pg_test]
     fn test_hls_custom_segment_duration() {
-        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let tmp = tempfile::Builder::new().suffix(".mpg").tempfile().unwrap();
         let video_path = tmp.path().to_path_buf();
         drop(tmp);
         generate_test_video(&video_path);
