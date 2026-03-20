@@ -2,6 +2,9 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
+#[pg_schema]
+mod pg_ffmpeg {}
+
 mod extract_audio;
 mod hls;
 mod media_info;
