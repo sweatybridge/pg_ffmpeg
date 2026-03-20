@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "pgrx_embed_ffmpeg"
+name = "pgrx_embed_pg_ffmpeg"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
