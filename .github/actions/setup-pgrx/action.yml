@@ -1,0 +1,50 @@
+name: Setup pgrx
+description: Install dependencies, Rust, PostgreSQL dev files, and cargo-pgrx
+
+inputs:
+  pg_version:
+    description: PostgreSQL major version
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        apt-get update
+        apt-get install -y \
+          curl ca-certificates gnupg lsb-release \
+          build-essential pkg-config \
+          libclang-dev \
+          libavcodec-dev libavformat-dev libavutil-dev \
+          libswscale-dev libswresample-dev \
+          libavfilter-dev libavdevice-dev \
+          git
+
+    - name: Add PostgreSQL APT repository
+      shell: bash
+      run: |
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+        echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+          > /etc/apt/sources.list.d/pgdg.list
+        apt-get update
+
+    - name: Install PostgreSQL development files
+      shell: bash
+      run: |
+        apt-get install -y postgresql-server-dev-${{ inputs.pg_version }}
+
+    - name: Install Rust
+      shell: bash
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Install cargo-pgrx
+      shell: bash
+      run: |
+        . "$HOME/.cargo/env"
+        cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
+        cargo pgrx init "--pg${{ inputs.pg_version }}=/usr/lib/postgresql/${{ inputs.pg_version }}/bin/pg_config"
