@@ -9,6 +9,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [16, 17, 18]
     steps:
       - uses: actions/checkout@v4
 
@@ -32,14 +36,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: test-${{ hashFiles('Cargo.lock') }}
-          restore-keys: test-
+          key: test-pg${{ matrix.pg_version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-pg${{ matrix.pg_version }}-
 
       - name: Install cargo-pgrx
         run: cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init --pg16 download --pg17 download --pg18 download
+        run: cargo pgrx init --pg${{ matrix.pg_version }} download
 
       - name: Test
-        run: cargo pgrx test all
+        run: cargo pgrx test "pg${{ matrix.pg_version }}"
