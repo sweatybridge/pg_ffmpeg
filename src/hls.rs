@@ -83,7 +83,9 @@ unsafe extern "C" fn hls_io_open(
             1, // write mode
             &mut state.seg_buf as *mut SegmentBuf as *mut c_void,
             None,
-            Some(segment_write),
+            // Transmute to match the write_packet signature: older FFmpeg uses
+            // `*mut u8`, newer uses `*const u8`. Both are ABI-compatible.
+            Some(std::mem::transmute(segment_write as *const ())),
             None,
         );
         if ctx.is_null() {
