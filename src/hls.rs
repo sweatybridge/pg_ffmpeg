@@ -524,7 +524,7 @@ seg042.ts
             // Fill Y plane with a shifting pattern so frames differ
             let y_data = frame.data_mut(0);
             for (j, byte) in y_data.iter_mut().enumerate() {
-                *byte = ((i * 3 + j) % 256) as u8;
+                *byte = ((i as usize * 3 + j) % 256) as u8;
             }
             // Fill U and V planes with 128 (neutral chroma)
             for plane in 1..=2 {
