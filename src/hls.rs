@@ -25,7 +25,7 @@ struct SegmentBuf {
 /// Custom write callback: appends directly into a palloc'd varlena buffer.
 unsafe extern "C" fn segment_write(
     opaque: *mut c_void,
-    data: *mut u8,
+    data: *const u8,
     size: c_int,
 ) -> c_int {
     let seg = &mut *(opaque as *mut SegmentBuf);
@@ -83,7 +83,9 @@ unsafe extern "C" fn hls_io_open(
             1, // write mode
             &mut state.seg_buf as *mut SegmentBuf as *mut c_void,
             None,
-            Some(segment_write),
+            // Transmute to match the write_packet signature: older FFmpeg uses
+            // `*mut u8`, newer uses `*const u8`. Both are ABI-compatible.
+            Some(std::mem::transmute(segment_write as *const ())),
             None,
         );
         if ctx.is_null() {
