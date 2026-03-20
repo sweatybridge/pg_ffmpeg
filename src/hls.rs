@@ -224,7 +224,7 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
 
 // --- Main function ---
 
-#[pg_extern(schema = "pg_ffmpeg")]
+#[pg_extern(schema = "ffmpeg")]
 fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     ffmpeg_next::init().unwrap();
     ffmpeg_next::format::network::init();
@@ -233,7 +233,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     let playlist_id = Spi::connect_mut(|client| {
         client
             .update(
-                "INSERT INTO pg_ffmpeg.hls_playlists DEFAULT VALUES RETURNING id",
+                "INSERT INTO ffmpeg.hls_playlists DEFAULT VALUES RETURNING id",
                 None,
                 &[],
             )
@@ -246,7 +246,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
 
     // Open hls_segments relation for direct inserts
     let segments_rel = unsafe {
-        let rel = PgRelation::open_with_name("pg_ffmpeg.hls_segments")
+        let rel = PgRelation::open_with_name("ffmpeg.hls_segments")
             .unwrap_or_else(|_| error!("failed to open hls_segments"));
         let oid = rel.oid();
         drop(rel);
@@ -374,7 +374,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
         // Update playlist metadata
         client
             .update(
-                "UPDATE pg_ffmpeg.hls_playlists SET target_duration = $1, media_sequence = $2 WHERE id = $3",
+                "UPDATE ffmpeg.hls_playlists SET target_duration = $1, media_sequence = $2 WHERE id = $3",
                 None,
                 &[
                     pgrx::datum::DatumWithOid::from(playlist_info.target_duration),
@@ -397,7 +397,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
 
             client
                 .update(
-                    "UPDATE pg_ffmpeg.hls_segments s SET duration = v.duration \
+                    "UPDATE ffmpeg.hls_segments s SET duration = v.duration \
                      FROM unnest($1::int4[], $2::float8[]) AS v(segment_index, duration) \
                      WHERE s.playlist_id = $3 AND s.segment_index = v.segment_index",
                     None,
@@ -517,7 +517,7 @@ seg042.ts
         let row = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT target_duration, media_sequence FROM pg_ffmpeg.hls_playlists WHERE id = $1",
+                    "SELECT target_duration, media_sequence FROM ffmpeg.hls_playlists WHERE id = $1",
                     None,
                     &[pgrx::datum::DatumWithOid::from(playlist_id)],
                 )
@@ -534,7 +534,7 @@ seg042.ts
         let seg_count = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT count(*)::int4 FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1",
+                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
                     None,
                     &[pgrx::datum::DatumWithOid::from(playlist_id)],
                 )
@@ -551,7 +551,7 @@ seg042.ts
             client
                 .select(
                     "SELECT segment_index, duration, octet_length(data) \
-                     FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1 ORDER BY segment_index",
+                     FROM ffmpeg.hls_segments WHERE playlist_id = $1 ORDER BY segment_index",
                     None,
                     &[pgrx::datum::DatumWithOid::from(playlist_id)],
                 )
@@ -591,7 +591,7 @@ seg042.ts
         let count_short = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT count(*)::int4 FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1",
+                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
                     None,
                     &[pgrx::datum::DatumWithOid::from(playlist_id_short)],
                 )
@@ -607,7 +607,7 @@ seg042.ts
         let count_long = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT count(*)::int4 FROM pg_ffmpeg.hls_segments WHERE playlist_id = $1",
+                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
                     None,
                     &[pgrx::datum::DatumWithOid::from(playlist_id_long)],
                 )

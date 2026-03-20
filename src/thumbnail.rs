@@ -7,7 +7,7 @@ use ffmpeg_next::util::frame::video::Video;
 
 use crate::write_to_tempfile;
 
-#[pg_extern(schema = "pg_ffmpeg")]
+#[pg_extern(schema = "ffmpeg")]
 fn thumbnail(data: Vec<u8>, seconds: default!(f64, 0.0)) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 

@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::write_to_tempfile;
 
-#[pg_extern(schema = "pg_ffmpeg")]
+#[pg_extern(schema = "ffmpeg")]
 fn media_info(data: Vec<u8>) -> pgrx::JsonB {
     ffmpeg_next::init().unwrap();
 
