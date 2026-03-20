@@ -1,60 +1,36 @@
 use pgrx::prelude::*;
-use pgrx::PgRelation;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
 use ffmpeg_next::sys::{
-    av_free, av_malloc, avformat_alloc_output_context2,
-    avio_alloc_context, avio_close_dyn_buf,
-    avio_context_free, avio_open_dyn_buf, AVDictionary, AVFormatContext, AVIOContext,
+    av_free, av_malloc, avformat_alloc_output_context2, avio_alloc_context, avio_context_free,
+    AVDictionary, AVFormatContext, AVIOContext,
 };
 
 const AVIO_BUF_SIZE: c_int = 4096;
-const SEGMENT_BUF_INITIAL: usize = 256 * 1024; // 256 KB
 
-// --- Output AVIO: HLS muxer streams segments directly to DB ---
-
-/// Growing palloc'd buffer used as write target for segment AVIO.
-/// Data starts at offset VARHDRSZ so the buffer is a ready-made varlena when done.
-struct SegmentBuf {
-    ptr: *mut u8,
-    len: usize, // bytes of payload written (not counting VARHDRSZ)
-    cap: usize, // total allocated bytes
-}
-
-/// Custom write callback: appends directly into a palloc'd varlena buffer.
-unsafe extern "C" fn segment_write(
-    opaque: *mut c_void,
-    data: *const u8,
-    size: c_int,
-) -> c_int {
-    let seg = &mut *(opaque as *mut SegmentBuf);
-    let needed = pg_sys::VARHDRSZ + seg.len + size as usize;
-    if needed > seg.cap {
-        let new_cap = needed.next_power_of_two();
-        seg.ptr = pg_sys::repalloc(seg.ptr as *mut c_void, new_cap) as *mut u8;
-        seg.cap = new_cap;
-    }
-    ptr::copy_nonoverlapping(
-        data,
-        seg.ptr.add(pg_sys::VARHDRSZ + seg.len),
-        size as usize,
-    );
-    seg.len += size as usize;
+/// Custom write callback: appends into a Vec<u8>.
+unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
+    let buf = &mut *(opaque as *mut Vec<u8>);
+    buf.extend_from_slice(std::slice::from_raw_parts(data, size as usize));
     size
 }
 
+struct CollectedSegment {
+    index: i32,
+    data: Vec<u8>,
+}
+
 struct HlsIoState {
-    playlist_id: i64,
     segment_index: i32,
-    m3u8_data: Option<Vec<u8>>,
-    /// Reusable segment buffer — reset (len=0) on each segment open, kept across segments.
-    seg_buf: SegmentBuf,
-    /// AVIO pointer for the currently open .ts segment (null when none open).
+    /// Buffer for the m3u8 playlist being written.
+    m3u8_buf: Vec<u8>,
+    m3u8_pb: *mut AVIOContext,
+    /// Buffer for the current .ts segment being written.
+    seg_buf: Vec<u8>,
     segment_pb: *mut AVIOContext,
-    segments_rel: pg_sys::Relation,
-    segments_tupdesc: pg_sys::TupleDesc,
-    slot: *mut pg_sys::TupleTableSlot,
+    /// Completed segments collected during muxing.
+    segments: Vec<CollectedSegment>,
 }
 
 unsafe extern "C" fn hls_io_open(
@@ -68,39 +44,38 @@ unsafe extern "C" fn hls_io_open(
     let url_bytes = CStr::from_ptr(url).to_bytes();
     let is_ts = url_bytes.ends_with(b".ts");
 
+    let target_buf = if is_ts {
+        state.seg_buf.clear();
+        &mut state.seg_buf as *mut Vec<u8>
+    } else {
+        state.m3u8_buf.clear();
+        &mut state.m3u8_buf as *mut Vec<u8>
+    };
+
+    let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
+    if avio_buf.is_null() {
+        return ffmpeg_next::sys::AVERROR_EOF;
+    }
+
+    let ctx = avio_alloc_context(
+        avio_buf,
+        AVIO_BUF_SIZE,
+        1,
+        target_buf as *mut c_void,
+        None,
+        Some(std::mem::transmute(vec_write as *const ())),
+        None,
+    );
+    if ctx.is_null() {
+        av_free(avio_buf as *mut c_void);
+        return ffmpeg_next::sys::AVERROR_EOF;
+    }
+
+    *pb = ctx;
     if is_ts {
-        // Reuse the segment buffer — just reset the write position
-        state.seg_buf.len = 0;
-
-        let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
-        if avio_buf.is_null() {
-            return ffmpeg_next::sys::AVERROR_EOF; // OOM
-        }
-
-        let ctx = avio_alloc_context(
-            avio_buf,
-            AVIO_BUF_SIZE,
-            1, // write mode
-            &mut state.seg_buf as *mut SegmentBuf as *mut c_void,
-            None,
-            // Transmute to match the write_packet signature: older FFmpeg uses
-            // `*mut u8`, newer uses `*const u8`. Both are ABI-compatible.
-            Some(std::mem::transmute(segment_write as *const ())),
-            None,
-        );
-        if ctx.is_null() {
-            av_free(avio_buf as *mut c_void);
-            return ffmpeg_next::sys::AVERROR_EOF;
-        }
-
-        *pb = ctx;
         state.segment_pb = ctx;
     } else {
-        // m3u8 and other small files: use dyn_buf as before
-        let ret = avio_open_dyn_buf(pb);
-        if ret < 0 {
-            return ret;
-        }
+        state.m3u8_pb = ctx;
     }
 
     0
@@ -113,72 +88,23 @@ unsafe extern "C" fn hls_io_close2(
     let state = &mut *((*s).opaque as *mut HlsIoState);
 
     if pb == state.segment_pb {
-        // .ts segment — data is in the reusable seg_buf
         state.segment_pb = ptr::null_mut();
-
-        if state.seg_buf.len > 0 {
-            // Set varlena header — buffer is already the bytea datum
-            let total = pg_sys::VARHDRSZ + state.seg_buf.len;
-            pgrx::set_varsize_4b(state.seg_buf.ptr as *mut pg_sys::varlena, total as i32);
-            let datum = pg_sys::Datum::from(state.seg_buf.ptr as *mut pg_sys::varlena);
-
+        if !state.seg_buf.is_empty() {
             let idx = state.segment_index;
             state.segment_index += 1;
-
-            // heap_form_tuple copies the datum, so seg_buf can be reused
-            insert_segment_raw(
-                state.segments_rel,
-                state.segments_tupdesc,
-                state.slot,
-                state.playlist_id,
-                idx,
-                datum,
-            );
+            state.segments.push(CollectedSegment {
+                index: idx,
+                data: std::mem::take(&mut state.seg_buf),
+            });
         }
-
-        // Free the AVIOContext + its internal buffer (seg_buf itself is reused)
-        let mut pb_mut = pb;
-        avio_context_free(&mut pb_mut);
     } else {
-        // .m3u8 playlist
-        let mut buf: *mut u8 = ptr::null_mut();
-        let size = avio_close_dyn_buf(pb, &mut buf);
-
-        if size > 0 {
-            state.m3u8_data =
-                Some(std::slice::from_raw_parts(buf, size as usize).to_vec());
-        }
-
-        if !buf.is_null() {
-            av_free(buf as *mut c_void);
-        }
+        ffmpeg_next::sys::avio_flush(pb);
+        state.m3u8_pb = ptr::null_mut();
     }
 
+    let mut pb_mut = pb;
+    avio_context_free(&mut pb_mut);
     0
-}
-
-/// Insert a segment row. Reuses TupleTableSlot and stack-allocated arrays.
-#[inline]
-unsafe fn insert_segment_raw(
-    rel: pg_sys::Relation,
-    tupdesc: pg_sys::TupleDesc,
-    slot: *mut pg_sys::TupleTableSlot,
-    playlist_id: i64,
-    segment_index: i32,
-    bytea_datum: pg_sys::Datum,
-) {
-    let mut values: [pg_sys::Datum; 5] = [pg_sys::Datum::from(0); 5];
-    let mut nulls: [bool; 5] = [true, false, false, true, false];
-
-    values[1] = pg_sys::Datum::from(playlist_id);
-    values[2] = pg_sys::Datum::from(segment_index as i64);
-    values[4] = bytea_datum;
-
-    let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
-
-    pg_sys::ExecClearTuple(slot);
-    pg_sys::ExecStoreHeapTuple(tuple, slot, true);
-    pg_sys::simple_table_tuple_insert(rel, slot);
 }
 
 // --- m3u8 parsing ---
@@ -244,50 +170,30 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             .unwrap_or_else(|| error!("playlist id was null"))
     });
 
-    // Open hls_segments relation for direct inserts
-    let segments_rel = unsafe {
-        let rel = PgRelation::open_with_name("ffmpeg.hls_segments")
-            .unwrap_or_else(|_| error!("failed to open hls_segments"));
-        let oid = rel.oid();
-        drop(rel);
-        pg_sys::relation_open(oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE)
-    };
-    let segments_tupdesc = unsafe { (*segments_rel).rd_att };
-    let segments_slot = unsafe {
-        pg_sys::MakeSingleTupleTableSlot(segments_tupdesc, &pg_sys::TTSOpsHeapTuple)
-    };
-
     // Open input directly from URL — FFmpeg handles protocol decoding
     let mut ictx = ffmpeg_next::format::input(&url)
         .unwrap_or_else(|e| error!("failed to open input url: {e}"));
 
     // Allocate HLS output context with streaming I/O callbacks
-    let mut output_state = unsafe {
-        Box::new(HlsIoState {
-            playlist_id,
-            segment_index: 0,
-            m3u8_data: None,
-            seg_buf: SegmentBuf {
-                ptr: pg_sys::palloc(SEGMENT_BUF_INITIAL) as *mut u8,
-                len: 0,
-                cap: SEGMENT_BUF_INITIAL,
-            },
-            segment_pb: ptr::null_mut(),
-            segments_rel,
-            segments_tupdesc,
-            slot: segments_slot,
-        })
-    };
+    let mut output_state = Box::new(HlsIoState {
+        segment_index: 0,
+        m3u8_buf: Vec::new(),
+        m3u8_pb: ptr::null_mut(),
+        seg_buf: Vec::new(),
+        segment_pb: ptr::null_mut(),
+        segments: Vec::new(),
+    });
 
     let mut octx = unsafe {
         let mut ps: *mut AVFormatContext = ptr::null_mut();
         let format = std::ffi::CString::new("hls").unwrap();
+        let filename = std::ffi::CString::new("playlist.m3u8").unwrap();
 
         let ret = avformat_alloc_output_context2(
             &mut ps,
             ptr::null_mut(),
             format.as_ptr(),
-            ptr::null(),
+            filename.as_ptr(),
         );
         if ret < 0 || ps.is_null() {
             error!("failed to allocate HLS output context");
@@ -351,23 +257,11 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     drop(octx);
     drop(ictx);
 
-    // Free the reusable segment buffer
-    unsafe {
-        pg_sys::pfree(output_state.seg_buf.ptr as *mut c_void);
+    // Parse m3u8 and update playlist metadata
+    let m3u8_content = String::from_utf8_lossy(&output_state.m3u8_buf);
+    if m3u8_content.is_empty() {
+        error!("no m3u8 playlist found in output");
     }
-
-    // Clean up slot and close relation
-    unsafe {
-        pg_sys::ExecDropSingleTupleTableSlot(segments_slot);
-        pg_sys::relation_close(segments_rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-    }
-
-    // Parse m3u8 and update playlist metadata + segment durations
-    let m3u8_bytes = output_state
-        .m3u8_data
-        .take()
-        .unwrap_or_else(|| error!("no m3u8 playlist found in output"));
-    let m3u8_content = String::from_utf8_lossy(&m3u8_bytes);
     let playlist_info = parse_m3u8(&m3u8_content);
 
     Spi::connect_mut(|client| {
@@ -384,30 +278,25 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             )
             .unwrap_or_else(|e| error!("failed to update playlist: {e}"));
 
-        // Batch update all segment durations in a single query
-        if !playlist_info.segments.is_empty() {
-            let indices: Vec<Option<i32>> = (0..playlist_info.segments.len() as i32)
-                .map(|i| Some(i))
-                .collect();
-            let durations: Vec<Option<f64>> = playlist_info
+        // Insert segments
+        for seg in &output_state.segments {
+            let duration = playlist_info
                 .segments
-                .iter()
-                .map(|s| Some(s.duration))
-                .collect();
-
+                .get(seg.index as usize)
+                .map(|s| s.duration);
             client
                 .update(
-                    "UPDATE ffmpeg.hls_segments s SET duration = v.duration \
-                     FROM unnest($1::int4[], $2::float8[]) AS v(segment_index, duration) \
-                     WHERE s.playlist_id = $3 AND s.segment_index = v.segment_index",
+                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                     VALUES ($1, $2, $3, $4)",
                     None,
                     &[
-                        pgrx::datum::DatumWithOid::from(indices),
-                        pgrx::datum::DatumWithOid::from(durations),
                         pgrx::datum::DatumWithOid::from(playlist_id),
+                        pgrx::datum::DatumWithOid::from(seg.index),
+                        pgrx::datum::DatumWithOid::from(duration),
+                        pgrx::datum::DatumWithOid::from(seg.data.clone()),
                     ],
                 )
-                .unwrap_or_else(|e| error!("failed to update segment durations: {e}"));
+                .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
         }
     });
 
@@ -494,10 +383,10 @@ seg042.ts
         let duration_secs = 3;
         let total_frames = fps * duration_secs;
 
-        let codec = ffmpeg_next::encoder::find(codec::Id::MPEG4)
-            .expect("MPEG4 encoder not found");
+        let codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
+            .expect("MPEG2VIDEO encoder not found");
 
-        let mut octx = ffmpeg_next::format::output(path)
+        let mut octx = ffmpeg_next::format::output_as(path, "mpegts")
             .expect("failed to create output context");
 
         let mut stream = octx.add_stream(codec).expect("failed to add stream");
@@ -508,7 +397,9 @@ seg042.ts
         encoder.set_width(width);
         encoder.set_height(height);
         encoder.set_format(Pixel::YUV420P);
-        encoder.set_gop(12);
+        encoder.set_bit_rate(400_000);
+        encoder.set_gop(10);
+        encoder.set_max_b_frames(2);
         encoder.set_frame_rate(Some((fps, 1)));
         encoder.set_time_base((1, fps));
 
