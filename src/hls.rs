@@ -1,5 +1,5 @@
 use pgrx::prelude::*;
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
 
 use ffmpeg_next::sys::{
@@ -8,6 +8,10 @@ use ffmpeg_next::sys::{
 };
 
 const AVIO_BUF_SIZE: c_int = 4096;
+/// PostgreSQL's TOAST_MAX_CHUNK_SIZE for standard 8KB BLCKSZ with 64-bit alignment:
+/// BLCKSZ/4 - MAXALIGN(SizeofHeapTupleHeader + 3*ItemIdData) - sizeof(int32) - MAXALIGN(sizeof(varattrib_4b))
+/// = 2048 - 40 - 4 - 8 = 1996
+const TOAST_CHUNK_SIZE: usize = 1996;
 
 /// Custom write callback: appends into a Vec<u8>.
 unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
@@ -105,6 +109,89 @@ unsafe extern "C" fn hls_io_close2(
     let mut pb_mut = pb;
     avio_context_free(&mut pb_mut);
     0
+}
+
+/// Write bytes as TOAST chunks directly into the TOAST relation.
+/// Returns (value_id, byte_count).
+unsafe fn write_toast_chunks(
+    toast_rel: pg_sys::Relation,
+    toast_idx: pg_sys::Relation,
+    toast_idx_info: *mut pg_sys::IndexInfo,
+    data: &[u8],
+) -> (pg_sys::Oid, usize) {
+    let toast_idx_oid = (*toast_idx).rd_id;
+    let value_id = pg_sys::GetNewOidWithIndex(toast_rel, toast_idx_oid, 1);
+    let value_id_u32: u32 = std::mem::transmute(value_id);
+    let tupdesc = (*toast_rel).rd_att;
+    let mut seq: i32 = 0;
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let end = (offset + TOAST_CHUNK_SIZE).min(data.len());
+        let chunk_len = end - offset;
+
+        // Build chunk_data varlena in palloc'd memory
+        let varlena_size = pg_sys::VARHDRSZ + chunk_len;
+        let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
+        *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
+        ptr::copy_nonoverlapping(data[offset..end].as_ptr(), cbuf.add(pg_sys::VARHDRSZ), chunk_len);
+
+        let mut values: [pg_sys::Datum; 3] = [
+            pg_sys::Datum::from(value_id_u32 as usize),
+            pg_sys::Datum::from(seq as usize),
+            pg_sys::Datum::from(cbuf as usize),
+        ];
+        let mut nulls: [bool; 3] = [false; 3];
+
+        let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
+        (*tuple).t_tableOid = (*toast_rel).rd_id;
+        pg_sys::heap_insert(
+            toast_rel,
+            tuple,
+            pg_sys::GetCurrentCommandId(true),
+            0,
+            ptr::null_mut(),
+        );
+        pg_sys::index_insert(
+            toast_idx,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            &mut (*tuple).t_self,
+            toast_rel,
+            pg_sys::IndexUniqueCheck::UNIQUE_CHECK_YES,
+            false,
+            toast_idx_info,
+        );
+        pg_sys::pfree(tuple as *mut c_void);
+        pg_sys::pfree(cbuf as *mut c_void);
+
+        seq += 1;
+        offset = end;
+    }
+
+    (value_id, data.len())
+}
+
+/// Build an ondisk TOAST pointer in palloc'd memory. Returns a Datum.
+unsafe fn build_toast_pointer(
+    value_id: pg_sys::Oid,
+    toast_rel_oid: pg_sys::Oid,
+    rawsize: usize,
+) -> pg_sys::Datum {
+    let ptr_size = 2 + std::mem::size_of::<pg_sys::varatt_external>();
+    let buf = pg_sys::palloc(ptr_size) as *mut u8;
+    *buf = 0x01; // 1-byte external varlena header
+    *buf.add(1) = pg_sys::vartag_external::VARTAG_ONDISK as u8;
+    ptr::write_unaligned(
+        buf.add(2) as *mut pg_sys::varatt_external,
+        pg_sys::varatt_external {
+            va_rawsize: (rawsize + pg_sys::VARHDRSZ) as i32,
+            va_extinfo: rawsize as u32,
+            va_valueid: value_id,
+            va_toastrelid: toast_rel_oid,
+        },
+    );
+    pg_sys::Datum::from(buf as usize)
 }
 
 // --- m3u8 parsing ---
@@ -235,7 +322,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
 
-    // Remux packets — segments stream to DB as they complete
+    // Remux packets — segments are buffered in output_state.segments
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
         if let Some(Some(out_idx)) = stream_mapping.get(input_index) {
@@ -264,6 +351,46 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     }
     let playlist_info = parse_m3u8(&m3u8_content);
 
+    // Open the TOAST relation for hls_segments.data — all PG work happens AFTER write_trailer()
+    let (toast_rel, toast_idx, toast_idx_info, toast_rel_oid) = unsafe {
+        // Get the hls_segments OID and its TOAST OID
+        let seg_oid = {
+            use pgrx::PgRelation;
+            let rel = PgRelation::open_with_name("ffmpeg.hls_segments")
+                .unwrap_or_else(|_| error!("failed to open hls_segments"));
+            rel.oid()
+        };
+        let srel = pg_sys::relation_open(seg_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let toast_oid = (*(*srel).rd_rel).reltoastrelid;
+        pg_sys::relation_close(srel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        if toast_oid == pg_sys::Oid::INVALID {
+            error!("hls_segments has no TOAST table");
+        }
+
+        let trel = pg_sys::relation_open(toast_oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+        let idx_list = pg_sys::RelationGetIndexList(trel);
+        if idx_list.is_null() || (*idx_list).length == 0 {
+            error!("TOAST relation has no index");
+        }
+        let tidx_oid = (*(*idx_list).elements).oid_value;
+        let tidx = pg_sys::index_open(tidx_oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+        let tidx_info = pg_sys::BuildIndexInfo(tidx);
+        (trel, tidx, tidx_info, toast_oid)
+    };
+
+    // Prepare INSERT statement for segments — uses SPI_execute_with_args to pass pre-built TOAST pointer
+    let insert_sql = CString::new(
+        "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .unwrap();
+    let mut insert_argtypes = [
+        pg_sys::INT8OID,
+        pg_sys::INT4OID,
+        pg_sys::FLOAT8OID,
+        pg_sys::BYTEAOID,
+    ];
+
     Spi::connect_mut(|client| {
         // Update playlist metadata
         client
@@ -278,27 +405,54 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             )
             .unwrap_or_else(|e| error!("failed to update playlist: {e}"));
 
-        // Insert segments
+        // Insert each segment: write TOAST chunks directly, then SPI INSERT with the pointer
         for seg in &output_state.segments {
-            let duration = playlist_info
-                .segments
-                .get(seg.index as usize)
-                .map(|s| s.duration);
-            client
-                .update(
-                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
-                     VALUES ($1, $2, $3, $4)",
-                    None,
-                    &[
-                        pgrx::datum::DatumWithOid::from(playlist_id),
-                        pgrx::datum::DatumWithOid::from(seg.index),
-                        pgrx::datum::DatumWithOid::from(duration),
-                        pgrx::datum::DatumWithOid::from(seg.data.clone()),
-                    ],
-                )
-                .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
+            let duration = playlist_info.segments.get(seg.index as usize).map(|s| s.duration);
+
+            // Write TOAST chunks directly — no seg.data.clone() required
+            let (value_id, total) = unsafe {
+                write_toast_chunks(toast_rel, toast_idx, toast_idx_info, &seg.data)
+            };
+            let toast_datum = unsafe { build_toast_pointer(value_id, toast_rel_oid, total) };
+
+            let dur_val = duration.unwrap_or(0.0_f64);
+            let mut values = [
+                pg_sys::Datum::from(playlist_id as usize),
+                pg_sys::Datum::from(seg.index as usize),
+                pg_sys::Datum::from(dur_val.to_bits() as usize),
+                toast_datum,
+            ];
+            // nulls: ' ' = non-null, 'n' = null
+            let nulls: [i8; 5] = [
+                b' ' as i8,
+                b' ' as i8,
+                if duration.is_some() { b' ' as i8 } else { b'n' as i8 },
+                b' ' as i8,
+                0i8,
+            ];
+
+            unsafe {
+                let ret = pg_sys::SPI_execute_with_args(
+                    insert_sql.as_ptr(),
+                    4,
+                    insert_argtypes.as_mut_ptr(),
+                    values.as_mut_ptr(),
+                    nulls.as_ptr(),
+                    false,
+                    1,
+                );
+                if ret < 0 {
+                    error!("failed to insert segment {}: SPI error {}", seg.index, ret);
+                }
+            }
         }
     });
+
+    // Close TOAST index and relation
+    unsafe {
+        pg_sys::index_close(toast_idx, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+        pg_sys::relation_close(toast_rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+    }
 
     playlist_id
 }
