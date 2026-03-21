@@ -90,10 +90,17 @@ fn transcode(
     let enc_codec = codec::encoder::find(codec_id)
         .unwrap_or_else(|| error!("no encoder found for codec {:?}", codec_id));
     let mut enc_ctx = codec::context::Context::new_with_codec(enc_codec);
-    // Copy source codec parameters so bit_rate, gop, profile, etc. carry over
+    // Copy source codec parameters (bit_rate, profile, level, etc.)
     enc_ctx
         .set_parameters(video_params)
         .unwrap_or_else(|e| error!("failed to copy codec parameters: {e}"));
+    // Copy encoder-specific fields not in AVCodecParameters
+    unsafe {
+        let dec_ptr = decoder.as_ptr();
+        let enc_ptr = enc_ctx.as_mut_ptr();
+        (*enc_ptr).gop_size = (*dec_ptr).gop_size;
+        (*enc_ptr).max_b_frames = (*dec_ptr).max_b_frames;
+    }
     let mut video_enc = enc_ctx
         .encoder()
         .video()
