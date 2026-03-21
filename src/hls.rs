@@ -28,8 +28,8 @@ unsafe extern "C" fn toast_write(opaque: *mut c_void, data: *const u8, size: c_i
 }
 
 /// Streams bytes into TOAST chunks without buffering the full segment.
-/// Begin a segment with `begin_segment()`, feed data via `write_data()`, and
-/// call `end_segment()` to flush the last partial chunk.
+/// Chunks are staged as TupleTableSlots during write_data() and
+/// batch-inserted via heap_multi_insert in end_segment().
 struct ToastWriter {
     toast_rel: pg_sys::Relation,
     toast_idx: pg_sys::Relation,
@@ -41,7 +41,10 @@ struct ToastWriter {
     total_bytes: usize,
     partial: [u8; TOAST_CHUNK_SIZE],
     partial_len: usize,
-    bistate: pg_sys::BulkInsertState,
+    // Staged slots accumulated for heap_multi_insert in end_segment().
+    slot_ptrs: Vec<*mut pg_sys::TupleTableSlot>,
+    all_values: Vec<[pg_sys::Datum; 3]>,
+    all_nulls: Vec<[bool; 3]>,
 }
 
 impl ToastWriter {
@@ -50,7 +53,9 @@ impl ToastWriter {
         self.seq = 0;
         self.total_bytes = 0;
         self.partial_len = 0;
-        self.bistate = pg_sys::GetBulkInsertState();
+        self.slot_ptrs.clear();
+        self.all_values.clear();
+        self.all_nulls.clear();
     }
 
     unsafe fn write_data(&mut self, data: &[u8]) {
@@ -63,12 +68,13 @@ impl ToastWriter {
             self.partial_len += to_copy;
             pos += to_copy;
             if self.partial_len == TOAST_CHUNK_SIZE {
-                self.flush_chunk();
+                self.stage_chunk();
             }
         }
     }
 
-    unsafe fn flush_chunk(&mut self) {
+    // Copy the current partial buffer into a TupleTableSlot and stage it for batch insert.
+    unsafe fn stage_chunk(&mut self) {
         if self.partial_len == 0 {
             return;
         }
@@ -79,42 +85,58 @@ impl ToastWriter {
         ptr::copy_nonoverlapping(self.partial.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), chunk_len);
 
         let value_id_u32: u32 = std::mem::transmute(self.value_id);
-        let mut values: [pg_sys::Datum; 3] = [
+        self.all_values.push([
             pg_sys::Datum::from(value_id_u32 as usize),
             pg_sys::Datum::from(self.seq as usize),
             pg_sys::Datum::from(cbuf as usize),
-        ];
-        let mut nulls: [bool; 3] = [false; 3];
+        ]);
+        self.all_nulls.push([false; 3]);
+
+        let vals = self.all_values.last_mut().unwrap();
+        let nulls = self.all_nulls.last_mut().unwrap();
         let tupdesc = (*self.toast_rel).rd_att;
-        let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
+        let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
         (*tuple).t_tableOid = (*self.toast_rel).rd_id;
-        pg_sys::heap_insert(
-            self.toast_rel,
-            tuple,
-            pg_sys::GetCurrentCommandId(true),
-            0,
-            self.bistate,
-        );
-        pg_sys::index_insert(
-            self.toast_idx,
-            values.as_mut_ptr(),
-            nulls.as_mut_ptr(),
-            &mut (*tuple).t_self,
-            self.toast_rel,
-            pg_sys::IndexUniqueCheck::UNIQUE_CHECK_YES,
-            false,
-            self.toast_idx_info,
-        );
-        pg_sys::pfree(tuple as *mut c_void);
-        pg_sys::pfree(cbuf as *mut c_void);
+
+        let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+        pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
+        self.slot_ptrs.push(slot);
+
         self.seq += 1;
         self.partial_len = 0;
     }
 
+    // Flush all staged chunks via heap_multi_insert, then update the TOAST index per slot.
     unsafe fn end_segment(&mut self) -> (pg_sys::Oid, usize) {
-        self.flush_chunk();
-        pg_sys::FreeBulkInsertState(self.bistate);
-        self.bistate = ptr::null_mut();
+        self.stage_chunk(); // stage last partial chunk
+
+        if !self.slot_ptrs.is_empty() {
+            let bistate = pg_sys::GetBulkInsertState();
+            pg_sys::heap_multi_insert(
+                self.toast_rel,
+                self.slot_ptrs.as_mut_ptr(),
+                self.slot_ptrs.len() as c_int,
+                pg_sys::GetCurrentCommandId(true),
+                0,
+                bistate,
+            );
+            pg_sys::FreeBulkInsertState(bistate);
+
+            for (i, &slot) in self.slot_ptrs.iter().enumerate() {
+                pg_sys::index_insert(
+                    self.toast_idx,
+                    self.all_values[i].as_mut_ptr(),
+                    self.all_nulls[i].as_mut_ptr(),
+                    &mut (*slot).tts_tid,
+                    self.toast_rel,
+                    pg_sys::IndexUniqueCheck::UNIQUE_CHECK_YES,
+                    false,
+                    self.toast_idx_info,
+                );
+                pg_sys::ExecDropSingleTupleTableSlot(slot);
+            }
+        }
+
         (self.value_id, self.total_bytes)
     }
 }
@@ -347,7 +369,9 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             total_bytes: 0,
             partial: [0u8; TOAST_CHUNK_SIZE],
             partial_len: 0,
-            bistate: ptr::null_mut(),
+            slot_ptrs: Vec::new(),
+            all_values: Vec::new(),
+            all_nulls: Vec::new(),
         },
         completed: Vec::new(),
     });
