@@ -13,8 +13,7 @@ extension_sql!(
     r#"
 CREATE TABLE hls_playlists (
     id              bigserial PRIMARY KEY,
-    target_duration int NOT NULL DEFAULT 0,
-    media_sequence  int NOT NULL DEFAULT 0
+    target_duration int NOT NULL DEFAULT 0
 );
 
 CREATE TABLE hls_segments (
