@@ -111,7 +111,9 @@ unsafe extern "C" fn hls_io_close2(
     0
 }
 
-/// Write bytes as TOAST chunks directly into the TOAST relation.
+/// Write bytes as TOAST chunks directly into the TOAST relation using
+/// heap_multi_insert: build all chunk slots first, batch-insert into the heap,
+/// then update the index per slot.
 /// Returns (value_id, byte_count).
 unsafe fn write_toast_chunks(
     toast_rel: pg_sys::Relation,
@@ -123,50 +125,63 @@ unsafe fn write_toast_chunks(
     let value_id = pg_sys::GetNewOidWithIndex(toast_rel, toast_idx_oid, 1);
     let value_id_u32: u32 = std::mem::transmute(value_id);
     let tupdesc = (*toast_rel).rd_att;
-    let mut seq: i32 = 0;
-    let mut offset = 0;
 
-    while offset < data.len() {
-        let end = (offset + TOAST_CHUNK_SIZE).min(data.len());
-        let chunk_len = end - offset;
+    let n = data.len().div_ceil(TOAST_CHUNK_SIZE);
+    let mut slot_ptrs: Vec<*mut pg_sys::TupleTableSlot> = Vec::with_capacity(n);
+    // Keep values/nulls alive through index_insert (values[2] holds the cbuf pointer).
+    let mut all_values: Vec<[pg_sys::Datum; 3]> = Vec::with_capacity(n);
+    let mut all_nulls: Vec<[bool; 3]> = Vec::with_capacity(n);
 
-        // Build chunk_data varlena in palloc'd memory
+    // Build one TupleTableSlot per chunk (heap_form_tuple copies the varlena data).
+    for (seq, chunk) in data.chunks(TOAST_CHUNK_SIZE).enumerate() {
+        let chunk_len = chunk.len();
         let varlena_size = pg_sys::VARHDRSZ + chunk_len;
         let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
         *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
-        ptr::copy_nonoverlapping(data[offset..end].as_ptr(), cbuf.add(pg_sys::VARHDRSZ), chunk_len);
+        ptr::copy_nonoverlapping(chunk.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), chunk_len);
 
-        let mut values: [pg_sys::Datum; 3] = [
+        all_values.push([
             pg_sys::Datum::from(value_id_u32 as usize),
             pg_sys::Datum::from(seq as usize),
             pg_sys::Datum::from(cbuf as usize),
-        ];
-        let mut nulls: [bool; 3] = [false; 3];
+        ]);
+        all_nulls.push([false; 3]);
 
-        let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
+        let vals = all_values.last_mut().unwrap();
+        let nulls = all_nulls.last_mut().unwrap();
+        let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
         (*tuple).t_tableOid = (*toast_rel).rd_id;
-        pg_sys::heap_insert(
-            toast_rel,
-            tuple,
-            pg_sys::GetCurrentCommandId(true),
-            0,
-            ptr::null_mut(),
-        );
+
+        let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+        pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
+        slot_ptrs.push(slot);
+    }
+
+    // Batch-insert all chunk tuples into the heap in one call.
+    let bistate = pg_sys::GetBulkInsertState();
+    pg_sys::heap_multi_insert(
+        toast_rel,
+        slot_ptrs.as_mut_ptr(),
+        slot_ptrs.len() as c_int,
+        pg_sys::GetCurrentCommandId(true),
+        0,
+        bistate,
+    );
+    pg_sys::FreeBulkInsertState(bistate);
+
+    // Update the TOAST index per slot using the TIDs set by heap_multi_insert.
+    for (i, &slot) in slot_ptrs.iter().enumerate() {
         pg_sys::index_insert(
             toast_idx,
-            values.as_mut_ptr(),
-            nulls.as_mut_ptr(),
-            &mut (*tuple).t_self,
+            all_values[i].as_mut_ptr(),
+            all_nulls[i].as_mut_ptr(),
+            &mut (*slot).tts_tid,
             toast_rel,
             pg_sys::IndexUniqueCheck::UNIQUE_CHECK_YES,
             false,
             toast_idx_info,
         );
-        pg_sys::pfree(tuple as *mut c_void);
-        pg_sys::pfree(cbuf as *mut c_void);
-
-        seq += 1;
-        offset = end;
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
     }
 
     (value_id, data.len())
