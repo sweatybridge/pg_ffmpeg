@@ -1,17 +1,13 @@
 use pgrx::prelude::*;
 use serde_json::json;
 
-use crate::write_to_tempfile;
+use crate::mem_io::MemInput;
 
 #[pg_extern]
 fn media_info(data: Vec<u8>) -> pgrx::JsonB {
     ffmpeg_next::init().unwrap();
 
-    let tmp = write_to_tempfile(&data, ".probe")
-        .unwrap_or_else(|e| error!("failed to write temp file: {e}"));
-
-    let ictx = ffmpeg_next::format::input(tmp.path())
-        .unwrap_or_else(|e| error!("failed to open media: {e}"));
+    let ictx = MemInput::open(data);
 
     let duration_secs = if ictx.duration() >= 0 {
         Some(ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE))

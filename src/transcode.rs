@@ -1,29 +1,13 @@
 use pgrx::prelude::*;
-use std::fs;
 
-use crate::write_to_tempfile;
+use crate::mem_io::{MemInput, MemOutput};
 
 #[pg_extern]
 fn transcode(data: Vec<u8>, format: &str) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 
-    let suffix = format!(".{format}");
-    let input_tmp = write_to_tempfile(&data, ".input")
-        .unwrap_or_else(|e| error!("failed to write input temp file: {e}"));
-
-    let output_tmp = tempfile::Builder::new()
-        .suffix(&suffix)
-        .tempfile()
-        .unwrap_or_else(|e| error!("failed to create output temp file: {e}"));
-    let output_path = output_tmp.path().to_path_buf();
-    // Close the output file so ffmpeg can write to it
-    drop(output_tmp);
-
-    let mut ictx = ffmpeg_next::format::input(input_tmp.path())
-        .unwrap_or_else(|e| error!("failed to open input: {e}"));
-
-    let mut octx = ffmpeg_next::format::output_as(&output_path, format)
-        .unwrap_or_else(|e| error!("failed to create output context for format '{format}': {e}"));
+    let mut ictx = MemInput::open(data);
+    let mut octx = MemOutput::open(format);
 
     // Copy all streams (remux without re-encoding)
     let mut stream_mapping = vec![];
@@ -58,7 +42,7 @@ fn transcode(data: Vec<u8>, format: &str) -> Vec<u8> {
             packet.rescale_ts(in_tb, out_tb);
             packet.set_position(-1);
             packet
-                .write_interleaved(&mut octx)
+                .write_interleaved(&mut *octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
         }
     }
@@ -66,9 +50,5 @@ fn transcode(data: Vec<u8>, format: &str) -> Vec<u8> {
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    let result = fs::read(&output_path)
-        .unwrap_or_else(|e| error!("failed to read output file: {e}"));
-
-    let _ = fs::remove_file(&output_path);
-    result
+    octx.into_data()
 }

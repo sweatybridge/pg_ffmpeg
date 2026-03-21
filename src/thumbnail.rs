@@ -5,17 +5,13 @@ use ffmpeg_next::media::Type;
 use ffmpeg_next::software::scaling::{context::Context, flag::Flags};
 use ffmpeg_next::util::frame::video::Video;
 
-use crate::write_to_tempfile;
+use crate::mem_io::MemInput;
 
 #[pg_extern]
 fn thumbnail(data: Vec<u8>, seconds: default!(f64, 0.0)) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 
-    let tmp = write_to_tempfile(&data, ".video")
-        .unwrap_or_else(|e| error!("failed to write temp file: {e}"));
-
-    let mut ictx = ffmpeg_next::format::input(tmp.path())
-        .unwrap_or_else(|e| error!("failed to open media: {e}"));
+    let mut ictx = MemInput::open(data);
 
     let input = ictx
         .streams()
