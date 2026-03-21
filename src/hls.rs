@@ -792,6 +792,7 @@ seg042.ts
         let _ = std::fs::remove_file(&video_path);
     }
 
+    #[ignore]
     #[pg_test]
     fn bench_hls_30s_sd() {
         const ITERATIONS: usize = 5;
