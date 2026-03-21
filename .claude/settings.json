@@ -1,5 +1,0 @@
-{
-  "env": {
-    "CARGO_PGRX_TEST_RUNAS": "postgres"
-  }
-}
