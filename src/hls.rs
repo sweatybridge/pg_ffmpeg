@@ -794,6 +794,8 @@ seg042.ts
 
     #[pg_test]
     fn bench_hls_30s_sd() {
+        const ITERATIONS: usize = 5;
+
         let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
         let video_path = tmp.path().to_path_buf();
         drop(tmp);
@@ -801,37 +803,52 @@ seg042.ts
         let gen_start = std::time::Instant::now();
         generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
         let gen_elapsed = gen_start.elapsed();
-
-        let url = format!("file://{}", video_path.display());
-
-        let hls_start = std::time::Instant::now();
-        let playlist_id = crate::hls::hls(&url, 6);
-        let hls_elapsed = hls_start.elapsed();
-
         pgrx::warning!(
-            "BENCH bench_hls_30s_sd: video_gen={:.3}s hls={:.3}s total={:.3}s playlist_id={}",
+            "BENCH bench_hls_30s_sd: video_gen={:.3}s",
             gen_elapsed.as_secs_f64(),
-            hls_elapsed.as_secs_f64(),
-            (gen_elapsed + hls_elapsed).as_secs_f64(),
-            playlist_id,
         );
 
-        assert!(playlist_id > 0);
+        let url = format!("file://{}", video_path.display());
+        let mut durations = Vec::with_capacity(ITERATIONS);
 
-        let seg_count = Spi::connect(|client| {
-            client
-                .select(
-                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
-                    None,
-                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
-                )
-                .unwrap()
-                .first()
-                .get_one::<i32>()
-                .unwrap()
-                .unwrap()
-        });
-        pgrx::warning!("BENCH bench_hls_30s_sd: segments={}", seg_count);
+        for i in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            let playlist_id = crate::hls::hls(&url, 6);
+            let elapsed = start.elapsed().as_secs_f64();
+            durations.push(elapsed);
+            assert!(playlist_id > 0);
+
+            if i == 0 {
+                let seg_count = Spi::connect(|client| {
+                    client
+                        .select(
+                            "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                            None,
+                            &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                        )
+                        .unwrap()
+                        .first()
+                        .get_one::<i32>()
+                        .unwrap()
+                        .unwrap()
+                });
+                pgrx::warning!("BENCH bench_hls_30s_sd: segments={}", seg_count);
+            }
+        }
+
+        durations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = durations.len() as f64;
+        let mean = durations.iter().sum::<f64>() / n;
+        let variance = durations.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let stddev = variance.sqrt();
+        let median = durations[durations.len() / 2];
+        let min = durations[0];
+        let max = durations[durations.len() - 1];
+
+        pgrx::warning!(
+            "BENCH bench_hls_30s_sd: iterations={} mean={:.3}s stddev={:.3}s median={:.3}s min={:.3}s max={:.3}s",
+            ITERATIONS, mean, stddev, median, min, max,
+        );
 
         let _ = std::fs::remove_file(&video_path);
     }
