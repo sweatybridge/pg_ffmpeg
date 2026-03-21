@@ -253,32 +253,25 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     let playlist_info = parse_m3u8(&m3u8_content);
 
     Spi::connect_mut(|client| {
-        // Batch insert segments
-        let n = output_state.segments.len();
-        if n > 0 {
-            let mut sql = String::from(
-                "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) VALUES ",
-            );
-            let mut args: Vec<pgrx::datum::DatumWithOid> = Vec::with_capacity(n * 4);
-            for (i, seg) in output_state.segments.iter().enumerate() {
-                let base = i * 4;
-                if i > 0 {
-                    sql.push(',');
-                }
-                use std::fmt::Write;
-                write!(sql, "(${}, ${}, ${}, ${})", base + 1, base + 2, base + 3, base + 4).unwrap();
-                let duration = playlist_info
-                    .segments
-                    .get(seg.index as usize)
-                    .map(|s| s.duration);
-                args.push(pgrx::datum::DatumWithOid::from(playlist_id));
-                args.push(pgrx::datum::DatumWithOid::from(seg.index));
-                args.push(pgrx::datum::DatumWithOid::from(duration));
-                args.push(pgrx::datum::DatumWithOid::from(seg.data.clone()));
-            }
+        // Insert segments
+        for seg in &output_state.segments {
+            let duration = playlist_info
+                .segments
+                .get(seg.index as usize)
+                .map(|s| s.duration);
             client
-                .update(&sql, None, &args)
-                .unwrap_or_else(|e| error!("failed to insert segments: {e}"));
+                .update(
+                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                     VALUES ($1, $2, $3, $4)",
+                    None,
+                    &[
+                        pgrx::datum::DatumWithOid::from(playlist_id),
+                        pgrx::datum::DatumWithOid::from(seg.index),
+                        pgrx::datum::DatumWithOid::from(duration),
+                        pgrx::datum::DatumWithOid::from(seg.data.clone()),
+                    ],
+                )
+                .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
         }
     });
 
