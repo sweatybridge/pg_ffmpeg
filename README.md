@@ -12,6 +12,7 @@ All functions are in the `pg_ffmpeg` schema.
 | `thumbnail(data bytea, seconds float8 DEFAULT 0.0) → bytea` | Extract a video frame as PPM image at the given timestamp |
 | `transcode(data bytea, format text) → bytea` | Remux media into a different container format |
 | `extract_audio(data bytea, format text DEFAULT 'mp3') → bytea` | Extract the audio track from a video file |
+| `hls(url text, segment_duration int DEFAULT 6) → bigint` | Fetch a video via URL, split into HLS segments, and store in `ffmpeg.hls_playlists` / `ffmpeg.hls_segments` |
 
 ## Prerequisites
 
@@ -50,6 +51,9 @@ SELECT pg_ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), 'matroska'
 
 -- Extract audio as MP3
 SELECT pg_ffmpeg.extract_audio(pg_read_binary_file('/path/to/video.mp4'), 'mp3');
+
+-- Split a remote video into HLS segments (6s default)
+SELECT pg_ffmpeg.hls('https://example.com/video.mp4', 6);
 ```
 
 ## License
