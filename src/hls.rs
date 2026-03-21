@@ -231,6 +231,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     opts.set("hls_time", &segment_duration.to_string());
     opts.set("hls_segment_filename", "seg%03d.ts");
     opts.set("hls_list_size", "0");
+    opts.set("hls_playlist_type", "vod");
 
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
