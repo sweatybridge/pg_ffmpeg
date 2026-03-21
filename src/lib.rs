@@ -25,6 +25,8 @@ CREATE TABLE hls_segments (
 );
 
 CREATE INDEX ON hls_segments (playlist_id);
+
+ALTER TABLE hls_segments ALTER COLUMN data SET STORAGE EXTERNAL;
 "#,
     name = "create_hls_tables",
 );
