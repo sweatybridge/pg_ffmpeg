@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 
 mod extract_audio;
 mod hls;
+pub mod mem_io;
 mod media_info;
 mod thumbnail;
 mod transcode;
@@ -30,18 +31,6 @@ ALTER TABLE hls_segments ALTER COLUMN data SET STORAGE EXTERNAL;
 "#,
     name = "create_hls_tables",
 );
-
-/// Write bytea data to a temporary file with the given suffix.
-pub fn write_to_tempfile(
-    data: &[u8],
-    suffix: &str,
-) -> Result<tempfile::NamedTempFile, std::io::Error> {
-    use std::io::Write;
-    let mut tmp = tempfile::Builder::new().suffix(suffix).tempfile()?;
-    tmp.write_all(data)?;
-    tmp.flush()?;
-    Ok(tmp)
-}
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
