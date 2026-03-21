@@ -125,36 +125,6 @@ unsafe extern "C" fn hls_io_close2(
     avio_context_free(&mut pb_mut);
     0
 }
-
-// --- m3u8 parsing ---
-
-struct SegmentInfo {
-    duration: f64,
-}
-
-struct PlaylistInfo {
-    segments: Vec<SegmentInfo>,
-}
-
-fn parse_m3u8(content: &str) -> PlaylistInfo {
-    let mut segments = Vec::new();
-    let mut pending_duration: Option<f64> = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("#EXTINF:") {
-            let dur_str = val.trim_end_matches(',');
-            pending_duration = dur_str.parse().ok();
-        } else if !line.starts_with('#') && !line.is_empty() {
-            if let Some(duration) = pending_duration.take() {
-                segments.push(SegmentInfo { duration });
-            }
-        }
-    }
-
-    PlaylistInfo { segments }
-}
-
 // --- Main function ---
 
 #[pg_extern]
@@ -294,44 +264,6 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
 #[pg_schema]
 mod tests {
     use super::*;
-
-    // --- Unit tests for parse_m3u8 (no PostgreSQL needed) ---
-
-    #[test]
-    fn test_parse_m3u8_basic() {
-        let m3u8 = "\
-#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:6
-#EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:5.005333,
-seg000.ts
-#EXTINF:4.838167,
-seg001.ts
-#EXTINF:2.135467,
-seg002.ts
-#EXT-X-ENDLIST
-";
-        let info = parse_m3u8(m3u8);
-        assert_eq!(info.segments.len(), 3);
-        assert!((info.segments[0].duration - 5.005333).abs() < 1e-6);
-        assert!((info.segments[1].duration - 4.838167).abs() < 1e-6);
-        assert!((info.segments[2].duration - 2.135467).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_parse_m3u8_empty() {
-        let info = parse_m3u8("#EXTM3U\n#EXT-X-ENDLIST\n");
-        assert!(info.segments.is_empty());
-    }
-
-    #[test]
-    fn test_parse_m3u8_trailing_comma_stripped() {
-        let m3u8 = "#EXTINF:3.500000,\nseg.ts\n";
-        let info = parse_m3u8(m3u8);
-        assert_eq!(info.segments.len(), 1);
-        assert!((info.segments[0].duration - 3.5).abs() < 1e-6);
-    }
 
     // --- Integration test requiring PostgreSQL ---
 
