@@ -3,7 +3,11 @@ use pgrx::prelude::*;
 use crate::mem_io::{MemInput, MemOutput};
 
 #[pg_extern]
-fn transcode(data: Vec<u8>, format: &str, filter: default!(Option<&str>, "NULL")) -> Vec<u8> {
+fn transcode(
+    data: Vec<u8>,
+    format: default!(Option<&str>, "NULL"),
+    filter: default!(Option<&str>, "NULL"),
+) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 
     let spec = filter.unwrap_or("null");
@@ -11,14 +15,16 @@ fn transcode(data: Vec<u8>, format: &str, filter: default!(Option<&str>, "NULL")
 }
 
 /// Transcode with a video filter graph (decode → filter → encode).
-fn filter_transcode(data: Vec<u8>, format: &str, filter_spec: &str) -> Vec<u8> {
+fn filter_transcode(data: Vec<u8>, format: Option<&str>, filter_spec: &str) -> Vec<u8> {
     use ffmpeg_next::codec;
     use ffmpeg_next::filter;
     use ffmpeg_next::media::Type;
     use ffmpeg_next::util::frame::video::Video;
 
     let mut ictx = MemInput::open(data);
-    let mut octx = MemOutput::open(format);
+    let input_format = ictx.format().name().to_owned();
+    let out_format = format.unwrap_or(&input_format);
+    let mut octx = MemOutput::open(out_format);
 
     // Find best video stream and create decoder
     let video_stream = ictx
