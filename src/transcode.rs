@@ -29,10 +29,9 @@ fn transcode(
         .unwrap_or_else(|| error!("no video stream found"));
     let video_stream_index = video_stream.index();
     let video_time_base = video_stream.time_base();
-    let video_params = video_stream.parameters();
 
     let decoder_ctx =
-        codec::context::Context::from_parameters(video_params.clone())
+        codec::context::Context::from_parameters(video_stream.parameters())
             .unwrap_or_else(|e| error!("failed to create decoder context: {e}"));
     let mut decoder = decoder_ctx
         .decoder()
@@ -89,18 +88,7 @@ fn transcode(
     let codec_id = decoder.id();
     let enc_codec = codec::encoder::find(codec_id)
         .unwrap_or_else(|| error!("no encoder found for codec {:?}", codec_id));
-    let mut enc_ctx = codec::context::Context::new_with_codec(enc_codec);
-    // Copy source codec parameters (bit_rate, profile, level, etc.)
-    enc_ctx
-        .set_parameters(video_params)
-        .unwrap_or_else(|e| error!("failed to copy codec parameters: {e}"));
-    // Copy encoder-specific fields not in AVCodecParameters
-    unsafe {
-        let dec_ptr = decoder.as_ptr();
-        let enc_ptr = enc_ctx.as_mut_ptr();
-        (*enc_ptr).gop_size = (*dec_ptr).gop_size;
-        (*enc_ptr).max_b_frames = (*dec_ptr).max_b_frames;
-    }
+    let enc_ctx = codec::context::Context::new_with_codec(enc_codec);
     let mut video_enc = enc_ctx
         .encoder()
         .video()
@@ -115,6 +103,14 @@ fn transcode(
     });
     if let Some(frame_rate) = decoder.frame_rate() {
         video_enc.set_frame_rate(Some(frame_rate));
+    }
+    video_enc.set_bit_rate(decoder.bit_rate());
+    // Copy encoder-specific fields not exposed by ffmpeg_next's safe API
+    unsafe {
+        let dec_ptr = decoder.as_ptr();
+        let enc_ptr = video_enc.as_mut_ptr();
+        (*enc_ptr).gop_size = (*dec_ptr).gop_size;
+        (*enc_ptr).max_b_frames = (*dec_ptr).max_b_frames;
     }
     let mut encoder = video_enc
         .open_as(enc_codec)
