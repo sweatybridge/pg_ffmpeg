@@ -15,22 +15,19 @@ unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int
     size
 }
 
-struct CollectedSegment {
-    index: i32,
-    duration: Option<f64>,
-    data: Vec<u8>,
-}
-
 struct HlsIoState {
     segment_index: i32,
+    playlist_id: i64,
     /// Buffer for the m3u8 playlist being written.
     m3u8_buf: Vec<u8>,
     m3u8_pb: *mut AVIOContext,
     /// Buffer for the current .ts segment being written.
     seg_buf: Vec<u8>,
     segment_pb: *mut AVIOContext,
-    /// Completed segments collected during muxing.
-    segments: Vec<CollectedSegment>,
+    /// DTS tracking for computing segment duration.
+    seg_start_dts: Option<i64>,
+    current_pkt_dts: Option<i64>,
+    video_tb_scale: f64,
 }
 
 unsafe extern "C" fn hls_io_open(
@@ -96,10 +93,27 @@ unsafe extern "C" fn hls_io_close2(
         if !state.seg_buf.is_empty() {
             let idx = state.segment_index;
             state.segment_index += 1;
-            state.segments.push(CollectedSegment {
-                index: idx,
-                duration: None,
-                data: std::mem::take(&mut state.seg_buf),
+            let duration = match (state.seg_start_dts, state.current_pkt_dts) {
+                (Some(start), Some(end)) => Some((end - start) as f64 * state.video_tb_scale),
+                _ => None,
+            };
+            state.seg_start_dts = state.current_pkt_dts;
+            let data = std::mem::take(&mut state.seg_buf);
+            let playlist_id = state.playlist_id;
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                         VALUES ($1, $2, $3, $4)",
+                        None,
+                        &[
+                            pgrx::datum::DatumWithOid::from(playlist_id),
+                            pgrx::datum::DatumWithOid::from(idx),
+                            pgrx::datum::DatumWithOid::from(duration),
+                            pgrx::datum::DatumWithOid::from(data),
+                        ],
+                    )
+                    .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
             });
         }
     } else {
@@ -170,11 +184,14 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
         segment_index: 0,
+        playlist_id,
         m3u8_buf: Vec::new(),
         m3u8_pb: ptr::null_mut(),
         seg_buf: Vec::new(),
         segment_pb: ptr::null_mut(),
-        segments: Vec::new(),
+        seg_start_dts: None,
+        current_pkt_dts: None,
+        video_tb_scale: 0.0,
     });
 
     let mut octx = unsafe {
@@ -233,14 +250,15 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
 
-    // Remux packets — segments stream to DB as they complete
-    let mut seg_start_dts: Option<i64> = None;
-    let mut last_video_dts: Option<i64> = None;
-    let mut prev_seg_count = 0usize;
-    let video_time_base = video_out_idx
-        .and_then(|idx| octx.stream(idx))
-        .map(|s| s.time_base());
+    // Set video time_base scale for duration computation in close callback
+    if let Some(idx) = video_out_idx {
+        if let Some(stream) = octx.stream(idx) {
+            let tb = stream.time_base();
+            output_state.video_tb_scale = tb.0 as f64 / tb.1 as f64;
+        }
+    }
 
+    // Remux packets — segments are inserted into DB via hls_io_close2 callback
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
         if let Some(Some(out_idx)) = stream_mapping.get(input_index) {
@@ -250,71 +268,24 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             packet.rescale_ts(in_tb, out_tb);
             packet.set_position(-1);
 
-            // Track video DTS before write (write may trigger segment close)
-            let is_video = Some(*out_idx) == video_out_idx;
-            let pkt_dts = if is_video { packet.dts() } else { None };
+            // Track video DTS before write (write may trigger segment close in callback)
+            if Some(*out_idx) == video_out_idx {
+                if let Some(dts) = packet.dts() {
+                    output_state.current_pkt_dts = Some(dts);
+                    if output_state.seg_start_dts.is_none() {
+                        output_state.seg_start_dts = Some(dts);
+                    }
+                }
+            }
 
             packet
                 .write_interleaved(&mut octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
-
-            // Detect segment completion: compute duration from DTS range
-            let seg_count = output_state.segments.len();
-            if seg_count > prev_seg_count {
-                if let (Some(start), Some(end), Some(tb)) =
-                    (seg_start_dts, pkt_dts, video_time_base)
-                {
-                    // Duration = time from segment start to next segment's first packet
-                    let dur = (end - start) as f64 * tb.0 as f64 / tb.1 as f64;
-                    output_state.segments[seg_count - 1].duration = Some(dur);
-                }
-                seg_start_dts = pkt_dts;
-                prev_seg_count = seg_count;
-            } else if let Some(dts) = pkt_dts {
-                if seg_start_dts.is_none() {
-                    seg_start_dts = Some(dts);
-                }
-                last_video_dts = Some(dts);
-            }
         }
     }
 
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
-
-    // Compute duration for the last segment (no next-segment DTS available)
-    let seg_count = output_state.segments.len();
-    if seg_count > prev_seg_count {
-        if let (Some(start), Some(end), Some(tb)) =
-            (seg_start_dts, last_video_dts, video_time_base)
-        {
-            let dur = (end - start) as f64 * tb.0 as f64 / tb.1 as f64;
-            output_state.segments[seg_count - 1].duration = Some(dur);
-        }
-    }
-
-    // Clean up FFmpeg contexts
-    drop(octx);
-    drop(ictx);
-
-    Spi::connect_mut(|client| {
-        // Insert segments
-        for seg in output_state.segments.drain(..) {
-            client
-                .update(
-                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
-                     VALUES ($1, $2, $3, $4)",
-                    None,
-                    &[
-                        pgrx::datum::DatumWithOid::from(playlist_id),
-                        pgrx::datum::DatumWithOid::from(seg.index),
-                        pgrx::datum::DatumWithOid::from(seg.duration),
-                        pgrx::datum::DatumWithOid::from(seg.data),
-                    ],
-                )
-                .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
-        }
-    });
 
     playlist_id
 }
