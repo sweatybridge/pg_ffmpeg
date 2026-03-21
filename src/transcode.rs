@@ -8,18 +8,14 @@ fn transcode(
     format: default!(Option<&str>, "NULL"),
     filter: default!(Option<&str>, "NULL"),
 ) -> Vec<u8> {
-    ffmpeg_next::init().unwrap();
-
-    let spec = filter.unwrap_or("null");
-    filter_transcode(data, format, spec)
-}
-
-/// Transcode with a video filter graph (decode → filter → encode).
-fn filter_transcode(data: Vec<u8>, format: Option<&str>, filter_spec: &str) -> Vec<u8> {
     use ffmpeg_next::codec;
     use ffmpeg_next::filter;
     use ffmpeg_next::media::Type;
     use ffmpeg_next::util::frame::video::Video;
+
+    ffmpeg_next::init().unwrap();
+
+    let filter_spec = filter.unwrap_or("null");
 
     let mut ictx = MemInput::open(data);
     let input_format = ictx.format().name().to_owned();
@@ -233,4 +229,132 @@ fn filter_transcode(data: Vec<u8>, format: Option<&str>, filter_spec: &str) -> V
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
     octx.into_data()
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+
+    /// Generate a minimal MPEG-TS video in memory and return the raw bytes.
+    fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_secs: i32) -> Vec<u8> {
+        use ffmpeg_next::codec;
+        use ffmpeg_next::format::Pixel;
+        use ffmpeg_next::util::frame::video::Video;
+
+        ffmpeg_next::init().unwrap();
+
+        let total_frames = fps * duration_secs;
+        let enc_codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
+            .expect("MPEG2VIDEO encoder not found");
+
+        let mut octx = MemOutput::open("mpegts");
+
+        let mut stream = octx.add_stream(enc_codec).expect("failed to add stream");
+        stream.set_time_base((1, fps));
+
+        let ctx = codec::context::Context::new_with_codec(enc_codec);
+        let mut encoder = ctx.encoder().video().expect("failed to create encoder");
+        encoder.set_width(width);
+        encoder.set_height(height);
+        encoder.set_format(Pixel::YUV420P);
+        encoder.set_bit_rate(400_000);
+        encoder.set_gop(10);
+        encoder.set_max_b_frames(2);
+        encoder.set_frame_rate(Some((fps, 1)));
+        encoder.set_time_base((1, fps));
+
+        let mut encoder = encoder.open().expect("failed to open encoder");
+        stream.set_parameters(&encoder);
+        let out_time_base = stream.time_base();
+        drop(stream);
+
+        octx.write_header().expect("failed to write header");
+
+        let mut packet = ffmpeg_next::Packet::empty();
+        for i in 0..total_frames {
+            let mut frame = Video::new(Pixel::YUV420P, width, height);
+            let y_data = frame.data_mut(0);
+            for (j, byte) in y_data.iter_mut().enumerate() {
+                *byte = ((i as usize * 3 + j) % 256) as u8;
+            }
+            for plane in 1..=2 {
+                for byte in frame.data_mut(plane).iter_mut() {
+                    *byte = 128;
+                }
+            }
+            frame.set_pts(Some(i as i64));
+
+            encoder.send_frame(&frame).expect("failed to send frame");
+            while encoder.receive_packet(&mut packet).is_ok() {
+                packet.set_stream(0);
+                packet.rescale_ts((1, fps), out_time_base);
+                packet
+                    .write_interleaved(&mut *octx)
+                    .expect("failed to write packet");
+            }
+        }
+
+        encoder.send_eof().expect("failed to send eof");
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.rescale_ts((1, fps), out_time_base);
+            packet
+                .write_interleaved(&mut *octx)
+                .expect("failed to write packet");
+        }
+
+        octx.write_trailer().expect("failed to write trailer");
+        octx.into_data()
+    }
+
+    #[pg_test]
+    fn test_transcode_default_format() {
+        let data = generate_test_video_bytes(64, 64, 10, 1);
+        assert!(!data.is_empty());
+
+        // Transcode with default format (should keep mpegts)
+        let result = transcode(data.clone(), None, None);
+        assert!(!result.is_empty());
+
+        // Verify output is valid by probing it
+        let probe = MemInput::open(result);
+        let fmt = probe.format().name().to_owned();
+        assert!(fmt.contains("mpegts"), "expected mpegts, got {fmt}");
+    }
+
+    #[pg_test]
+    fn test_transcode_to_different_format() {
+        let data = generate_test_video_bytes(64, 64, 10, 1);
+
+        let result = transcode(data, Some("matroska"), None);
+        assert!(!result.is_empty());
+
+        let probe = MemInput::open(result);
+        let fmt = probe.format().name().to_owned();
+        assert!(
+            fmt.contains("matroska"),
+            "expected matroska, got {fmt}"
+        );
+    }
+
+    #[pg_test]
+    fn test_transcode_with_scale_filter() {
+        let data = generate_test_video_bytes(64, 64, 10, 1);
+
+        let result = transcode(data, None, Some("scale=32:32"));
+        assert!(!result.is_empty());
+
+        // Verify output dimensions changed
+        let probe = MemInput::open(result);
+        let video = probe
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .expect("no video stream in output");
+        let params = video.parameters();
+        let ctx = ffmpeg_next::codec::context::Context::from_parameters(params).unwrap();
+        let dec = ctx.decoder().video().unwrap();
+        assert_eq!(dec.width(), 32);
+        assert_eq!(dec.height(), 32);
+    }
 }
