@@ -36,6 +36,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.pgrx
             target
           key: test-pg${{ matrix.pg_version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: test-pg${{ matrix.pg_version }}-
