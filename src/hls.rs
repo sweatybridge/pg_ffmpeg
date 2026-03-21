@@ -15,21 +15,19 @@ unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int
     size
 }
 
-struct CollectedSegment {
-    index: i32,
-    data: Vec<u8>,
-}
-
 struct HlsIoState {
     segment_index: i32,
+    playlist_id: i64,
     /// Buffer for the m3u8 playlist being written.
     m3u8_buf: Vec<u8>,
     m3u8_pb: *mut AVIOContext,
     /// Buffer for the current .ts segment being written.
     seg_buf: Vec<u8>,
     segment_pb: *mut AVIOContext,
-    /// Completed segments collected during muxing.
-    segments: Vec<CollectedSegment>,
+    /// DTS tracking for computing segment duration.
+    seg_start_dts: Option<i64>,
+    current_pkt_dts: Option<i64>,
+    video_tb_scale: f64,
 }
 
 unsafe extern "C" fn hls_io_open(
@@ -91,9 +89,27 @@ unsafe extern "C" fn hls_io_close2(
         if !state.seg_buf.is_empty() {
             let idx = state.segment_index;
             state.segment_index += 1;
-            state.segments.push(CollectedSegment {
-                index: idx,
-                data: std::mem::take(&mut state.seg_buf),
+            let duration = match (state.seg_start_dts, state.current_pkt_dts) {
+                (Some(start), Some(end)) => Some((end - start) as f64 * state.video_tb_scale),
+                _ => None,
+            };
+            state.seg_start_dts = state.current_pkt_dts;
+            let data = std::mem::take(&mut state.seg_buf);
+            let playlist_id = state.playlist_id;
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                         VALUES ($1, $2, $3, $4)",
+                        None,
+                        &[
+                            pgrx::datum::DatumWithOid::from(playlist_id),
+                            pgrx::datum::DatumWithOid::from(idx),
+                            pgrx::datum::DatumWithOid::from(duration),
+                            pgrx::datum::DatumWithOid::from(data),
+                        ],
+                    )
+                    .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
             });
         }
     } else {
@@ -105,36 +121,6 @@ unsafe extern "C" fn hls_io_close2(
     avio_context_free(&mut pb_mut);
     0
 }
-
-// --- m3u8 parsing ---
-
-struct SegmentInfo {
-    duration: f64,
-}
-
-struct PlaylistInfo {
-    segments: Vec<SegmentInfo>,
-}
-
-fn parse_m3u8(content: &str) -> PlaylistInfo {
-    let mut segments = Vec::new();
-    let mut pending_duration: Option<f64> = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("#EXTINF:") {
-            let dur_str = val.trim_end_matches(',');
-            pending_duration = dur_str.parse().ok();
-        } else if !line.starts_with('#') && !line.is_empty() {
-            if let Some(duration) = pending_duration.take() {
-                segments.push(SegmentInfo { duration });
-            }
-        }
-    }
-
-    PlaylistInfo { segments }
-}
-
 // --- Main function ---
 
 #[pg_extern]
@@ -164,11 +150,14 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
         segment_index: 0,
+        playlist_id,
         m3u8_buf: Vec::new(),
         m3u8_pb: ptr::null_mut(),
         seg_buf: Vec::new(),
         segment_pb: ptr::null_mut(),
-        segments: Vec::new(),
+        seg_start_dts: None,
+        current_pkt_dts: None,
+        video_tb_scale: 0.0,
     });
 
     let mut octx = unsafe {
@@ -196,12 +185,16 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     // Copy all streams (remux without re-encoding)
     let mut stream_mapping = vec![];
     let mut output_index = 0usize;
+    let mut video_out_idx: Option<usize> = None;
     for input_stream in ictx.streams() {
         let medium = input_stream.parameters().medium();
         if medium == ffmpeg_next::media::Type::Video
             || medium == ffmpeg_next::media::Type::Audio
             || medium == ffmpeg_next::media::Type::Subtitle
         {
+            if medium == ffmpeg_next::media::Type::Video && video_out_idx.is_none() {
+                video_out_idx = Some(output_index);
+            }
             let mut new_stream = octx
                 .add_stream(ffmpeg_next::codec::Id::None)
                 .unwrap_or_else(|e| error!("failed to add output stream: {e}"));
@@ -223,7 +216,15 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
 
-    // Remux packets — segments stream to DB as they complete
+    // Set video time_base scale for duration computation in close callback
+    if let Some(idx) = video_out_idx {
+        if let Some(stream) = octx.stream(idx) {
+            let tb = stream.time_base();
+            output_state.video_tb_scale = tb.0 as f64 / tb.1 as f64;
+        }
+    }
+
+    // Remux packets — segments are inserted into DB via hls_io_close2 callback
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
         if let Some(Some(out_idx)) = stream_mapping.get(input_index) {
@@ -232,6 +233,17 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             packet.set_stream(*out_idx);
             packet.rescale_ts(in_tb, out_tb);
             packet.set_position(-1);
+
+            // Track video DTS before write (write may trigger segment close in callback)
+            if Some(*out_idx) == video_out_idx {
+                if let Some(dts) = packet.dts() {
+                    output_state.current_pkt_dts = Some(dts);
+                    if output_state.seg_start_dts.is_none() {
+                        output_state.seg_start_dts = Some(dts);
+                    }
+                }
+            }
+
             packet
                 .write_interleaved(&mut octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
@@ -241,40 +253,6 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    // Clean up FFmpeg contexts
-    drop(octx);
-    drop(ictx);
-
-    // Parse m3u8 and update playlist metadata
-    let m3u8_content = String::from_utf8_lossy(&output_state.m3u8_buf);
-    if m3u8_content.is_empty() {
-        error!("no m3u8 playlist found in output");
-    }
-    let playlist_info = parse_m3u8(&m3u8_content);
-
-    Spi::connect_mut(|client| {
-        // Insert segments
-        for seg in &output_state.segments {
-            let duration = playlist_info
-                .segments
-                .get(seg.index as usize)
-                .map(|s| s.duration);
-            client
-                .update(
-                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
-                     VALUES ($1, $2, $3, $4)",
-                    None,
-                    &[
-                        pgrx::datum::DatumWithOid::from(playlist_id),
-                        pgrx::datum::DatumWithOid::from(seg.index),
-                        pgrx::datum::DatumWithOid::from(duration),
-                        pgrx::datum::DatumWithOid::from(seg.data.clone()),
-                    ],
-                )
-                .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
-        }
-    });
-
     playlist_id
 }
 
@@ -282,44 +260,6 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
 #[pg_schema]
 mod tests {
     use super::*;
-
-    // --- Unit tests for parse_m3u8 (no PostgreSQL needed) ---
-
-    #[test]
-    fn test_parse_m3u8_basic() {
-        let m3u8 = "\
-#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:6
-#EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:5.005333,
-seg000.ts
-#EXTINF:4.838167,
-seg001.ts
-#EXTINF:2.135467,
-seg002.ts
-#EXT-X-ENDLIST
-";
-        let info = parse_m3u8(m3u8);
-        assert_eq!(info.segments.len(), 3);
-        assert!((info.segments[0].duration - 5.005333).abs() < 1e-6);
-        assert!((info.segments[1].duration - 4.838167).abs() < 1e-6);
-        assert!((info.segments[2].duration - 2.135467).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_parse_m3u8_empty() {
-        let info = parse_m3u8("#EXTM3U\n#EXT-X-ENDLIST\n");
-        assert!(info.segments.is_empty());
-    }
-
-    #[test]
-    fn test_parse_m3u8_trailing_comma_stripped() {
-        let m3u8 = "#EXTINF:3.500000,\nseg.ts\n";
-        let info = parse_m3u8(m3u8);
-        assert_eq!(info.segments.len(), 1);
-        assert!((info.segments[0].duration - 3.5).abs() < 1e-6);
-    }
 
     // --- Integration test requiring PostgreSQL ---
 
