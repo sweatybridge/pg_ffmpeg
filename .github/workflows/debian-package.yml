@@ -2,8 +2,9 @@ name: Build Debian Packages
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths:
+      - Cargo.toml
   workflow_dispatch:
 
 jobs:
@@ -71,3 +72,27 @@ jobs:
         with:
           name: pg-ffmpeg-pg${{ matrix.pg_version }}-${{ matrix.debian }}
           path: "*.deb"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: echo "value=$(grep -oP '^version = "\K[^"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: debs
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          files: debs/*.deb
