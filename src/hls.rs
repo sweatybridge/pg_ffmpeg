@@ -579,18 +579,20 @@ seg042.ts
 
     // --- Integration test requiring PostgreSQL ---
 
-    /// Generate a minimal 3-second test video file using the ffmpeg library.
-    fn generate_test_video(path: &std::path::Path) {
+    fn generate_video(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        fps: i32,
+        duration_secs: i32,
+        bitrate: usize,
+    ) {
         use ffmpeg_next::codec;
         use ffmpeg_next::format::Pixel;
         use ffmpeg_next::util::frame::video::Video;
 
         ffmpeg_next::init().unwrap();
 
-        let width = 64u32;
-        let height = 64u32;
-        let fps = 10;
-        let duration_secs = 3;
         let total_frames = fps * duration_secs;
 
         let codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
@@ -607,7 +609,7 @@ seg042.ts
         encoder.set_width(width);
         encoder.set_height(height);
         encoder.set_format(Pixel::YUV420P);
-        encoder.set_bit_rate(400_000);
+        encoder.set_bit_rate(bitrate);
         encoder.set_gop(10);
         encoder.set_max_b_frames(2);
         encoder.set_frame_rate(Some((fps, 1)));
@@ -657,6 +659,11 @@ seg042.ts
         }
 
         octx.write_trailer().expect("failed to write trailer");
+    }
+
+    /// Generate a minimal 3-second test video file using the ffmpeg library.
+    fn generate_test_video(path: &std::path::Path) {
+        generate_video(path, 64, 64, 10, 3, 400_000);
     }
 
     #[pg_test]
@@ -780,6 +787,68 @@ seg042.ts
         assert!(
             count_short >= count_long,
             "shorter segment_duration ({count_short} segs) should produce >= segments than longer ({count_long} segs)"
+        );
+
+        let _ = std::fs::remove_file(&video_path);
+    }
+
+    #[ignore]
+    #[pg_test]
+    fn bench_hls_30s_sd() {
+        const ITERATIONS: usize = 5;
+
+        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let gen_start = std::time::Instant::now();
+        generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
+        let gen_elapsed = gen_start.elapsed();
+        pgrx::warning!(
+            "BENCH bench_hls_30s_sd: video_gen={:.3}s",
+            gen_elapsed.as_secs_f64(),
+        );
+
+        let url = format!("file://{}", video_path.display());
+        let mut durations = Vec::with_capacity(ITERATIONS);
+
+        for i in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            let playlist_id = crate::hls::hls(&url, 6);
+            let elapsed = start.elapsed().as_secs_f64();
+            durations.push(elapsed);
+            assert!(playlist_id > 0);
+
+            if i == 0 {
+                let seg_count = Spi::connect(|client| {
+                    client
+                        .select(
+                            "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                            None,
+                            &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                        )
+                        .unwrap()
+                        .first()
+                        .get_one::<i32>()
+                        .unwrap()
+                        .unwrap()
+                });
+                pgrx::warning!("BENCH bench_hls_30s_sd: segments={}", seg_count);
+            }
+        }
+
+        durations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = durations.len() as f64;
+        let mean = durations.iter().sum::<f64>() / n;
+        let variance = durations.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let stddev = variance.sqrt();
+        let median = durations[durations.len() / 2];
+        let min = durations[0];
+        let max = durations[durations.len() - 1];
+
+        pgrx::warning!(
+            "BENCH bench_hls_30s_sd: iterations={} mean={:.3}s stddev={:.3}s median={:.3}s min={:.3}s max={:.3}s",
+            ITERATIONS, mean, stddev, median, min, max,
         );
 
         let _ = std::fs::remove_file(&video_path);
