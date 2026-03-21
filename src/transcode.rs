@@ -29,9 +29,10 @@ fn transcode(
         .unwrap_or_else(|| error!("no video stream found"));
     let video_stream_index = video_stream.index();
     let video_time_base = video_stream.time_base();
+    let video_params = video_stream.parameters();
 
     let decoder_ctx =
-        codec::context::Context::from_parameters(video_stream.parameters())
+        codec::context::Context::from_parameters(video_params.clone())
             .unwrap_or_else(|e| error!("failed to create decoder context: {e}"));
     let mut decoder = decoder_ctx
         .decoder()
@@ -88,7 +89,11 @@ fn transcode(
     let codec_id = decoder.id();
     let enc_codec = codec::encoder::find(codec_id)
         .unwrap_or_else(|| error!("no encoder found for codec {:?}", codec_id));
-    let enc_ctx = codec::context::Context::new_with_codec(enc_codec);
+    let mut enc_ctx = codec::context::Context::new_with_codec(enc_codec);
+    // Copy source codec parameters so bit_rate, gop, profile, etc. carry over
+    enc_ctx
+        .set_parameters(video_params)
+        .unwrap_or_else(|e| error!("failed to copy codec parameters: {e}"));
     let mut video_enc = enc_ctx
         .encoder()
         .video()
