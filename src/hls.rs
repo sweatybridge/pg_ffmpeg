@@ -7,7 +7,6 @@ use ffmpeg_next::sys::{
     AVDictionary, AVFormatContext, AVIOContext,
 };
 
-const AVIO_BUF_SIZE: c_int = 4096;
 /// PostgreSQL's TOAST_MAX_CHUNK_SIZE for standard 8KB BLCKSZ with 64-bit alignment:
 /// BLCKSZ/4 - MAXALIGN(SizeofHeapTupleHeader + 3*ItemIdData) - sizeof(int32) - MAXALIGN(sizeof(varattrib_4b))
 /// = 2048 - 40 - 4 - 8 = 1996
@@ -68,47 +67,56 @@ impl ToastWriter {
             self.partial_len += to_copy;
             pos += to_copy;
             if self.partial_len == TOAST_CHUNK_SIZE {
-                self.stage_chunk();
+                let varlena_size = pg_sys::VARHDRSZ + TOAST_CHUNK_SIZE;
+                let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
+                *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
+                ptr::copy_nonoverlapping(self.partial.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), TOAST_CHUNK_SIZE);
+                let value_id_u32: u32 = std::mem::transmute(self.value_id);
+                self.all_values.push([
+                    pg_sys::Datum::from(value_id_u32 as usize),
+                    pg_sys::Datum::from(self.seq as usize),
+                    pg_sys::Datum::from(cbuf as usize),
+                ]);
+                self.all_nulls.push([false; 3]);
+                let vals = self.all_values.last_mut().unwrap();
+                let nulls = self.all_nulls.last_mut().unwrap();
+                let tupdesc = (*self.toast_rel).rd_att;
+                let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
+                (*tuple).t_tableOid = (*self.toast_rel).rd_id;
+                let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+                pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
+                self.slot_ptrs.push(slot);
+                self.seq += 1;
+                self.partial_len = 0;
             }
         }
     }
 
-    // Copy the current partial buffer into a TupleTableSlot and stage it for batch insert.
-    unsafe fn stage_chunk(&mut self) {
-        if self.partial_len == 0 {
-            return;
-        }
-        let chunk_len = self.partial_len;
-        let varlena_size = pg_sys::VARHDRSZ + chunk_len;
-        let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
-        *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
-        ptr::copy_nonoverlapping(self.partial.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), chunk_len);
-
-        let value_id_u32: u32 = std::mem::transmute(self.value_id);
-        self.all_values.push([
-            pg_sys::Datum::from(value_id_u32 as usize),
-            pg_sys::Datum::from(self.seq as usize),
-            pg_sys::Datum::from(cbuf as usize),
-        ]);
-        self.all_nulls.push([false; 3]);
-
-        let vals = self.all_values.last_mut().unwrap();
-        let nulls = self.all_nulls.last_mut().unwrap();
-        let tupdesc = (*self.toast_rel).rd_att;
-        let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
-        (*tuple).t_tableOid = (*self.toast_rel).rd_id;
-
-        let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
-        pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
-        self.slot_ptrs.push(slot);
-
-        self.seq += 1;
-        self.partial_len = 0;
-    }
-
     // Flush all staged chunks via heap_multi_insert, then update the TOAST index per slot.
     unsafe fn end_segment(&mut self) -> (pg_sys::Oid, usize) {
-        self.stage_chunk(); // stage last partial chunk
+        // Stage the final partial chunk if any.
+        if self.partial_len > 0 {
+            let chunk_len = self.partial_len;
+            let varlena_size = pg_sys::VARHDRSZ + chunk_len;
+            let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
+            *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
+            ptr::copy_nonoverlapping(self.partial.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), chunk_len);
+            let value_id_u32: u32 = std::mem::transmute(self.value_id);
+            self.all_values.push([
+                pg_sys::Datum::from(value_id_u32 as usize),
+                pg_sys::Datum::from(self.seq as usize),
+                pg_sys::Datum::from(cbuf as usize),
+            ]);
+            self.all_nulls.push([false; 3]);
+            let vals = self.all_values.last_mut().unwrap();
+            let nulls = self.all_nulls.last_mut().unwrap();
+            let tupdesc = (*self.toast_rel).rd_att;
+            let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
+            (*tuple).t_tableOid = (*self.toast_rel).rd_id;
+            let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+            pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
+            self.slot_ptrs.push(slot);
+        }
 
         if !self.slot_ptrs.is_empty() {
             let bistate = pg_sys::GetBulkInsertState();
@@ -169,7 +177,7 @@ unsafe extern "C" fn hls_io_open(
     let url_bytes = CStr::from_ptr(url).to_bytes();
     let is_ts = url_bytes.ends_with(b".ts");
 
-    let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
+    let avio_buf = av_malloc(TOAST_CHUNK_SIZE as c_int as usize) as *mut u8;
     if avio_buf.is_null() {
         return ffmpeg_next::sys::AVERROR_EOF;
     }
@@ -178,7 +186,7 @@ unsafe extern "C" fn hls_io_open(
         state.toast_writer.begin_segment();
         avio_alloc_context(
             avio_buf,
-            AVIO_BUF_SIZE,
+            TOAST_CHUNK_SIZE as c_int,
             1,
             &mut state.toast_writer as *mut ToastWriter as *mut c_void,
             None,
@@ -189,7 +197,7 @@ unsafe extern "C" fn hls_io_open(
         state.m3u8_buf.clear();
         avio_alloc_context(
             avio_buf,
-            AVIO_BUF_SIZE,
+            TOAST_CHUNK_SIZE as c_int,
             1,
             &mut state.m3u8_buf as *mut Vec<u8> as *mut c_void,
             None,
