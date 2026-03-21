@@ -43,10 +43,6 @@ unsafe extern "C" fn hls_io_open(
 
     let target_buf = if is_ts {
         state.seg_buf.clear();
-        // After take() in close2, seg_buf has 0 capacity; pre-allocate for typical segment size
-        if state.seg_buf.capacity() == 0 {
-            state.seg_buf.reserve(2 * 1024 * 1024);
-        }
         &mut state.seg_buf as *mut Vec<u8>
     } else {
         state.m3u8_buf.clear();
