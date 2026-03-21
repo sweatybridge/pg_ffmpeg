@@ -40,7 +40,7 @@ jobs:
           DEBIAN_CODENAME=${{ matrix.debian }}
           ARCH=$(dpkg --print-architecture)
           PKG_NAME="pg-ffmpeg-pg${PG_VERSION}"
-          PKG_DIR="${PKG_NAME}_${PKG_VERSION}-1_${ARCH}"
+          PKG_DIR="${PKG_NAME}_${PKG_VERSION}-1~${DEBIAN_CODENAME}_${ARCH}"
 
           # cargo pgrx package outputs to target/release/pg_ffmpeg-pg$VER/
           SRC_DIR="target/release/pg_ffmpeg-pg${PG_VERSION}"
