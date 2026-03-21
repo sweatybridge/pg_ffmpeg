@@ -7,7 +7,6 @@ use ffmpeg_next::sys::{
     AVDictionary, AVFormatContext, AVIOContext,
 };
 
-const AVIO_BUF_SIZE: c_int = 4096;
 
 /// Custom write callback: appends into a Vec<u8>.
 unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
@@ -52,14 +51,14 @@ unsafe extern "C" fn hls_io_open(
         &mut state.m3u8_buf as *mut Vec<u8>
     };
 
-    let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
+    let avio_buf = av_malloc(pg_sys::BLCKSZ as usize) as *mut u8;
     if avio_buf.is_null() {
         return ffmpeg_next::sys::AVERROR_EOF;
     }
 
     let ctx = avio_alloc_context(
         avio_buf,
-        AVIO_BUF_SIZE,
+        pg_sys::BLCKSZ as c_int,
         1,
         target_buf as *mut c_void,
         None,
@@ -114,24 +113,16 @@ struct SegmentInfo {
 }
 
 struct PlaylistInfo {
-    target_duration: i32,
-    media_sequence: i32,
     segments: Vec<SegmentInfo>,
 }
 
 fn parse_m3u8(content: &str) -> PlaylistInfo {
-    let mut target_duration = 0i32;
-    let mut media_sequence = 0i32;
     let mut segments = Vec::new();
     let mut pending_duration: Option<f64> = None;
 
     for line in content.lines() {
         let line = line.trim();
-        if let Some(val) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
-            target_duration = val.parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
-            media_sequence = val.parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("#EXTINF:") {
+        if let Some(val) = line.strip_prefix("#EXTINF:") {
             let dur_str = val.trim_end_matches(',');
             pending_duration = dur_str.parse().ok();
         } else if !line.starts_with('#') && !line.is_empty() {
@@ -141,11 +132,7 @@ fn parse_m3u8(content: &str) -> PlaylistInfo {
         }
     }
 
-    PlaylistInfo {
-        target_duration,
-        media_sequence,
-        segments,
-    }
+    PlaylistInfo { segments }
 }
 
 // --- Main function ---
@@ -159,9 +146,9 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     let playlist_id = Spi::connect_mut(|client| {
         client
             .update(
-                "INSERT INTO ffmpeg.hls_playlists DEFAULT VALUES RETURNING id",
+                "INSERT INTO ffmpeg.hls_playlists (target_duration) VALUES ($1) RETURNING id",
                 None,
-                &[],
+                &[pgrx::datum::DatumWithOid::from(segment_duration)],
             )
             .unwrap_or_else(|e| error!("failed to insert playlist: {e}"))
             .first()
@@ -266,19 +253,6 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     let playlist_info = parse_m3u8(&m3u8_content);
 
     Spi::connect_mut(|client| {
-        // Update playlist metadata
-        client
-            .update(
-                "UPDATE ffmpeg.hls_playlists SET target_duration = $1, media_sequence = $2 WHERE id = $3",
-                None,
-                &[
-                    pgrx::datum::DatumWithOid::from(playlist_info.target_duration),
-                    pgrx::datum::DatumWithOid::from(playlist_info.media_sequence),
-                    pgrx::datum::DatumWithOid::from(playlist_id),
-                ],
-            )
-            .unwrap_or_else(|e| error!("failed to update playlist: {e}"));
-
         // Insert segments
         for seg in &output_state.segments {
             let duration = playlist_info
@@ -327,8 +301,6 @@ seg002.ts
 #EXT-X-ENDLIST
 ";
         let info = parse_m3u8(m3u8);
-        assert_eq!(info.target_duration, 6);
-        assert_eq!(info.media_sequence, 0);
         assert_eq!(info.segments.len(), 3);
         assert!((info.segments[0].duration - 5.005333).abs() < 1e-6);
         assert!((info.segments[1].duration - 4.838167).abs() < 1e-6);
@@ -336,27 +308,8 @@ seg002.ts
     }
 
     #[test]
-    fn test_parse_m3u8_nonzero_sequence() {
-        let m3u8 = "\
-#EXTM3U
-#EXT-X-TARGETDURATION:10
-#EXT-X-MEDIA-SEQUENCE:42
-#EXTINF:9.9,
-seg042.ts
-#EXT-X-ENDLIST
-";
-        let info = parse_m3u8(m3u8);
-        assert_eq!(info.target_duration, 10);
-        assert_eq!(info.media_sequence, 42);
-        assert_eq!(info.segments.len(), 1);
-        assert!((info.segments[0].duration - 9.9).abs() < 1e-6);
-    }
-
-    #[test]
     fn test_parse_m3u8_empty() {
         let info = parse_m3u8("#EXTM3U\n#EXT-X-ENDLIST\n");
-        assert_eq!(info.target_duration, 0);
-        assert_eq!(info.media_sequence, 0);
         assert!(info.segments.is_empty());
     }
 
@@ -471,21 +424,19 @@ seg042.ts
         assert!(playlist_id > 0);
 
         // Verify playlist metadata was set
-        let row = Spi::connect(|client| {
+        let target_dur = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT target_duration, media_sequence FROM ffmpeg.hls_playlists WHERE id = $1",
+                    "SELECT target_duration FROM ffmpeg.hls_playlists WHERE id = $1",
                     None,
                     &[pgrx::datum::DatumWithOid::from(playlist_id)],
                 )
                 .unwrap()
                 .first()
-                .get_two::<i32, i32>()
+                .get_one::<i32>()
                 .unwrap()
         });
-        let (target_dur, media_seq) = row;
-        assert!(target_dur.unwrap() > 0, "target_duration should be set");
-        assert_eq!(media_seq.unwrap(), 0);
+        assert_eq!(target_dur.unwrap(), 2, "target_duration should match segment_duration");
 
         // Verify segments were created
         let seg_count = Spi::connect(|client| {
