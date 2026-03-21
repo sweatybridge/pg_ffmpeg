@@ -7,7 +7,7 @@ use ffmpeg_next::sys::{
     AVDictionary, AVFormatContext, AVIOContext,
 };
 
-const AVIO_BUF_SIZE: c_int = 8192;
+const AVIO_BUF_SIZE: c_int = pg_sys::BLCKSZ as c_int;
 
 /// Custom write callback: appends into a Vec<u8>.
 unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
