@@ -7,7 +7,6 @@ use ffmpeg_next::sys::{
     AVDictionary, AVFormatContext, AVIOContext,
 };
 
-const AVIO_BUF_SIZE: c_int = pg_sys::BLCKSZ as c_int;
 
 /// Custom write callback: appends into a Vec<u8>.
 unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
@@ -52,14 +51,14 @@ unsafe extern "C" fn hls_io_open(
         &mut state.m3u8_buf as *mut Vec<u8>
     };
 
-    let avio_buf = av_malloc(AVIO_BUF_SIZE as usize) as *mut u8;
+    let avio_buf = av_malloc(pg_sys::BLCKSZ as usize) as *mut u8;
     if avio_buf.is_null() {
         return ffmpeg_next::sys::AVERROR_EOF;
     }
 
     let ctx = avio_alloc_context(
         avio_buf,
-        AVIO_BUF_SIZE,
+        pg_sys::BLCKSZ as c_int,
         1,
         target_buf as *mut c_void,
         None,
