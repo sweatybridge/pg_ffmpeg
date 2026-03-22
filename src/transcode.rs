@@ -446,11 +446,11 @@ mod tests {
         let png_data = octx.into_data();
         assert!(!png_data.is_empty());
 
-        // Transcode the PNG (passthrough with null filter)
-        let result = transcode(png_data, None, None);
+        // Transcode the PNG with a crop filter
+        let result = transcode(png_data, None, Some("crop=32:32:0:0"));
         assert!(!result.is_empty());
 
-        // Verify output is valid PNG by probing
+        // Verify output dimensions match the crop
         let probe = MemInput::open(result);
         let video = probe
             .streams()
@@ -459,8 +459,8 @@ mod tests {
         let params = video.parameters();
         let ctx = ffmpeg_next::codec::context::Context::from_parameters(params).unwrap();
         let dec = ctx.decoder().video().unwrap();
-        assert_eq!(dec.width(), 64);
-        assert_eq!(dec.height(), 64);
+        assert_eq!(dec.width(), 32);
+        assert_eq!(dec.height(), 32);
     }
 
     #[pg_test]
