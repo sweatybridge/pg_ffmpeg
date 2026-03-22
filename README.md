@@ -44,22 +44,22 @@ CREATE EXTENSION pg_ffmpeg;
 SELECT ffmpeg.media_info(pg_read_binary_file('/path/to/video.mp4'));
 
 -- Extract a thumbnail at 5 seconds (PNG by default)
-SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), 5.0);
+SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), seconds => 5.0);
 
 -- Extract a thumbnail as JPEG
-SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), 5.0, 'mjpeg');
+SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), seconds => 5.0, format => 'mjpeg');
 
 -- Remux to MKV
-SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), 'matroska');
+SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), format => 'matroska');
 
 -- Transcode with a filter (e.g. scale to 720p)
-SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), 'matroska', 'scale=-1:720');
+SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), format => 'matroska', filter => 'scale=-1:720');
 
 -- Extract audio as MP3
-SELECT ffmpeg.extract_audio(pg_read_binary_file('/path/to/video.mp4'), 'mp3');
+SELECT ffmpeg.extract_audio(pg_read_binary_file('/path/to/video.mp4'), format => 'mp3');
 
 -- Split a remote video into HLS segments (6s default)
-SELECT ffmpeg.hls('https://example.com/video.mp4', 6);
+SELECT ffmpeg.hls('https://example.com/video.mp4', segment_duration => 6);
 ```
 
 ## License
