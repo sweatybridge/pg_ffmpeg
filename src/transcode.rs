@@ -46,11 +46,46 @@ fn transcode(
 
     ffmpeg_next::init().unwrap();
 
-    let filter_spec = filter.unwrap_or("null");
-
     let mut ictx = MemInput::open(data);
     let input_format = ictx.format().name().to_owned();
     let out_format = format.unwrap_or(&input_format);
+
+    // Zero-copy path: no filter requested → remux packets without decode/encode
+    if filter.is_none() {
+        let mut octx = MemOutput::open(out_format);
+
+        let mut stream_map = vec![None::<usize>; ictx.streams().count()];
+        for input_stream in ictx.streams() {
+            let mut out_stream = octx
+                .add_stream(codec::Id::None)
+                .unwrap_or_else(|e| error!("failed to add output stream: {e}"));
+            out_stream.set_parameters(input_stream.parameters());
+            stream_map[input_stream.index()] = Some(out_stream.index());
+        }
+
+        octx.write_header()
+            .unwrap_or_else(|e| error!("failed to write header: {e}"));
+
+        for (stream, mut packet) in ictx.packets() {
+            if let Some(Some(oi)) = stream_map.get(stream.index()) {
+                let in_tb = stream.time_base();
+                let out_tb = octx.stream(*oi).unwrap().time_base();
+                packet.set_stream(*oi);
+                packet.rescale_ts(in_tb, out_tb);
+                packet.set_position(-1);
+                packet
+                    .write_interleaved(&mut *octx)
+                    .unwrap_or_else(|e| error!("failed to write packet: {e}"));
+            }
+        }
+
+        octx.write_trailer()
+            .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
+
+        return octx.into_data();
+    }
+
+    let filter_spec = filter.unwrap_or("null");
     let mut octx = MemOutput::open(out_format);
 
     // Find best video stream and create decoder
