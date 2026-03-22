@@ -38,10 +38,11 @@ fn transcode(
         .decoder()
         .video()
         .unwrap_or_else(|e| error!("failed to open decoder: {e}"));
+    decoder.set_time_base(video_time_base);
 
     // Build filter graph: buffer → user spec → buffersink
     let mut graph = filter::Graph::new();
-    let pix_fmt: i32 = unsafe { std::mem::transmute::<ffmpeg_next::format::Pixel, i16>(decoder.format()) } as i32;
+    let pix_fmt = Into::<ffmpeg_next::sys::AVPixelFormat>::into(decoder.format()) as i32;
     let aspect = decoder.aspect_ratio();
     let buffer_args = format!(
         "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
@@ -80,7 +81,9 @@ fn transcode(
         (
             w,
             h,
-            std::mem::transmute::<i16, ffmpeg_next::format::Pixel>(fmt as i16),
+            ffmpeg_next::format::Pixel::from(
+                std::mem::transmute::<i32, ffmpeg_next::sys::AVPixelFormat>(fmt),
+            ),
             ffmpeg_next::Rational(tb.num, tb.den),
         )
     };
