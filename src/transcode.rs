@@ -48,7 +48,12 @@ fn transcode(
 
     let mut ictx = MemInput::open(data);
     let input_format = ictx.format().name().to_owned();
-    let out_format = format.unwrap_or(&input_format);
+    // Map input-only formats to their output equivalents
+    let default_format = match input_format.as_str() {
+        "png_pipe" => "image2pipe".to_owned(),
+        _ => input_format.clone(),
+    };
+    let out_format = format.unwrap_or(&default_format);
 
     // Zero-copy path: no filter requested → remux packets without decode/encode
     if filter.is_none() {
@@ -60,6 +65,8 @@ fn transcode(
                 .add_stream(codec::Id::None)
                 .unwrap_or_else(|e| error!("failed to add output stream: {e}"));
             out_stream.set_parameters(input_stream.parameters());
+            // Clear codec_tag so the muxer can set the correct one for the target container
+            unsafe { (*out_stream.parameters().as_mut_ptr()).codec_tag = 0 };
             stream_map[input_stream.index()] = Some(out_stream.index());
         }
 
