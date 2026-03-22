@@ -47,13 +47,13 @@ SELECT ffmpeg.media_info(pg_read_binary_file('/path/to/video.mp4'));
 SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), seconds => 5.0);
 
 -- Extract a thumbnail as JPEG
-SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), seconds => 5.0, format => 'mjpeg');
+SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), format => 'mjpeg');
 
 -- Remux to MKV
 SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), format => 'matroska');
 
 -- Transcode with a filter (e.g. scale to 720p)
-SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), format => 'matroska', filter => 'scale=-1:720');
+SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), filter => 'scale=-1:720');
 
 -- Extract audio as MP3
 SELECT ffmpeg.extract_audio(pg_read_binary_file('/path/to/video.mp4'), format => 'mp3');
