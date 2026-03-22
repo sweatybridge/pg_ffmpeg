@@ -228,7 +228,7 @@ fn transcode(
     let input_format = ictx.format().name().to_owned();
     // Map input-only formats to their output equivalents
     let default_format = match input_format.as_str() {
-        "png_pipe" => "image2pipe".to_owned(),
+        "png_pipe" | "ppm_pipe" => "image2pipe".to_owned(),
         _ => input_format.clone(),
     };
     let out_format = format.unwrap_or(&default_format);
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_transcode_png() {
+    fn test_transcode_image() {
         use ffmpeg_next::codec;
         use ffmpeg_next::format::Pixel;
         use ffmpeg_next::util::frame::video::Video;
@@ -510,11 +510,11 @@ mod tests {
         }
 
         octx.write_trailer().expect("failed to write trailer");
-        let png_data = octx.into_data();
-        assert!(!png_data.is_empty());
+        let ppm_data = octx.into_data();
+        assert!(!ppm_data.is_empty());
 
-        // Transcode the PNG with a crop filter
-        let result = transcode(png_data, None, Some("crop=32:32:0:0"));
+        // Transcode the PPM image with a crop filter
+        let result = transcode(ppm_data, None, Some("crop=32:32:0:0"));
         assert!(!result.is_empty());
 
         // Verify output dimensions match the crop
