@@ -355,6 +355,73 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_transcode_png() {
+        use ffmpeg_next::codec;
+        use ffmpeg_next::format::Pixel;
+        use ffmpeg_next::util::frame::video::Video;
+
+        ffmpeg_next::init().unwrap();
+
+        // Generate a single-frame PNG in memory
+        let enc_codec =
+            ffmpeg_next::encoder::find(codec::Id::PNG).expect("PNG encoder not found");
+        let mut octx = MemOutput::open("image2pipe");
+        let mut stream = octx.add_stream(enc_codec).expect("failed to add stream");
+        stream.set_time_base((1, 1));
+
+        let ctx = codec::context::Context::new_with_codec(enc_codec);
+        let mut encoder = ctx.encoder().video().expect("failed to create encoder");
+        encoder.set_width(64);
+        encoder.set_height(64);
+        encoder.set_format(Pixel::RGB24);
+        encoder.set_time_base((1, 1));
+
+        let mut encoder = encoder.open().expect("failed to open encoder");
+        stream.set_parameters(&encoder);
+        let out_time_base = stream.time_base();
+        drop(stream);
+
+        octx.write_header().expect("failed to write header");
+
+        let mut frame = Video::new(Pixel::RGB24, 64, 64);
+        for (i, byte) in frame.data_mut(0).iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+        frame.set_pts(Some(0));
+
+        encoder.send_frame(&frame).expect("failed to send frame");
+        encoder.send_eof().expect("failed to send eof");
+        let mut packet = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.rescale_ts((1, 1), out_time_base);
+            packet
+                .write_interleaved(&mut *octx)
+                .expect("failed to write packet");
+        }
+
+        octx.write_trailer().expect("failed to write trailer");
+        let png_data = octx.into_data();
+        assert!(!png_data.is_empty());
+
+        // Transcode the PNG (passthrough with null filter)
+        let result = transcode(png_data, None, None);
+        assert!(!result.is_empty());
+
+        // Verify output is valid PNG by probing
+        let probe = MemInput::open(result);
+        let video = probe
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .expect("no video stream in output");
+        let params = video.parameters();
+        let ctx = ffmpeg_next::codec::context::Context::from_parameters(params).unwrap();
+        let dec = ctx.decoder().video().unwrap();
+        assert_eq!(dec.width(), 64);
+        assert_eq!(dec.height(), 64);
+    }
+
+    #[pg_test]
     fn test_transcode_with_scale_filter() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
 
