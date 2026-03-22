@@ -51,13 +51,7 @@ fn transcode(
     let out_format = format.unwrap_or(&input_format);
 
     // Zero-copy path: no filter requested → remux packets without decode/encode
-    // Only if the output format is a valid muxer (e.g. png_pipe is input-only)
-    let can_mux = unsafe {
-        let fmt_cstr = std::ffi::CString::new(out_format).unwrap();
-        !ffmpeg_next::sys::av_guess_format(fmt_cstr.as_ptr(), std::ptr::null(), std::ptr::null())
-            .is_null()
-    };
-    if filter.is_none() && can_mux {
+    if filter.is_none() {
         let mut octx = MemOutput::open(out_format);
 
         let mut stream_map = vec![None::<usize>; ictx.streams().count()];
