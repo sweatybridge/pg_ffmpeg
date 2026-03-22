@@ -40,7 +40,7 @@ unsafe extern "C" fn seek_cb(opaque: *mut c_void, offset: i64, whence: c_int) ->
     }
 }
 
-unsafe extern "C" fn write_cb(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
+unsafe extern "C" fn write_cb(opaque: *mut c_void, data: *mut u8, size: c_int) -> c_int {
     let vec = &mut *(opaque as *mut Vec<u8>);
     vec.extend_from_slice(std::slice::from_raw_parts(data, size as usize));
     size
@@ -67,9 +67,9 @@ impl MemInput {
                 BUF_SIZE as c_int,
                 0,
                 &mut *cursor as *mut Cursor<Vec<u8>> as *mut c_void,
-                Some(std::mem::transmute(read_cb as *const ())),
+                Some(read_cb),
                 None,
-                Some(std::mem::transmute(seek_cb as *const ())),
+                Some(seek_cb),
             );
             if avio_ctx.is_null() {
                 error!("failed to allocate AVIO context");
@@ -147,7 +147,7 @@ impl MemOutput {
                 1,
                 &mut *output_buf as *mut Vec<u8> as *mut c_void,
                 None,
-                Some(std::mem::transmute(write_cb as *const ())),
+                Some(write_cb),
                 None,
             );
             if avio_ctx.is_null() {
