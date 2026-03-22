@@ -2,6 +2,37 @@ use pgrx::prelude::*;
 
 use crate::mem_io::{MemInput, MemOutput};
 
+/// Pull all available filtered frames from the graph, encode them, and write packets to output.
+fn drain_filtered(
+    graph: &mut ffmpeg_next::filter::Graph,
+    encoder: &mut ffmpeg_next::codec::encoder::video::Encoder,
+    enc_tb: ffmpeg_next::Rational,
+    stream_idx: usize,
+    octx: &mut ffmpeg_next::format::context::Output,
+) {
+    let mut filtered = ffmpeg_next::util::frame::video::Video::empty();
+    while graph
+        .get("out")
+        .unwrap()
+        .sink()
+        .frame(&mut filtered)
+        .is_ok()
+    {
+        encoder
+            .send_frame(&filtered)
+            .unwrap_or_else(|e| error!("encode error: {e}"));
+        let mut encoded = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut encoded).is_ok() {
+            encoded.set_stream(stream_idx);
+            encoded.rescale_ts(enc_tb, octx.stream(stream_idx).unwrap().time_base());
+            encoded.set_position(-1);
+            encoded
+                .write_interleaved(octx)
+                .unwrap_or_else(|e| error!("failed to write video packet: {e}"));
+        }
+    }
+}
+
 #[pg_extern]
 fn transcode(
     data: Vec<u8>,
@@ -155,41 +186,6 @@ fn transcode(
 
     let enc_tb = encoder.time_base();
 
-    // Helper: drain encoded packets from encoder and write to output
-    let drain_encoder =
-        |encoder: &mut codec::encoder::video::Encoder,
-         octx: &mut ffmpeg_next::format::context::Output| {
-            let mut encoded = ffmpeg_next::Packet::empty();
-            while encoder.receive_packet(&mut encoded).is_ok() {
-                encoded.set_stream(video_out_idx);
-                encoded.rescale_ts(enc_tb, octx.stream(video_out_idx).unwrap().time_base());
-                encoded.set_position(-1);
-                encoded
-                    .write_interleaved(octx)
-                    .unwrap_or_else(|e| error!("failed to write video packet: {e}"));
-            }
-        };
-
-    // Helper: pull filtered frames from graph, encode, and write
-    let encode_filtered =
-        |graph: &mut filter::Graph,
-         encoder: &mut codec::encoder::video::Encoder,
-         octx: &mut ffmpeg_next::format::context::Output| {
-            let mut filtered = Video::empty();
-            while graph
-                .get("out")
-                .unwrap()
-                .sink()
-                .frame(&mut filtered)
-                .is_ok()
-            {
-                encoder
-                    .send_frame(&filtered)
-                    .unwrap_or_else(|e| error!("encode error: {e}"));
-                drain_encoder(encoder, octx);
-            }
-        };
-
     // Main packet loop
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
@@ -209,7 +205,7 @@ fn transcode(
                     .source()
                     .add(&decoded)
                     .unwrap_or_else(|e| error!("filter source error: {e}"));
-                encode_filtered(&mut graph, &mut encoder, &mut *octx);
+                drain_filtered(&mut graph, &mut encoder, enc_tb, video_out_idx, &mut *octx);
             }
         } else if let Some(Some(oi)) = stream_map.get(input_index) {
             // Passthrough audio/subtitle
@@ -224,21 +220,26 @@ fn transcode(
         }
     }
 
-    // Flush decoder
+    // Flush decoder into filter graph
     let _ = decoder.send_eof();
     let mut decoded = Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
         let _ = graph.get("in").unwrap().source().add(&decoded);
-        encode_filtered(&mut graph, &mut encoder, &mut *octx);
     }
-
-    // Flush filter graph
     let _ = graph.get("in").unwrap().source().flush();
-    encode_filtered(&mut graph, &mut encoder, &mut *octx);
+    drain_filtered(&mut graph, &mut encoder, enc_tb, video_out_idx, &mut *octx);
 
     // Flush encoder
     let _ = encoder.send_eof();
-    drain_encoder(&mut encoder, &mut *octx);
+    let mut encoded = ffmpeg_next::Packet::empty();
+    while encoder.receive_packet(&mut encoded).is_ok() {
+        encoded.set_stream(video_out_idx);
+        encoded.rescale_ts(enc_tb, octx.stream(video_out_idx).unwrap().time_base());
+        encoded.set_position(-1);
+        encoded
+            .write_interleaved(&mut *octx)
+            .unwrap_or_else(|e| error!("failed to write video packet: {e}"));
+    }
 
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
