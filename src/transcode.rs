@@ -29,7 +29,6 @@ fn transcode(
         .unwrap_or_else(|| error!("no video stream found"));
     let video_stream_index = video_stream.index();
     let video_time_base = video_stream.time_base();
-    let video_frame_rate = video_stream.rate();
 
     let decoder_ctx =
         codec::context::Context::from_parameters(video_stream.parameters())
@@ -100,13 +99,12 @@ fn transcode(
     video_enc.set_width(out_width);
     video_enc.set_height(out_height);
     video_enc.set_format(out_pix_fmt);
-    // Derive time_base from the stream's frame rate. Container time_bases (e.g. 1/90000
-    // from mpegts) are unsuitable — codecs like MPEG2VIDEO need a standard frame rate.
-    // Note: decoder.frame_rate() is unreliable here because AVCodecContext::framerate
-    // is not populated by from_parameters(); use the stream's r_frame_rate instead.
-    let enc_time_base = if video_frame_rate.numerator() != 0 {
-        video_enc.set_frame_rate(Some(video_frame_rate));
-        ffmpeg_next::Rational(video_frame_rate.denominator(), video_frame_rate.numerator())
+    // Derive time_base from frame rate when possible; fall back to filter/stream time_base.
+    // Some codecs (e.g. MPEG2VIDEO) reject time_bases that don't map to standard frame rates,
+    // and container time_bases like 1/90000 from mpegts are unsuitable for encoding.
+    let enc_time_base = if let Some(frame_rate) = decoder.frame_rate() {
+        video_enc.set_frame_rate(Some(frame_rate));
+        ffmpeg_next::Rational(frame_rate.denominator(), frame_rate.numerator())
     } else if filter_tb.denominator() != 0 {
         filter_tb
     } else {
@@ -114,13 +112,12 @@ fn transcode(
     };
     video_enc.set_time_base(enc_time_base);
     video_enc.set_bit_rate(decoder.bit_rate());
-    // Set encoder-specific fields not available in AVCodecParameters.
-    // The decoder context created via from_parameters() has gop_size=0,
-    // which is invalid for codecs like MPEG2VIDEO, so use sensible defaults.
+    // Copy encoder-specific fields not exposed by ffmpeg_next's safe API
     unsafe {
+        let dec_ptr = decoder.as_ptr();
         let enc_ptr = video_enc.as_mut_ptr();
-        (*enc_ptr).gop_size = 12;
-        (*enc_ptr).max_b_frames = 2;
+        (*enc_ptr).gop_size = (*dec_ptr).gop_size;
+        (*enc_ptr).max_b_frames = (*dec_ptr).max_b_frames;
     }
     let mut encoder = video_enc
         .open_as(enc_codec)
