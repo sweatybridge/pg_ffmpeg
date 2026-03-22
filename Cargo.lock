@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "pg_ffmpeg"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ffmpeg-next",
  "pgrx",
