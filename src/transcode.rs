@@ -96,14 +96,18 @@ fn transcode(
     video_enc.set_width(out_width);
     video_enc.set_height(out_height);
     video_enc.set_format(out_pix_fmt);
-    video_enc.set_time_base(if filter_tb.denominator() != 0 {
+    // Derive time_base from frame rate when possible; fall back to filter/stream time_base.
+    // Some codecs (e.g. MPEG2VIDEO) reject time_bases that don't map to standard frame rates,
+    // and container time_bases like 1/90000 from mpegts are unsuitable for encoding.
+    let enc_time_base = if let Some(frame_rate) = decoder.frame_rate() {
+        video_enc.set_frame_rate(Some(frame_rate));
+        ffmpeg_next::Rational(frame_rate.denominator(), frame_rate.numerator())
+    } else if filter_tb.denominator() != 0 {
         filter_tb
     } else {
         video_time_base
-    });
-    if let Some(frame_rate) = decoder.frame_rate() {
-        video_enc.set_frame_rate(Some(frame_rate));
-    }
+    };
+    video_enc.set_time_base(enc_time_base);
     video_enc.set_bit_rate(decoder.bit_rate());
     // Copy encoder-specific fields not exposed by ffmpeg_next's safe API
     unsafe {
