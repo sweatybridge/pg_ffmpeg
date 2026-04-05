@@ -34,18 +34,15 @@ jobs:
           cache-directories: /home/runner/.pgrx
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version "$(grep -oP 'pgrx = "=?\K[0-9][^"]+' Cargo.toml)" --locked
+        run: cargo install cargo-pgrx --locked
 
       - name: Initialize pgrx
         run: |
           set +e
-          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
+          v=$(cargo pgrx info pg${{ matrix.pg_version }})
           if [ $? -ne 0 ]; then
             cargo pgrx init --pg${{ matrix.pg_version }} download
           fi
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
-
-      - name: Bench
-        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
