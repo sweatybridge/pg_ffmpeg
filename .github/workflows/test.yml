@@ -21,6 +21,9 @@ jobs:
         with:
           pg_version: ${{ matrix.pg_version }}
 
+      - name: Install PostgreSQL server
+        run: apt-get install -y postgresql-${{ matrix.pg_version }}
+
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
 

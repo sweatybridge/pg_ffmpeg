@@ -34,7 +34,7 @@ runs:
     - name: Install PostgreSQL development files
       shell: bash
       run: |
-        apt-get install -y postgresql-${{ inputs.pg_version }} postgresql-server-dev-${{ inputs.pg_version }}
+        apt-get install -y postgresql-server-dev-${{ inputs.pg_version }}
 
     - name: Install Rust
       shell: bash
