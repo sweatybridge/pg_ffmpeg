@@ -19,7 +19,7 @@ pg_test = ["tempfile"]
 
 [dependencies]
 pgrx = "0.17"
-ffmpeg-next = "7"
+ffmpeg-next = "8"
 tempfile = { version = "3", optional = true }
 serde_json = "1"
 
