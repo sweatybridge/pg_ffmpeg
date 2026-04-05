@@ -30,7 +30,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           # components: clippy, rustfmt
-          cache-key: pg${{ matrix.pg_version }}
+          cache-shared-key: pg${{ matrix.pg_version }}
           cache-directories: /home/runner/.pgrx
 
       - name: Install cargo-pgrx
@@ -46,3 +46,6 @@ jobs:
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
+
+      - name: Bench
+        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
