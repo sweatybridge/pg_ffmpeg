@@ -15,18 +15,17 @@ default = ["pg16"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = []
-pg_bench = ["dep:pgrx-bench"]
+pg_test = ["tempfile"]
+pg_bench = ["tempfile"]
 
 [dependencies]
-pgrx = "=0.17.0"
-pgrx-bench = { version = "=0.17.0", optional = true }
+pgrx = "0.17"
 ffmpeg-next = "8"
 tempfile = { version = "3", optional = true }
 serde_json = "1"
 
 [dev-dependencies]
-pgrx-tests = "=0.17.0"
+pgrx-tests = "0.17"
 tempfile = "3"
 
 [profile.dev]
