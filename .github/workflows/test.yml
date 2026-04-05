@@ -24,8 +24,16 @@ jobs:
       - name: Install PostgreSQL server
         run: apt-get install -y postgresql-${{ matrix.pg_version }}
 
+      - name: Create test user
+        run: |
+          useradd -m testuser
+          chown -R testuser: .
+          cp -r /github/home/.cargo /home/testuser/.cargo
+          cp -r /github/home/.pgrx /home/testuser/.pgrx
+          chown -R testuser: /home/testuser/.cargo /home/testuser/.pgrx
+
       - name: Test
-        run: cargo pgrx test "pg${{ matrix.pg_version }}"
+        run: su testuser -c 'cargo pgrx test "pg${{ matrix.pg_version }}"'
 
       - name: Bench
-        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
+        run: su testuser -c 'cargo pgrx bench "pg${{ matrix.pg_version }}"'
