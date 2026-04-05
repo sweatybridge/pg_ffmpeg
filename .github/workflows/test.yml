@@ -24,7 +24,8 @@ jobs:
             libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev
+            libavfilter-dev libavdevice-dev \
+            libreadline-dev
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
