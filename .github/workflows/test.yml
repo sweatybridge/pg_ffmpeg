@@ -32,7 +32,7 @@ jobs:
         with:
           # components: clippy, rustfmt
           cache-key: pg${{ matrix.pg_version }}
-          cache-directories: ~/.pgrx
+          cache-directories: /home/runner/.pgrx
 
       - name: Install cargo-pgrx
         run: cargo install cargo-pgrx --locked
