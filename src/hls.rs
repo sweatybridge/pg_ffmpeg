@@ -474,8 +474,7 @@ mod tests {
         let _ = std::fs::remove_file(&video_path);
     }
 
-    #[ignore]
-    #[pg_test]
+    #[pg_bench]
     fn bench_hls_30s_sd() {
         const ITERATIONS: usize = 5;
 
