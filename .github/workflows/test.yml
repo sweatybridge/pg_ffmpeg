@@ -33,7 +33,7 @@ jobs:
           chown -R testuser: /home/testuser/.cargo /home/testuser/.pgrx
 
       - name: Test
-        run: su testuser -c 'cargo pgrx test "pg${{ matrix.pg_version }}"'
+        run: su testuser -c 'PATH="/home/testuser/.cargo/bin:$PATH" cargo pgrx test "pg${{ matrix.pg_version }}"'
 
       - name: Bench
-        run: su testuser -c 'cargo pgrx bench "pg${{ matrix.pg_version }}"'
+        run: su testuser -c 'PATH="/home/testuser/.cargo/bin:$PATH" cargo pgrx bench "pg${{ matrix.pg_version }}"'
