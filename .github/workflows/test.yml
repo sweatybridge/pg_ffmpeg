@@ -39,6 +39,7 @@ jobs:
 
       - name: Initialize pgrx
         run: |
+          set +e
           v=$(cargo pgrx info version pg${{ matrix.pg_version }})
           if [ $? -ne 0 ]; then
             cargo pgrx init --pg${{ matrix.pg_version }} download
