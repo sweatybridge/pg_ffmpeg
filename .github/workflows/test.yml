@@ -9,7 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: debian:bookworm
+    container: debian:trixie
     strategy:
       fail-fast: false
       matrix:
