@@ -38,7 +38,11 @@ jobs:
         run: cargo install cargo-pgrx --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init --pg${{ matrix.pg_version }} download
+        run: |
+          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
+          if [ $? -ne 0 ]; then
+            cargo pgrx init --pg${{ matrix.pg_version }} download
+          fi
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
