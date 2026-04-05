@@ -273,7 +273,7 @@ fn transcode(
     let mut octx = MemOutput::open(out_format);
 
     // Identify video streams and build transcoders
-    let best_video_stream_index = ictx
+    let _best_video_stream_index = ictx
         .streams()
         .best(Type::Video)
         .map(|stream| stream.index());

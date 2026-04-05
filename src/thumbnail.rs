@@ -149,7 +149,7 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
 
     let codec = ffmpeg_next::encoder::find_by_name(codec_name)
         .unwrap_or_else(|| error!("codec not found: {codec_name}"));
-    let mut ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+    let ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
     let mut encoder = ctx
         .encoder()
         .video()
