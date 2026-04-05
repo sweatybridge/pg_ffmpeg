@@ -256,84 +256,68 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     playlist_id
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use super::*;
+#[cfg(any(test, feature = "pg_test", feature = "pg_bench"))]
+pub(crate) fn generate_video(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    fps: i32,
+    duration_secs: i32,
+    bitrate: usize,
+) {
+    use ffmpeg_next::codec;
+    use ffmpeg_next::format::Pixel;
+    use ffmpeg_next::util::frame::video::Video;
 
-    // --- Integration test requiring PostgreSQL ---
+    ffmpeg_next::init().unwrap();
 
-    fn generate_video(
-        path: &std::path::Path,
-        width: u32,
-        height: u32,
-        fps: i32,
-        duration_secs: i32,
-        bitrate: usize,
-    ) {
-        use ffmpeg_next::codec;
-        use ffmpeg_next::format::Pixel;
-        use ffmpeg_next::util::frame::video::Video;
+    let total_frames = fps * duration_secs;
 
-        ffmpeg_next::init().unwrap();
+    let codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
+        .expect("MPEG2VIDEO encoder not found");
 
-        let total_frames = fps * duration_secs;
+    let mut octx = ffmpeg_next::format::output_as(path, "mpegts")
+        .expect("failed to create output context");
 
-        let codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
-            .expect("MPEG2VIDEO encoder not found");
+    let mut stream = octx.add_stream(codec).expect("failed to add stream");
+    stream.set_time_base((1, fps));
 
-        let mut octx = ffmpeg_next::format::output_as(path, "mpegts")
-            .expect("failed to create output context");
+    let ctx = codec::context::Context::new_with_codec(codec);
+    let mut encoder = ctx.encoder().video().expect("failed to create encoder");
+    encoder.set_width(width);
+    encoder.set_height(height);
+    encoder.set_format(Pixel::YUV420P);
+    encoder.set_bit_rate(bitrate);
+    encoder.set_gop(10);
+    encoder.set_max_b_frames(2);
+    encoder.set_frame_rate(Some((fps, 1)));
+    encoder.set_time_base((1, fps));
 
-        let mut stream = octx.add_stream(codec).expect("failed to add stream");
-        stream.set_time_base((1, fps));
+    let mut encoder = encoder.open().expect("failed to open encoder");
+    stream.set_parameters(&encoder);
+    let out_time_base = stream.time_base();
+    drop(stream);
 
-        let ctx = codec::context::Context::new_with_codec(codec);
-        let mut encoder = ctx.encoder().video().expect("failed to create encoder");
-        encoder.set_width(width);
-        encoder.set_height(height);
-        encoder.set_format(Pixel::YUV420P);
-        encoder.set_bit_rate(bitrate);
-        encoder.set_gop(10);
-        encoder.set_max_b_frames(2);
-        encoder.set_frame_rate(Some((fps, 1)));
-        encoder.set_time_base((1, fps));
+    octx.write_header().expect("failed to write header");
 
-        let mut encoder = encoder.open().expect("failed to open encoder");
-        stream.set_parameters(&encoder);
-        let out_time_base = stream.time_base();
-        drop(stream);
+    let mut packet = ffmpeg_next::Packet::empty();
 
-        octx.write_header().expect("failed to write header");
-
-        let mut packet = ffmpeg_next::Packet::empty();
-
-        for i in 0..total_frames {
-            let mut frame = Video::new(Pixel::YUV420P, width, height);
-            // Fill Y plane with a shifting pattern so frames differ
-            let y_data = frame.data_mut(0);
-            for (j, byte) in y_data.iter_mut().enumerate() {
-                *byte = ((i as usize * 3 + j) % 256) as u8;
-            }
-            // Fill U and V planes with 128 (neutral chroma)
-            for plane in 1..=2 {
-                for byte in frame.data_mut(plane).iter_mut() {
-                    *byte = 128;
-                }
-            }
-            frame.set_pts(Some(i as i64));
-
-            encoder.send_frame(&frame).expect("failed to send frame");
-            while encoder.receive_packet(&mut packet).is_ok() {
-                packet.set_stream(0);
-                packet.rescale_ts((1, fps), out_time_base);
-                packet
-                    .write_interleaved(&mut octx)
-                    .expect("failed to write packet");
+    for i in 0..total_frames {
+        let mut frame = Video::new(Pixel::YUV420P, width, height);
+        // Fill Y plane with a shifting pattern so frames differ
+        let y_data = frame.data_mut(0);
+        for (j, byte) in y_data.iter_mut().enumerate() {
+            *byte = ((i as usize * 3 + j) % 256) as u8;
+        }
+        // Fill U and V planes with 128 (neutral chroma)
+        for plane in 1..=2 {
+            for byte in frame.data_mut(plane).iter_mut() {
+                *byte = 128;
             }
         }
+        frame.set_pts(Some(i as i64));
 
-        encoder.send_eof().expect("failed to send eof");
+        encoder.send_frame(&frame).expect("failed to send frame");
         while encoder.receive_packet(&mut packet).is_ok() {
             packet.set_stream(0);
             packet.rescale_ts((1, fps), out_time_base);
@@ -341,11 +325,25 @@ mod tests {
                 .write_interleaved(&mut octx)
                 .expect("failed to write packet");
         }
-
-        octx.write_trailer().expect("failed to write trailer");
     }
 
-    /// Generate a minimal 3-second test video file using the ffmpeg library.
+    encoder.send_eof().expect("failed to send eof");
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.rescale_ts((1, fps), out_time_base);
+        packet
+            .write_interleaved(&mut octx)
+            .expect("failed to write packet");
+    }
+
+    octx.write_trailer().expect("failed to write trailer");
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+
     fn generate_test_video(path: &std::path::Path) {
         generate_video(path, 64, 64, 10, 3, 400_000);
     }
@@ -474,64 +472,24 @@ mod tests {
         let _ = std::fs::remove_file(&video_path);
     }
 
-    #[pg_bench]
-    fn bench_hls_30s_sd() {
-        const ITERATIONS: usize = 5;
+}
 
+#[cfg(feature = "pg_bench")]
+#[pg_schema]
+mod benches {
+    use pgrx::prelude::*;
+    use pgrx_bench::{black_box, Bencher};
+
+    #[pg_bench]
+    fn bench_hls_30s_sd(b: &mut Bencher) {
         let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
         let video_path = tmp.path().to_path_buf();
         drop(tmp);
-
-        let gen_start = std::time::Instant::now();
-        generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
-        let gen_elapsed = gen_start.elapsed();
-        pgrx::warning!(
-            "BENCH bench_hls_30s_sd: video_gen={:.3}s",
-            gen_elapsed.as_secs_f64(),
-        );
-
+        super::generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
         let url = format!("file://{}", video_path.display());
-        let mut durations = Vec::with_capacity(ITERATIONS);
 
-        for i in 0..ITERATIONS {
-            let start = std::time::Instant::now();
-            let playlist_id = crate::hls::hls(&url, 6);
-            let elapsed = start.elapsed().as_secs_f64();
-            durations.push(elapsed);
-            assert!(playlist_id > 0);
-
-            if i == 0 {
-                let seg_count = Spi::connect(|client| {
-                    client
-                        .select(
-                            "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
-                            None,
-                            &[pgrx::datum::DatumWithOid::from(playlist_id)],
-                        )
-                        .unwrap()
-                        .first()
-                        .get_one::<i32>()
-                        .unwrap()
-                        .unwrap()
-                });
-                pgrx::warning!("BENCH bench_hls_30s_sd: segments={}", seg_count);
-            }
-        }
-
-        durations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = durations.len() as f64;
-        let mean = durations.iter().sum::<f64>() / n;
-        let variance = durations.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
-        let stddev = variance.sqrt();
-        let median = durations[durations.len() / 2];
-        let min = durations[0];
-        let max = durations[durations.len() - 1];
-
-        pgrx::warning!(
-            "BENCH bench_hls_30s_sd: iterations={} mean={:.3}s stddev={:.3}s median={:.3}s min={:.3}s max={:.3}s",
-            ITERATIONS, mean, stddev, median, min, max,
-        );
-
-        let _ = std::fs::remove_file(&video_path);
+        b.iter(|| {
+            black_box(crate::hls::hls(&url, 6));
+        });
     }
 }

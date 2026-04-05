@@ -16,9 +16,11 @@ pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = ["tempfile"]
+pg_bench = ["pgrx-bench", "tempfile"]
 
 [dependencies]
 pgrx = "0.17"
+pgrx-bench = { version = "0.17", optional = true }
 ffmpeg-next = "8"
 tempfile = { version = "3", optional = true }
 serde_json = "1"
