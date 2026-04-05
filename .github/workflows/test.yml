@@ -35,7 +35,7 @@ jobs:
           cache-directories: /home/runner/.pgrx
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --locked
+        run: cargo install cargo-pgrx --version "$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
 
       - name: Initialize pgrx
         run: |

@@ -46,5 +46,5 @@ runs:
       shell: bash
       run: |
         . "$HOME/.cargo/env"
-        cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
+        cargo install cargo-pgrx --version "$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
         cargo pgrx init "--pg${{ inputs.pg_version }}=/usr/lib/postgresql/${{ inputs.pg_version }}/bin/pg_config"
