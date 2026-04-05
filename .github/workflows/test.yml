@@ -46,6 +46,3 @@ jobs:
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
-
-      - name: Bench
-        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
