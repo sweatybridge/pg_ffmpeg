@@ -256,7 +256,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     playlist_id
 }
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(any(test, feature = "pg_test", feature = "pg_bench"))]
 pub(crate) fn generate_video(
     path: &std::path::Path,
     width: u32,
@@ -472,5 +472,25 @@ mod tests {
         let _ = std::fs::remove_file(&video_path);
     }
 
+}
+
+#[cfg(feature = "pg_bench")]
+#[pg_schema]
+mod benches {
+    use pgrx::prelude::*;
+    use pgrx_bench::{black_box, Bencher};
+
+    #[pg_bench]
+    fn bench_hls_30s_sd(b: &mut Bencher) {
+        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp);
+        super::generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
+        let url = format!("file://{}", video_path.display());
+
+        b.iter(|| {
+            black_box(crate::hls::hls(&url, 6));
+        });
+    }
 }
 
