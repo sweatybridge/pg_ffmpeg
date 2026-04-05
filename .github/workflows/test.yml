@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    container: debian:bookworm
     strategy:
       fail-fast: false
       matrix:
@@ -16,39 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config \
-            libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
-            libreadline-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup-pgrx
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.pgrx
-            target
-          key: test-pg${{ matrix.pg_version }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: test-pg${{ matrix.pg_version }}-
-
-      - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
-
-      - name: Initialize pgrx
-        run: cargo pgrx init --pg${{ matrix.pg_version }} download
+          pg_version: ${{ matrix.pg_version }}
 
       - name: Test
-        run: cargo pgrx test "pg${{ matrix.pg_version }}"
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx test "pg${{ matrix.pg_version }}"
 
       - name: Bench
-        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx bench "pg${{ matrix.pg_version }}"
