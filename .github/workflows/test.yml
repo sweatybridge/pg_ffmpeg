@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   test:
@@ -28,24 +27,22 @@ jobs:
             libreadline-dev
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.pgrx
-            target
-          key: test-pg${{ matrix.pg_version }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: test-pg${{ matrix.pg_version }}-
+          # components: clippy, rustfmt
+          cache-key: pg${{ matrix.pg_version }}
+          cache-directories: /home/runner/.pgrx
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version "=$(grep -oP 'pgrx = "\K[^"]+' Cargo.toml).0" --locked
+        run: cargo install cargo-pgrx --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init --pg${{ matrix.pg_version }} download
+        run: |
+          set +e
+          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
+          if [ $? -ne 0 ]; then
+            cargo pgrx init --pg${{ matrix.pg_version }} download
+          fi
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
