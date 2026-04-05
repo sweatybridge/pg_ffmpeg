@@ -22,11 +22,7 @@ jobs:
           pg_version: ${{ matrix.pg_version }}
 
       - name: Test
-        run: |
-          . "$HOME/.cargo/env"
-          cargo pgrx test "pg${{ matrix.pg_version }}"
+        run: cargo pgrx test "pg${{ matrix.pg_version }}"
 
       - name: Bench
-        run: |
-          . "$HOME/.cargo/env"
-          cargo pgrx bench "pg${{ matrix.pg_version }}"
+        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
