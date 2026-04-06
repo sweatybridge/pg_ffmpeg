@@ -479,7 +479,7 @@ mod tests {
 #[cfg(feature = "pg_bench")]
 #[pg_schema]
 mod benches {
-    use pgrx::prelude::*;
+    use pgrx::pg_bench;
     use pgrx_bench::{black_box, Bencher};
 
     #[pg_bench]

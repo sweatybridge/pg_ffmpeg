@@ -16,16 +16,17 @@ pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = ["tempfile"]
-pg_bench = ["tempfile"]
+pg_bench = ["tempfile", "dep:pgrx-bench"]
 
 [dependencies]
-pgrx = "0.17"
+pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
+pgrx-bench = { git = "https://github.com/pgcentralfoundation/pgrx.git", optional = true }
 ffmpeg-next = "8"
 tempfile = { version = "3", optional = true }
 serde_json = "1"
 
 [dev-dependencies]
-pgrx-tests = "0.17"
+pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
 tempfile = "3"
 
 [profile.dev]
