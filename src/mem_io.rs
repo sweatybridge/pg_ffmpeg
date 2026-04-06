@@ -40,9 +40,9 @@ unsafe extern "C" fn seek_cb(opaque: *mut c_void, offset: i64, whence: c_int) ->
     }
 }
 
-unsafe extern "C" fn write_cb(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
+unsafe extern "C" fn write_cb(opaque: *mut c_void, data: *mut u8, size: c_int) -> c_int {
     let vec = &mut *(opaque as *mut Vec<u8>);
-    vec.extend_from_slice(std::slice::from_raw_parts(data, size as usize));
+    vec.extend_from_slice(std::slice::from_raw_parts(data as *const u8, size as usize));
     size
 }
 

@@ -8,9 +8,9 @@ use ffmpeg_next::sys::{
 };
 
 /// Custom write callback: appends into a Vec<u8>.
-unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
+unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *mut u8, size: c_int) -> c_int {
     let buf = &mut *(opaque as *mut Vec<u8>);
-    buf.extend_from_slice(std::slice::from_raw_parts(data, size as usize));
+    buf.extend_from_slice(std::slice::from_raw_parts(data as *const u8, size as usize));
     size
 }
 
