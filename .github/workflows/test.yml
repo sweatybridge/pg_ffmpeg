@@ -40,7 +40,7 @@ jobs:
             libreadline-dev
 
       - name: Install cargo-pgrx
-        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
+        run: cargo install --locked cargo-pgrx
 
       - name: Initialize pgrx
         run: |
