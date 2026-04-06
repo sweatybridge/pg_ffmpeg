@@ -7,7 +7,6 @@ use ffmpeg_next::sys::{
     AVDictionary, AVFormatContext, AVIOContext,
 };
 
-
 /// Custom write callback: appends into a Vec<u8>.
 unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
     let buf = &mut *(opaque as *mut Vec<u8>);
@@ -78,10 +77,7 @@ unsafe extern "C" fn hls_io_open(
     0
 }
 
-unsafe extern "C" fn hls_io_close2(
-    s: *mut AVFormatContext,
-    pb: *mut AVIOContext,
-) -> c_int {
+unsafe extern "C" fn hls_io_close2(s: *mut AVFormatContext, pb: *mut AVIOContext) -> c_int {
     let state = &mut *((*s).opaque as *mut HlsIoState);
 
     if pb == state.segment_pb {
@@ -273,11 +269,11 @@ pub(crate) fn generate_video(
 
     let total_frames = fps * duration_secs;
 
-    let codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
-        .expect("MPEG2VIDEO encoder not found");
+    let codec =
+        ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
 
-    let mut octx = ffmpeg_next::format::output_as(path, "mpegts")
-        .expect("failed to create output context");
+    let mut octx =
+        ffmpeg_next::format::output_as(path, "mpegts").expect("failed to create output context");
 
     let mut stream = octx.add_stream(codec).expect("failed to add stream");
     stream.set_time_base((1, fps));
@@ -374,7 +370,11 @@ mod tests {
                 .get_one::<i32>()
                 .unwrap()
         });
-        assert_eq!(target_dur.unwrap(), 2, "target_duration should match segment_duration");
+        assert_eq!(
+            target_dur.unwrap(),
+            2,
+            "target_duration should match segment_duration"
+        );
 
         // Verify segments were created
         let seg_count = Spi::connect(|client| {
@@ -415,7 +415,10 @@ mod tests {
         for (i, (seg_idx, duration, data_len)) in rows.iter().enumerate() {
             assert_eq!(*seg_idx, i as i32, "segment_index should be sequential");
             assert!(duration.is_some(), "duration should be set for segment {i}");
-            assert!(duration.unwrap() > 0.0, "duration should be positive for segment {i}");
+            assert!(
+                duration.unwrap() > 0.0,
+                "duration should be positive for segment {i}"
+            );
             assert!(*data_len > 0, "segment {i} should have data");
         }
 
@@ -471,7 +474,6 @@ mod tests {
 
         let _ = std::fs::remove_file(&video_path);
     }
-
 }
 
 #[cfg(feature = "pg_bench")]
@@ -493,4 +495,3 @@ mod benches {
         });
     }
 }
-

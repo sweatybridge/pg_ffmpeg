@@ -4,8 +4,8 @@ use pgrx::prelude::*;
 
 mod extract_audio;
 mod hls;
-pub mod mem_io;
 mod media_info;
+pub mod mem_io;
 mod thumbnail;
 mod transcode;
 

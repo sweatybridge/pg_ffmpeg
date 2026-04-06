@@ -24,9 +24,8 @@ fn thumbnail(
     let video_stream_index = input.index();
     let time_base = input.time_base();
 
-    let context_decoder =
-        ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
-            .unwrap_or_else(|e| error!("failed to create decoder context: {e}"));
+    let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
+        .unwrap_or_else(|e| error!("failed to create decoder context: {e}"));
     let mut decoder = context_decoder
         .decoder()
         .video()
@@ -34,8 +33,7 @@ fn thumbnail(
 
     // Seek to the target time if > 0
     if seconds > 0.0 {
-        let target_ts =
-            (seconds * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+        let target_ts = (seconds * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
         let _ = ictx.seek(target_ts, ..target_ts + 1);
     }
 
@@ -51,7 +49,10 @@ fn thumbnail(
     .unwrap_or_else(|e| error!("failed to create scaler: {e}"));
 
     let target_pts = if time_base.denominator() != 0 {
-        Some((seconds * f64::from(time_base.denominator()) / f64::from(time_base.numerator())) as i64)
+        Some(
+            (seconds * f64::from(time_base.denominator()) / f64::from(time_base.numerator()))
+                as i64,
+        )
     } else {
         None
     };
@@ -60,7 +61,9 @@ fn thumbnail(
 
     for (stream, packet) in ictx.packets() {
         if stream.index() == video_stream_index {
-            decoder.send_packet(&packet).unwrap_or_else(|e| error!("decode error: {e}"));
+            decoder
+                .send_packet(&packet)
+                .unwrap_or_else(|e| error!("decode error: {e}"));
 
             let mut decoded = Video::empty();
             while decoder.receive_frame(&mut decoded).is_ok() {

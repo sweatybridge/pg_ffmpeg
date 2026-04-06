@@ -27,18 +27,23 @@ fn media_info(data: Vec<u8>) -> pgrx::JsonB {
         });
 
         if medium == ffmpeg_next::media::Type::Video {
-            if let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+            if let Ok(ctx) =
+                ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            {
                 if let Ok(video) = ctx.decoder().video() {
                     info["width"] = json!(video.width());
                     info["height"] = json!(video.height());
                     let rate = stream.avg_frame_rate();
                     if rate.denominator() != 0 {
-                        info["fps"] = json!(f64::from(rate.numerator()) / f64::from(rate.denominator()));
+                        info["fps"] =
+                            json!(f64::from(rate.numerator()) / f64::from(rate.denominator()));
                     }
                 }
             }
         } else if medium == ffmpeg_next::media::Type::Audio {
-            if let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+            if let Ok(ctx) =
+                ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            {
                 if let Ok(audio) = ctx.decoder().audio() {
                     info["sample_rate"] = json!(audio.rate());
                     info["channels"] = json!(audio.channels());
