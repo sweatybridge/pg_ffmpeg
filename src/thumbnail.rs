@@ -204,8 +204,9 @@ mod tests {
         encoder.set_height(height);
         encoder.set_format(Pixel::YUV420P);
         encoder.set_bit_rate(400_000);
-        encoder.set_gop(10);
-        encoder.set_max_b_frames(2);
+        // All-intra: every frame is a keyframe so seek lands precisely.
+        encoder.set_gop(1);
+        encoder.set_max_b_frames(0);
         encoder.set_frame_rate(Some((fps, 1)));
         encoder.set_time_base((1, fps));
 
@@ -255,7 +256,8 @@ mod tests {
 
     #[pg_test]
     fn test_thumbnail_at_one_second() {
-        let data = generate_test_video_bytes(64, 64, 10, 3);
+        // 5-second video gives the seek+decode path room to land well before EOF.
+        let data = generate_test_video_bytes(64, 64, 25, 5);
         let png = thumbnail(data, 1.0, "png".to_string());
         assert!(!png.is_empty(), "thumbnail bytes should be non-empty");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output should be a PNG");
