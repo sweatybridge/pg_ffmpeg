@@ -19,11 +19,11 @@ pg_test = ["tempfile"]
 pg_bench = ["tempfile", "pgrx-bench"]
 
 [dependencies]
+ffmpeg-next = "8"
 pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
 pgrx-bench = { git = "https://github.com/pgcentralfoundation/pgrx.git", optional = true }
-ffmpeg-next = "8"
-tempfile = { version = "3", optional = true }
 serde_json = "1"
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
