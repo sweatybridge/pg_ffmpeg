@@ -550,3 +550,23 @@ mod tests {
         assert_eq!(dec.height(), 32);
     }
 }
+
+#[cfg(feature = "pg_bench")]
+#[pg_schema]
+mod benches {
+    use crate::bench_common::{generate_sample_video, sample_video_bytes};
+    use pgrx::pg_bench;
+    use pgrx_bench::{black_box, Bencher};
+
+    #[pg_bench(setup = generate_sample_video)]
+    fn bench_transcode_remux(b: &mut Bencher) {
+        let data = sample_video_bytes();
+        b.iter(move || black_box(super::transcode(data.clone(), Some("matroska"), None)));
+    }
+
+    #[pg_bench(setup = generate_sample_video)]
+    fn bench_transcode_filter_scale(b: &mut Bencher) {
+        let data = sample_video_bytes();
+        b.iter(move || black_box(super::transcode(data.clone(), None, Some("scale=320:240"))));
+    }
+}

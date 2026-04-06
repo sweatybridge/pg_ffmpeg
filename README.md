@@ -18,13 +18,13 @@ All functions are in the `ffmpeg` schema.
 
 - PostgreSQL 16–18
 - Rust toolchain
-- `cargo-pgrx` (`cargo install cargo-pgrx`)
+- `cargo install --locked cargo-pgrx`
 - FFmpeg development libraries:
 
 ```bash
 # Debian/Ubuntu
-apt-get install libavcodec-dev libavformat-dev libavutil-dev \
-  libavfilter-dev libswscale-dev libswresample-dev \
+apt-get install libavcodec-dev libavdevice-dev libavfilter-dev \
+  libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
   clang libclang-dev pkg-config
 ```
 
@@ -33,6 +33,14 @@ apt-get install libavcodec-dev libavformat-dev libavutil-dev \
 ```bash
 cargo pgrx init --pg16=$(which pg_config)  # adjust for your PG version
 cargo pgrx install --release
+```
+
+Additional libraries if you plan to build postgres from source.
+
+```bash
+# Debian/Ubuntu
+apt-get install build-essential libreadline-dev zlib1g-dev flex bison \
+  libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache
 ```
 
 ## Usage

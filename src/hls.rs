@@ -479,17 +479,13 @@ mod tests {
 #[cfg(feature = "pg_bench")]
 #[pg_schema]
 mod benches {
+    use crate::bench_common::{generate_sample_video, sample_video_path};
     use pgrx::pg_bench;
     use pgrx_bench::{black_box, Bencher};
 
-    #[pg_bench]
+    #[pg_bench(setup = generate_sample_video)]
     fn bench_hls_30s_sd(b: &mut Bencher) {
-        let tmp = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
-        let video_path = tmp.path().to_path_buf();
-        drop(tmp);
-        super::generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
-        let url = format!("file://{}", video_path.display());
-
+        let url = format!("file://{}", sample_video_path().display());
         b.iter(move || {
             black_box(crate::hls::hls(&url, 6));
         });
