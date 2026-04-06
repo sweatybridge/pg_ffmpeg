@@ -59,32 +59,36 @@ impl ToastWriter {
 
     unsafe fn write_data(&mut self, data: &[u8]) {
         self.total_bytes += data.len();
-        if data.len() == TOAST_CHUNK_SIZE {
-            // Full chunk: stage directly from the avio buffer — no copy through partial.
-            let varlena_size = pg_sys::VARHDRSZ + TOAST_CHUNK_SIZE;
-            let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
-            *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
-            ptr::copy_nonoverlapping(data.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), TOAST_CHUNK_SIZE);
-            let value_id_u32: u32 = std::mem::transmute(self.value_id);
-            self.all_values.push([
-                pg_sys::Datum::from(value_id_u32 as usize),
-                pg_sys::Datum::from(self.seq as usize),
-                pg_sys::Datum::from(cbuf as usize),
-            ]);
-            self.all_nulls.push([false; 3]);
-            let vals = self.all_values.last_mut().unwrap();
-            let nulls = self.all_nulls.last_mut().unwrap();
-            let tupdesc = (*self.toast_rel).rd_att;
-            let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
-            (*tuple).t_tableOid = (*self.toast_rel).rd_id;
-            let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
-            pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
-            self.slot_ptrs.push(slot);
-            self.seq += 1;
-        } else {
-            // Final partial flush — save for end_segment.
-            self.partial[..data.len()].copy_from_slice(data);
-            self.partial_len = data.len();
+        let mut pos = 0;
+        while pos < data.len() {
+            let to_copy = (TOAST_CHUNK_SIZE - self.partial_len).min(data.len() - pos);
+            self.partial[self.partial_len..self.partial_len + to_copy]
+                .copy_from_slice(&data[pos..pos + to_copy]);
+            self.partial_len += to_copy;
+            pos += to_copy;
+            if self.partial_len == TOAST_CHUNK_SIZE {
+                let varlena_size = pg_sys::VARHDRSZ + TOAST_CHUNK_SIZE;
+                let cbuf = pg_sys::palloc(varlena_size) as *mut u8;
+                *(cbuf as *mut u32) = (varlena_size as u32) << 2; // SET_VARSIZE_4B
+                ptr::copy_nonoverlapping(self.partial.as_ptr(), cbuf.add(pg_sys::VARHDRSZ), TOAST_CHUNK_SIZE);
+                let value_id_u32: u32 = std::mem::transmute(self.value_id);
+                self.all_values.push([
+                    pg_sys::Datum::from(value_id_u32 as usize),
+                    pg_sys::Datum::from(self.seq as usize),
+                    pg_sys::Datum::from(cbuf as usize),
+                ]);
+                self.all_nulls.push([false; 3]);
+                let vals = self.all_values.last_mut().unwrap();
+                let nulls = self.all_nulls.last_mut().unwrap();
+                let tupdesc = (*self.toast_rel).rd_att;
+                let tuple = pg_sys::heap_form_tuple(tupdesc, vals.as_mut_ptr(), nulls.as_mut_ptr());
+                (*tuple).t_tableOid = (*self.toast_rel).rd_id;
+                let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+                pg_sys::ExecStoreHeapTuple(tuple, slot, true); // slot owns tuple
+                self.slot_ptrs.push(slot);
+                self.seq += 1;
+                self.partial_len = 0;
+            }
         }
     }
 
