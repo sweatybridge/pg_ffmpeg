@@ -18,6 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+          cache-key: pg${{ matrix.pg_version }}
+          cache-directories: /home/runner/.pgrx
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -29,13 +39,6 @@ jobs:
             libavfilter-dev libavdevice-dev \
             libreadline-dev
 
-      - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          # components: clippy, rustfmt
-          cache-key: pg${{ matrix.pg_version }}
-          cache-directories: /home/runner/.pgrx
-
       - name: Install cargo-pgrx
         run: cargo install cargo-pgrx --locked
 
@@ -46,6 +49,9 @@ jobs:
           if [ $? -ne 0 ]; then
             cargo pgrx init --pg${{ matrix.pg_version }} download
           fi
+
+      - name: Clippy
+        run: cargo clippy --features pg${{ matrix.pg_version }} --no-default-features -- -D warnings
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
