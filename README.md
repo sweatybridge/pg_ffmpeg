@@ -25,7 +25,9 @@ All functions are in the `ffmpeg` schema.
 # Debian/Ubuntu
 apt-get install libavcodec-dev libavformat-dev libavutil-dev \
   libavfilter-dev libswscale-dev libswresample-dev \
-  clang libclang-dev pkg-config
+  clang libclang-dev pkg-config \
+  build-essential libreadline-dev zlib1g-dev flex bison \
+  libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache
 ```
 
 ## Build & Install
