@@ -32,7 +32,7 @@ fn extract_audio(data: Vec<u8>, format: default!(&str, "'mp3'")) -> Vec<u8> {
             packet.rescale_ts(in_tb, out_tb);
             packet.set_position(-1);
             packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
         }
     }

@@ -59,7 +59,7 @@ unsafe extern "C" fn hls_io_open(
         1,
         target_buf as *mut c_void,
         None,
-        Some(std::mem::transmute(vec_write as *const ())),
+        Some(vec_write),
         None,
     );
     if ctx.is_null() {

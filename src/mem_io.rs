@@ -67,9 +67,9 @@ impl MemInput {
                 BUF_SIZE as c_int,
                 0,
                 &mut *cursor as *mut Cursor<Vec<u8>> as *mut c_void,
-                Some(std::mem::transmute(read_cb as *const ())),
+                Some(read_cb),
                 None,
-                Some(std::mem::transmute(seek_cb as *const ())),
+                Some(seek_cb),
             );
             if avio_ctx.is_null() {
                 error!("failed to allocate AVIO context");
@@ -129,6 +129,7 @@ impl Drop for MemInput {
 pub struct MemOutput {
     ctx: Option<ffmpeg_next::format::context::Output>,
     avio_ctx: *mut AVIOContext,
+    #[allow(clippy::box_collection)]
     output_buf: Box<Vec<u8>>,
 }
 
@@ -147,7 +148,7 @@ impl MemOutput {
                 1,
                 &mut *output_buf as *mut Vec<u8> as *mut c_void,
                 None,
-                Some(std::mem::transmute(write_cb as *const ())),
+                Some(write_cb),
                 None,
             );
             if avio_ctx.is_null() {

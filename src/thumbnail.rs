@@ -92,13 +92,12 @@ fn thumbnail(
     if result_frame.is_none() {
         let _ = decoder.send_eof();
         let mut decoded = Video::empty();
-        while decoder.receive_frame(&mut decoded).is_ok() {
+        if decoder.receive_frame(&mut decoded).is_ok() {
             let mut rgb_frame = Video::empty();
             scaler
                 .run(&decoded, &mut rgb_frame)
                 .unwrap_or_else(|e| error!("scaling error: {e}"));
             result_frame = Some(rgb_frame);
-            break;
         }
     }
 
@@ -166,7 +165,7 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
         .unwrap_or_else(|e| error!("failed to open encoder: {e}"));
 
     encoder
-        .send_frame(&enc_frame)
+        .send_frame(enc_frame)
         .unwrap_or_else(|e| error!("encode send_frame error: {e}"));
     encoder.send_eof().unwrap();
 

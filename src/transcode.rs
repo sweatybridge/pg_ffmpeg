@@ -258,7 +258,7 @@ fn transcode(
                 packet.rescale_ts(in_tb, out_tb);
                 packet.set_position(-1);
                 packet
-                    .write_interleaved(&mut *octx)
+                    .write_interleaved(&mut octx)
                     .unwrap_or_else(|e| error!("failed to write packet: {e}"));
             }
         }
@@ -337,7 +337,7 @@ fn transcode(
                 packet.set_position(-1);
                 packet.set_stream(ost_idx as _);
                 packet
-                    .write_interleaved(&mut *octx)
+                    .write_interleaved(&mut octx)
                     .unwrap_or_else(|e| error!("failed to write packet: {e}"));
             }
         }
