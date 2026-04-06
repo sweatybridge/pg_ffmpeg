@@ -479,17 +479,9 @@ mod tests {
 #[cfg(feature = "pg_bench")]
 #[pg_schema]
 mod benches {
+    use crate::bench_common::{generate_sample_video, sample_video_path};
     use pgrx::pg_bench;
     use pgrx_bench::{black_box, Bencher};
-
-    fn sample_video_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("pg_ffmpeg_bench_sample.ts")
-    }
-
-    fn generate_sample_video() {
-        let path = sample_video_path();
-        super::generate_video(&path, 640, 480, 25, 30, 2_000_000);
-    }
 
     #[pg_bench(setup = generate_sample_video)]
     fn bench_hls_30s_sd(b: &mut Bencher) {

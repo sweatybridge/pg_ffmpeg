@@ -42,3 +42,5 @@ fn extract_audio(data: Vec<u8>, format: default!(&str, "'mp3'")) -> Vec<u8> {
 
     octx.into_data()
 }
+
+// NOTE: no bench for extract_audio — the shared sample video has no audio stream.

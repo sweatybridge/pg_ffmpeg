@@ -176,3 +176,17 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
 
     packet.data().unwrap().to_vec()
 }
+
+#[cfg(feature = "pg_bench")]
+#[pg_schema]
+mod benches {
+    use crate::bench_common::{generate_sample_video, sample_video_bytes};
+    use pgrx::pg_bench;
+    use pgrx_bench::{black_box, Bencher};
+
+    #[pg_bench(setup = generate_sample_video)]
+    fn bench_thumbnail(b: &mut Bencher) {
+        let data = sample_video_bytes();
+        b.iter(|| black_box(super::thumbnail(data.clone(), 1.0, "png".to_string())));
+    }
+}
