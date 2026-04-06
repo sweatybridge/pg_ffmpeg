@@ -181,20 +181,83 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
 #[pg_schema]
 mod tests {
     use super::*;
+    use crate::mem_io::MemOutput;
+
+    fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_secs: i32) -> Vec<u8> {
+        use ffmpeg_next::codec;
+        use ffmpeg_next::util::frame::video::Video;
+
+        ffmpeg_next::init().unwrap();
+
+        let total_frames = fps * duration_secs;
+        let enc_codec = ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO)
+            .expect("MPEG2VIDEO encoder not found");
+
+        let mut octx = MemOutput::open("mpegts");
+
+        let mut stream = octx.add_stream(enc_codec).expect("failed to add stream");
+        stream.set_time_base((1, fps));
+
+        let ctx = codec::context::Context::new_with_codec(enc_codec);
+        let mut encoder = ctx.encoder().video().expect("failed to create encoder");
+        encoder.set_width(width);
+        encoder.set_height(height);
+        encoder.set_format(Pixel::YUV420P);
+        encoder.set_bit_rate(400_000);
+        encoder.set_gop(10);
+        encoder.set_max_b_frames(2);
+        encoder.set_frame_rate(Some((fps, 1)));
+        encoder.set_time_base((1, fps));
+
+        let mut encoder = encoder.open().expect("failed to open encoder");
+        stream.set_parameters(&encoder);
+        let out_time_base = stream.time_base();
+        drop(stream);
+
+        octx.write_header().expect("failed to write header");
+
+        let mut packet = ffmpeg_next::Packet::empty();
+        for i in 0..total_frames {
+            let mut frame = Video::new(Pixel::YUV420P, width, height);
+            let y_data = frame.data_mut(0);
+            for (j, byte) in y_data.iter_mut().enumerate() {
+                *byte = ((i as usize * 3 + j) % 256) as u8;
+            }
+            for plane in 1..=2 {
+                for byte in frame.data_mut(plane).iter_mut() {
+                    *byte = 128;
+                }
+            }
+            frame.set_pts(Some(i as i64));
+
+            encoder.send_frame(&frame).expect("failed to send frame");
+            while encoder.receive_packet(&mut packet).is_ok() {
+                packet.set_stream(0);
+                packet.rescale_ts((1, fps), out_time_base);
+                packet
+                    .write_interleaved(&mut *octx)
+                    .expect("failed to write packet");
+            }
+        }
+
+        encoder.send_eof().expect("failed to send eof");
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.rescale_ts((1, fps), out_time_base);
+            packet
+                .write_interleaved(&mut *octx)
+                .expect("failed to write packet");
+        }
+
+        octx.write_trailer().expect("failed to write trailer");
+        octx.into_data()
+    }
 
     #[pg_test]
     fn test_thumbnail_at_one_second() {
-        // Generate a 3s test video and extract a thumbnail at t=1s
-        let tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
-        let video_path = tmp.path().to_path_buf();
-        drop(tmp);
-        crate::hls::generate_video(&video_path, 64, 64, 10, 3, 400_000);
-        let data = std::fs::read(&video_path).unwrap();
-        let _ = std::fs::remove_file(&video_path);
-
+        let data = generate_test_video_bytes(64, 64, 10, 3);
         let png = thumbnail(data, 1.0, "png".to_string());
         assert!(!png.is_empty(), "thumbnail bytes should be non-empty");
-        // PNG magic number
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output should be a PNG");
     }
 }
