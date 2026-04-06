@@ -177,6 +177,28 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
     packet.data().unwrap().to_vec()
 }
 
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+
+    #[pg_test]
+    fn test_thumbnail_at_one_second() {
+        // Generate a 3s test video and extract a thumbnail at t=1s
+        let tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp);
+        crate::hls::generate_video(&video_path, 64, 64, 10, 3, 400_000);
+        let data = std::fs::read(&video_path).unwrap();
+        let _ = std::fs::remove_file(&video_path);
+
+        let png = thumbnail(data, 1.0, "png".to_string());
+        assert!(!png.is_empty(), "thumbnail bytes should be non-empty");
+        // PNG magic number
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output should be a PNG");
+    }
+}
+
 #[cfg(feature = "pg_bench")]
 #[pg_schema]
 mod benches {
