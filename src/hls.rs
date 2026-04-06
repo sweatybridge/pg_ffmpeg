@@ -479,7 +479,7 @@ mod tests {
 #[cfg(feature = "pg_bench")]
 #[pg_schema]
 mod benches {
-    use pgrx::prelude::*;
+    use pgrx::pg_bench;
     use pgrx_bench::{black_box, Bencher};
 
     fn sample_video_path() -> std::path::PathBuf {
@@ -494,7 +494,7 @@ mod benches {
     #[pg_bench(setup = generate_sample_video)]
     fn bench_hls_30s_sd(b: &mut Bencher) {
         let url = format!("file://{}", sample_video_path().display());
-        b.iter(|| {
+        b.iter(move || {
             black_box(crate::hls::hls(&url, 6));
         });
     }
