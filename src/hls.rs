@@ -479,7 +479,7 @@ mod tests {
 #[cfg(feature = "pg_bench")]
 #[pg_schema]
 mod benches {
-    use pgrx::prelude::*;
+    use pgrx::pg_bench;
     use pgrx_bench::{black_box, Bencher};
 
     #[pg_bench]
@@ -490,7 +490,7 @@ mod benches {
         super::generate_video(&video_path, 640, 480, 25, 30, 2_000_000);
         let url = format!("file://{}", video_path.display());
 
-        b.iter(|| {
+        b.iter(move || {
             black_box(crate::hls::hls(&url, 6));
         });
     }
