@@ -74,6 +74,6 @@ mod benches {
     #[pg_bench(setup = generate_sample_video)]
     fn bench_media_info(b: &mut Bencher) {
         let data = sample_video_bytes();
-        b.iter(|| black_box(super::media_info(data.clone())));
+        b.iter(move || black_box(super::media_info(data.clone())));
     }
 }

@@ -187,6 +187,6 @@ mod benches {
     #[pg_bench(setup = generate_sample_video)]
     fn bench_thumbnail(b: &mut Bencher) {
         let data = sample_video_bytes();
-        b.iter(|| black_box(super::thumbnail(data.clone(), 1.0, "png".to_string())));
+        b.iter(move || black_box(super::thumbnail(data.clone(), 1.0, "png".to_string())));
     }
 }

@@ -561,12 +561,12 @@ mod benches {
     #[pg_bench(setup = generate_sample_video)]
     fn bench_transcode_remux(b: &mut Bencher) {
         let data = sample_video_bytes();
-        b.iter(|| black_box(super::transcode(data.clone(), Some("matroska"), None)));
+        b.iter(move || black_box(super::transcode(data.clone(), Some("matroska"), None)));
     }
 
     #[pg_bench(setup = generate_sample_video)]
     fn bench_transcode_filter_scale(b: &mut Bencher) {
         let data = sample_video_bytes();
-        b.iter(|| black_box(super::transcode(data.clone(), None, Some("scale=320:240"))));
+        b.iter(move || black_box(super::transcode(data.clone(), None, Some("scale=320:240"))));
     }
 }
