@@ -6,8 +6,8 @@ use ffmpeg_next::software::scaling::{context::Context, flag::Flags};
 use ffmpeg_next::util::frame::video::Video;
 
 use crate::limits;
-use crate::mem_io::MemOutput;
 use crate::mem_io::MemInput;
+use crate::mem_io::MemOutput;
 
 #[pg_extern]
 fn thumbnail(

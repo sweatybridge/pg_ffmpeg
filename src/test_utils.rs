@@ -213,7 +213,9 @@ pub fn generate_test_video_with_audio_bytes(
         .flags()
         .contains(ffmpeg_next::format::Flags::GLOBAL_HEADER);
 
-    let mut video_stream = octx.add_stream(video_codec).expect("failed to add video stream");
+    let mut video_stream = octx
+        .add_stream(video_codec)
+        .expect("failed to add video stream");
     video_stream.set_time_base((1, fps));
 
     let video_ctx = codec::context::Context::new_with_codec(video_codec);
@@ -240,8 +242,12 @@ pub fn generate_test_video_with_audio_bytes(
     let video_out_time_base = video_stream.time_base();
     drop(video_stream);
 
-    let mut audio_stream = octx.add_stream(audio_codec).expect("failed to add audio stream");
-    let audio_props = audio_codec.audio().expect("AAC codec is not an audio encoder");
+    let mut audio_stream = octx
+        .add_stream(audio_codec)
+        .expect("failed to add audio stream");
+    let audio_props = audio_codec
+        .audio()
+        .expect("AAC codec is not an audio encoder");
     let sample_rate = audio_props
         .rates()
         .and_then(|mut rates| rates.next())
@@ -320,9 +326,9 @@ pub fn generate_test_video_with_audio_bytes(
     if samples_per_frame == 0 {
         samples_per_frame = 1024;
     }
-    let total_audio_samples =
-        (duration_secs as usize).saturating_mul(sample_rate as usize) / samples_per_frame
-            * samples_per_frame;
+    let total_audio_samples = (duration_secs as usize).saturating_mul(sample_rate as usize)
+        / samples_per_frame
+        * samples_per_frame;
     let total_audio_samples = total_audio_samples.max(samples_per_frame);
 
     let mut next_audio_pts = 0usize;

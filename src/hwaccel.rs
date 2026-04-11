@@ -37,8 +37,8 @@ use std::ptr;
 
 use ffmpeg_next::codec::Id as CodecId;
 use ffmpeg_next::sys::{
-    av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, av_hwdevice_iterate_types,
-    AVBufferRef, AVHWDeviceType,
+    av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, av_hwdevice_iterate_types, AVBufferRef,
+    AVHWDeviceType,
 };
 use ffmpeg_next::Codec;
 
