@@ -45,6 +45,7 @@ struct AudioTranscodePipeline {
     graph: filter::Graph,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_extern]
 fn transcode(
     data: Vec<u8>,
@@ -606,6 +607,7 @@ fn resolve_audio_encoder(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_video_encoder_with_fallback(
     octx: &ffmpeg_next::format::context::Output,
     decoder: &ffmpeg_next::decoder::Video,
@@ -811,7 +813,7 @@ fn resolve_audio_sample_rate(
     if let Some(mut rates) = codec.rates() {
         let decoder_rate = decoder.rate();
         let mut fallback = None;
-        while let Some(rate) = rates.next() {
+        for rate in rates {
             fallback.get_or_insert(rate as u32);
             if rate as u32 == decoder_rate {
                 return decoder_rate;
@@ -846,7 +848,7 @@ fn resolve_audio_sample_format(
     if let Some(mut formats) = codec.formats() {
         let decoder_format = decoder.format();
         let mut fallback = None;
-        while let Some(format) = formats.next() {
+        for format in formats {
             fallback.get_or_insert(format);
             if format == decoder_format {
                 return decoder_format;
