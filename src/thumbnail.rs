@@ -168,13 +168,14 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
         .open_as(codec)
         .unwrap_or_else(|e| error!("failed to open encoder: {e}"));
     let mut octx = MemOutput::open("image2pipe");
-    let mut stream = octx
-        .add_stream(codec)
-        .unwrap_or_else(|e| error!("failed to add thumbnail stream: {e}"));
-    stream.set_time_base((1, 25));
-    stream.set_parameters(&encoder);
-    let out_time_base = stream.time_base();
-    drop(stream);
+    let out_time_base = {
+        let mut stream = octx
+            .add_stream(codec)
+            .unwrap_or_else(|e| error!("failed to add thumbnail stream: {e}"));
+        stream.set_time_base((1, 25));
+        stream.set_parameters(&encoder);
+        stream.time_base()
+    };
 
     octx.write_header()
         .unwrap_or_else(|e| error!("failed to write thumbnail header: {e}"));

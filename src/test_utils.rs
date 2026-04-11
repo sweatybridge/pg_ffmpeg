@@ -149,9 +149,10 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
     encoder.set_time_base((1, fps));
 
     let mut encoder = encoder.open().expect("failed to open encoder");
-    stream.set_parameters(&encoder);
-    let out_time_base = stream.time_base();
-    drop(stream);
+    let out_time_base = {
+        stream.set_parameters(&encoder);
+        stream.time_base()
+    };
 
     octx.write_header().expect("failed to write header");
 
@@ -238,9 +239,10 @@ pub fn generate_test_video_with_audio_bytes(
     let mut video_encoder = video_encoder
         .open_as(video_codec)
         .expect("failed to open video encoder");
-    video_stream.set_parameters(&video_encoder);
-    let video_out_time_base = video_stream.time_base();
-    drop(video_stream);
+    let video_out_time_base = {
+        video_stream.set_parameters(&video_encoder);
+        video_stream.time_base()
+    };
 
     let mut audio_stream = octx
         .add_stream(audio_codec)
@@ -280,9 +282,10 @@ pub fn generate_test_video_with_audio_bytes(
     let mut audio_encoder = audio_encoder
         .open_as(audio_codec)
         .expect("failed to open audio encoder");
-    audio_stream.set_parameters(&audio_encoder);
-    let audio_out_time_base = audio_stream.time_base();
-    drop(audio_stream);
+    let audio_out_time_base = {
+        audio_stream.set_parameters(&audio_encoder);
+        audio_stream.time_base()
+    };
 
     octx.write_header().expect("failed to write header");
 
@@ -396,9 +399,10 @@ pub fn generate_test_image_bytes(format: &str, width: u32, height: u32) -> Vec<u
     encoder.set_time_base((1, 1));
 
     let mut encoder = encoder.open().expect("failed to open image encoder");
-    stream.set_parameters(&encoder);
-    let out_time_base = stream.time_base();
-    drop(stream);
+    let out_time_base = {
+        stream.set_parameters(&encoder);
+        stream.time_base()
+    };
 
     octx.write_header().expect("failed to write header");
 
