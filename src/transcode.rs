@@ -784,7 +784,7 @@ fn build_audio_filter_graph(
         .unwrap_or_else(|e| error!("failed to add abuffer sink: {e}"));
     {
         let mut out = graph.get("out").unwrap();
-        out.set_sample_rate(encoder.rate() as u32);
+        out.set_sample_rate(encoder.rate());
         out.set_channel_layout(encoder.channel_layout());
         out.set_sample_format(encoder.format());
     }
