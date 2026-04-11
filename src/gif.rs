@@ -287,11 +287,7 @@ fn drain_encoder(ctx: &mut PipelineCtx) {
 /// Resolve (encoder_name, muxer_name, filter_spec) for the requested
 /// output format. Filter specs here are built from numeric parameters
 /// only — there is no user-supplied filter string to validate.
-fn gif_params(
-    format: &str,
-    fps: i32,
-    width: Option<i32>,
-) -> (&'static str, &'static str, String) {
+fn gif_params(format: &str, fps: i32, width: Option<i32>) -> (&'static str, &'static str, String) {
     let scale_prefix = match width {
         Some(w) => format!("scale={}:-1:flags=lanczos,", w),
         None => String::new(),
@@ -360,11 +356,7 @@ mod tests {
         let data = generate_test_video_bytes(64, 64, 25, 5);
         let apng = generate_gif(data, 0.0, 2.0, Some(32), 10, "apng");
         assert!(!apng.is_empty(), "apng bytes should be non-empty");
-        assert_eq!(
-            &apng[..8],
-            b"\x89PNG\r\n\x1a\n",
-            "expected PNG signature"
-        );
+        assert_eq!(&apng[..8], b"\x89PNG\r\n\x1a\n", "expected PNG signature");
         // APNG adds an `acTL` animation control chunk near the start
         // of the file. Searching the first 128 bytes is plenty: the
         // chunk always appears right after IHDR.
@@ -385,8 +377,7 @@ mod tests {
     #[pg_test]
     fn test_generate_gif_rejects_unknown_format() {
         let data = generate_test_video_bytes(64, 64, 25, 1);
-        let result =
-            std::panic::catch_unwind(|| generate_gif(data, 0.0, 1.0, None, 10, "mp4"));
+        let result = std::panic::catch_unwind(|| generate_gif(data, 0.0, 1.0, None, 10, "mp4"));
         assert!(result.is_err(), "unknown format should error");
     }
 }
