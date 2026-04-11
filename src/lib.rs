@@ -5,6 +5,7 @@ use pgrx::prelude::*;
 mod codec_lookup;
 mod extract_audio;
 mod filter_safety;
+mod gif;
 mod hls;
 mod hwaccel;
 mod limits;
