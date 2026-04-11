@@ -7,7 +7,7 @@ use crate::mem_io::MemInput;
 fn media_info(data: Vec<u8>) -> pgrx::JsonB {
     ffmpeg_next::init().unwrap();
 
-    let ictx = MemInput::open(data);
+    let ictx = MemInput::open(&data);
 
     let duration_secs = if ictx.duration() >= 0 {
         Some(ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE))

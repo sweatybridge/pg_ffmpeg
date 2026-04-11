@@ -2,12 +2,28 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
+mod codec_lookup;
 mod extract_audio;
+mod filter_safety;
 mod hls;
+mod hwaccel;
+mod limits;
 mod media_info;
 pub mod mem_io;
+mod pipeline;
+#[cfg(any(test, feature = "pg_test"))]
+mod test_utils;
 mod thumbnail;
 mod transcode;
+
+/// Postgres `_PG_init` entrypoint. Postgres calls this once per backend
+/// when the shared library is first loaded. We use it to register the
+/// limit GUCs (Task F4); nothing else in the foundation needs init-time
+/// setup because the hardware-acceleration cache (Task F2) is lazy.
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    limits::register_gucs();
+}
 
 #[cfg(feature = "pg_bench")]
 pub(crate) mod bench_common {
