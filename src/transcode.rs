@@ -90,7 +90,8 @@ fn transcode(
         && crf.is_none()
         && bitrate.is_none()
         && !hwaccel;
-    let audio_passthrough = audio_codec.is_none() && audio_filter.is_none() && audio_bitrate.is_none();
+    let audio_passthrough =
+        audio_codec.is_none() && audio_filter.is_none() && audio_bitrate.is_none();
 
     if video_passthrough && audio_passthrough {
         return remux_all_streams(&mut ictx, out_format);
@@ -132,7 +133,8 @@ fn transcode(
                 if video_passthrough {
                     stream_mapping[ist_index] = pipeline::copy_stream(&ist, &mut octx) as isize;
                 } else {
-                    let pipe = VideoTranscodePipeline::new(&ist, &mut octx, ost_index, &video_config);
+                    let pipe =
+                        VideoTranscodePipeline::new(&ist, &mut octx, ost_index, &video_config);
                     stream_mapping[ist_index] = ost_index as isize;
                     video_pipelines.insert(ist_index, pipe);
                     ost_index += 1;
@@ -144,7 +146,8 @@ fn transcode(
                 if audio_passthrough {
                     stream_mapping[ist_index] = pipeline::copy_stream(&ist, &mut octx) as isize;
                 } else {
-                    let pipe = AudioTranscodePipeline::new(&ist, &mut octx, ost_index, &audio_config);
+                    let pipe =
+                        AudioTranscodePipeline::new(&ist, &mut octx, ost_index, &audio_config);
                     stream_mapping[ist_index] = ost_index as isize;
                     audio_pipelines.insert(ist_index, pipe);
                     ost_index += 1;
@@ -408,7 +411,8 @@ impl AudioTranscodePipeline {
             .decoder()
             .audio()
             .unwrap_or_else(|e| error!("failed to open audio decoder: {e}"));
-        decoder.set_parameters(ist.parameters())
+        decoder
+            .set_parameters(ist.parameters())
             .unwrap_or_else(|e| error!("failed to set audio decoder parameters: {e}"));
 
         let (selected_codec, codec_label) = resolve_audio_encoder(config.codec_name, decoder.id());
@@ -431,8 +435,13 @@ impl AudioTranscodePipeline {
             encoder_time_base,
             config,
         );
-        let graph =
-            build_audio_filter_graph(&decoder, sample_rate, channel_layout, sample_format, config.filter_spec);
+        let graph = build_audio_filter_graph(
+            &decoder,
+            sample_rate,
+            channel_layout,
+            sample_format,
+            config.filter_spec,
+        );
 
         let mut ost = octx
             .add_stream(selected_codec)
@@ -538,13 +547,18 @@ fn resolved_video_output(graph: &mut filter::Graph) -> (u32, u32, Pixel, Rationa
         (
             width,
             height,
-            Pixel::from(std::mem::transmute::<i32, ffmpeg_next::sys::AVPixelFormat>(pix_fmt)),
+            Pixel::from(std::mem::transmute::<i32, ffmpeg_next::sys::AVPixelFormat>(
+                pix_fmt,
+            )),
             Rational(time_base.num, time_base.den),
         )
     }
 }
 
-fn resolved_video_time_base(decoder: &ffmpeg_next::decoder::Video, filter_tb: Rational) -> Rational {
+fn resolved_video_time_base(
+    decoder: &ffmpeg_next::decoder::Video,
+    filter_tb: Rational,
+) -> Rational {
     if let Some(frame_rate) = decoder.frame_rate() {
         Rational(frame_rate.denominator(), frame_rate.numerator())
     } else if filter_tb.denominator() != 0 {
@@ -554,24 +568,40 @@ fn resolved_video_time_base(decoder: &ffmpeg_next::decoder::Video, filter_tb: Ra
     }
 }
 
-fn resolve_video_encoder(requested: Option<&str>, source_id: codec::Id) -> (ffmpeg_next::Codec, String) {
+fn resolve_video_encoder(
+    requested: Option<&str>,
+    source_id: codec::Id,
+) -> (ffmpeg_next::Codec, String) {
     if let Some(name) = requested {
-        let codec = codec_lookup::find_encoder(name, CodecKind::Video).unwrap_or_else(|e| error!("{e}"));
+        let codec =
+            codec_lookup::find_encoder(name, CodecKind::Video).unwrap_or_else(|e| error!("{e}"));
         (codec, name.to_owned())
     } else {
-        let codec = codec::encoder::find(source_id)
-            .unwrap_or_else(|| error!("pg_ffmpeg: no video encoder found for source codec {:?}", source_id));
+        let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
+            error!(
+                "pg_ffmpeg: no video encoder found for source codec {:?}",
+                source_id
+            )
+        });
         (codec, codec.name().to_owned())
     }
 }
 
-fn resolve_audio_encoder(requested: Option<&str>, source_id: codec::Id) -> (ffmpeg_next::Codec, String) {
+fn resolve_audio_encoder(
+    requested: Option<&str>,
+    source_id: codec::Id,
+) -> (ffmpeg_next::Codec, String) {
     if let Some(name) = requested {
-        let codec = codec_lookup::find_encoder(name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
+        let codec =
+            codec_lookup::find_encoder(name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
         (codec, name.to_owned())
     } else {
-        let codec = codec::encoder::find(source_id)
-            .unwrap_or_else(|| error!("pg_ffmpeg: no audio encoder found for source codec {:?}", source_id));
+        let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
+            error!(
+                "pg_ffmpeg: no audio encoder found for source codec {:?}",
+                source_id
+            )
+        });
         (codec, codec.name().to_owned())
     }
 }
@@ -621,7 +651,12 @@ fn open_video_encoder_with_fallback(
         config,
         None,
     )
-    .unwrap_or_else(|e| error!("{}", codec_lookup::open_failed(codec_label, CodecKind::Video, e)));
+    .unwrap_or_else(|e| {
+        error!(
+            "{}",
+            codec_lookup::open_failed(codec_label, CodecKind::Video, e)
+        )
+    });
     (software_codec, encoder)
 }
 
@@ -666,11 +701,7 @@ fn open_video_encoder(
         }
     }
 
-    if octx
-        .format()
-        .flags()
-        .contains(format::Flags::GLOBAL_HEADER)
-    {
+    if octx.format().flags().contains(format::Flags::GLOBAL_HEADER) {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
@@ -720,17 +751,16 @@ fn open_audio_encoder(
         encoder.set_bit_rate(target_bitrate);
     }
 
-    if octx
-        .format()
-        .flags()
-        .contains(format::Flags::GLOBAL_HEADER)
-    {
+    if octx.format().flags().contains(format::Flags::GLOBAL_HEADER) {
         encoder.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
-    encoder
-        .open_as(selected_codec)
-        .unwrap_or_else(|e| error!("{}", codec_lookup::open_failed(codec_label, CodecKind::Audio, e)))
+    encoder.open_as(selected_codec).unwrap_or_else(|e| {
+        error!(
+            "{}",
+            codec_lookup::open_failed(codec_label, CodecKind::Audio, e)
+        )
+    })
 }
 
 fn build_audio_filter_graph(
@@ -800,7 +830,8 @@ fn resolve_audio_channel_layout(
     decoder: &ffmpeg_next::decoder::Audio,
     codec: &ffmpeg_next::codec::audio::Audio,
 ) -> ChannelLayout {
-    codec.channel_layouts()
+    codec
+        .channel_layouts()
         .map(|layouts| layouts.best(decoder.channel_layout().channels()))
         .unwrap_or_else(|| {
             if decoder.channel_layout().bits() != 0 {
