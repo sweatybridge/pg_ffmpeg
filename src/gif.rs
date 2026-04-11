@@ -367,17 +367,17 @@ mod tests {
         );
     }
 
-    #[pg_test]
+    #[pg_test(error = "pg_ffmpeg: fps must be > 0")]
     fn test_generate_gif_rejects_invalid_fps() {
         let data = generate_test_video_bytes(64, 64, 25, 1);
-        let result = std::panic::catch_unwind(|| generate_gif(data, 0.0, 1.0, None, 0, "gif"));
-        assert!(result.is_err(), "fps = 0 should error");
+        let _ = generate_gif(data, 0.0, 1.0, None, 0, "gif");
     }
 
-    #[pg_test]
+    #[pg_test(
+        error = "pg_ffmpeg: unsupported generate_gif format 'mp4', expected 'gif' | 'apng' | 'webp'"
+    )]
     fn test_generate_gif_rejects_unknown_format() {
         let data = generate_test_video_bytes(64, 64, 25, 1);
-        let result = std::panic::catch_unwind(|| generate_gif(data, 0.0, 1.0, None, 10, "mp4"));
-        assert!(result.is_err(), "unknown format should error");
+        let _ = generate_gif(data, 0.0, 1.0, None, 10, "mp4");
     }
 }
