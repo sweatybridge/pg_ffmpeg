@@ -149,7 +149,7 @@ fn generate_gif(
             decoder: &mut decoder,
             graph: &mut graph,
             encoder: &mut encoder,
-            octx: &mut *octx,
+            octx: &mut octx,
             ost_index,
             filter_tb,
             ost_time_base,
