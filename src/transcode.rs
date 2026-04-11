@@ -810,7 +810,7 @@ fn resolve_audio_sample_rate(
     decoder: &ffmpeg_next::decoder::Audio,
     codec: &ffmpeg_next::codec::audio::Audio,
 ) -> u32 {
-    if let Some(mut rates) = codec.rates() {
+    if let Some(rates) = codec.rates() {
         let decoder_rate = decoder.rate();
         let mut fallback = None;
         for rate in rates {
@@ -845,7 +845,7 @@ fn resolve_audio_sample_format(
     decoder: &ffmpeg_next::decoder::Audio,
     codec: &ffmpeg_next::codec::audio::Audio,
 ) -> Sample {
-    if let Some(mut formats) = codec.formats() {
+    if let Some(formats) = codec.formats() {
         let decoder_format = decoder.format();
         let mut fallback = None;
         for format in formats {
