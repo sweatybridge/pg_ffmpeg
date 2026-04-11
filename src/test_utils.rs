@@ -272,6 +272,7 @@ pub fn generate_test_video_with_audio_bytes(
         .expect("failed to create audio encoder");
     audio_encoder.set_rate(sample_rate);
     audio_encoder.set_channel_layout(channel_layout);
+    audio_encoder.set_channels(channel_layout.channels());
     audio_encoder.set_format(sample_format);
     audio_encoder.set_bit_rate(128_000);
     audio_encoder.set_time_base((1, sample_rate));
