@@ -2,7 +2,7 @@
 
 ## Context
 
-pg_ffmpeg is a Rust/pgrx PostgreSQL extension that wraps FFmpeg for in-memory media processing. Today it has 5 functions covering metadata extraction, thumbnails, basic transcoding (with video filters), audio extraction (stream copy only), and HLS segmentation. The goal is to expand this to cover **everything FFmpeg can do** — including hardware-accelerated encoding/decoding — while keeping the SQL API clean and composable.
+pg_ffmpeg is a Rust/pgrx PostgreSQL extension that wraps FFmpeg for in-memory media processing. Today it has 5 functions covering metadata extraction, thumbnails, basic transcoding (with video filters), audio extraction (stream copy only), and HLS segmentation. The goal is to expand this into a comprehensive FFmpeg-in-Postgres surface — including hardware-accelerated encoding/decoding — while keeping the SQL API clean, composable, and safe.
 
 ### Design Philosophy
 
@@ -10,12 +10,30 @@ pg_ffmpeg is a Rust/pgrx PostgreSQL extension that wraps FFmpeg for in-memory me
 - Lean on FFmpeg's filter graph DSL rather than reinventing it
 - Use SQL's `SELECT`/`FROM`/`JOIN`/aggregates for orchestration
 - Multi-input operations use `bytea[]` arrays
-- **Hardware acceleration** (VAAPI, NVENC, QSV, VideoToolbox) whenever available at runtime — transparent fallback to software
+- **Hardware acceleration** (VAAPI, NVENC, QSV, VideoToolbox) transparent fallback to software
+- **Security by default** — reject filters that touch the filesystem or network
 
 ### Decisions
-- **Scope**: All 12 phases — complete implementation
-- **Multi-input approach**: `bytea[]` arrays (simple, composable, all in-memory)
-- **Hardware acceleration**: Runtime detection with automatic fallback
+
+- **Scope**: Full feature set delivered across 3 milestones (Foundation → Core APIs → Advanced/Multi-input)
+- **Multi-input approach**: `bytea[]` arrays (all in-memory)
+- **Hardware acceleration**: Lazy per-backend detection with cache, automatic software fallback
+- **Memory safety**: Hard limits on input/output sizes with explicit `ERROR` responses when exceeded
+
+### Input Size Assumption
+
+**Every function assumes `bytea` inputs are on the order of a few MB — roughly the size of a single HLS segment (2–10 MB).** This shapes the design throughout:
+
+- All processing happens in-memory via `MemInput`/`MemOutput`; no spill to disk
+- Whole-input buffering is acceptable (`Vec<u8>` copies, `bytea[]` arrays held concurrently)
+- No streaming/chunked interfaces — one call processes one segment
+- For full videos, callers pre-segment via `hls()` and process segments in parallel: `SELECT ffmpeg.transcode(data) FROM hls_segments`
+- **Hard limits enforced** (configurable via GUCs, see Task F4):
+  - `pg_ffmpeg.max_input_bytes` — default 64 MB per bytea input, ERROR if exceeded
+  - `pg_ffmpeg.max_output_bytes` — default 256 MB per function call, ERROR if exceeded
+  - `pg_ffmpeg.max_inputs` — default 32 elements in a `bytea[]` array
+  - `pg_ffmpeg.max_aggregate_state_bytes` — default 512 MB for `concat_agg` state
+- Hardware acceleration paths inherit the same assumption — HW upload/download cost per call is amortized over a segment, not a full movie
 
 ---
 
@@ -33,438 +51,662 @@ Supporting infra: `mem_io.rs` (MemInput/MemOutput with AVIO callbacks), HLS tabl
 
 ---
 
-## Workstreams (Parallelizable)
+## Milestone Structure
 
-The implementation is divided into **5 independent workstreams** that can be developed in parallel by separate agents. Dependencies between workstreams are noted where they exist.
+The work is organized into **3 sequential milestones** with hard gates between them. Tasks within a milestone can run in parallel, but no milestone starts until the previous one's gate passes.
+
+```
+Milestone F (Foundation)  →  Milestone 1 (Core APIs)  →  Milestone 2 (Advanced)
+  shared helpers, limits,       enhanced transcode,        generate_gif, waveform,
+  HW detection, filter          enhanced extract_audio,    extract_subtitles, overlay,
+  allow-list, test utils,       trim, extract_frames,      filter_complex,
+  CI gates                      enhanced media_info        concat, encode
+```
+
+**Why this order** (per review feedback): the original "5 parallel workstreams" claim was optimistic. The shared `Transcoder` struct, filter graph helpers, HW detection, and memory-limit enforcement are cross-cutting dependencies. Building them once in a foundation milestone prevents duplicated work and API drift.
 
 ---
 
-### Workstream A: Enhanced Transcoding & Hardware Acceleration
+## Rollout Strategy
 
-**Files to modify**: `src/transcode.rs`, `src/lib.rs`
-**New files**: `src/hwaccel.rs`
-**Dependencies**: None (extends existing code)
+**Per review feedback**: shipping all 3 milestones as a single big-bang release creates a long window where nothing is in users' hands. The plan ships in staged releases so Milestone 2 scope can slip without blocking Milestone 1 value.
 
-#### Task A1: Hardware acceleration runtime detection (`src/hwaccel.rs`)
+| Release | Contents | Stability | Feature flags |
+|---------|----------|-----------|---------------|
+| **v0.2.0** | Milestone F + Milestone 1 | Stable | None — all M1 functions are always-on |
+| **v0.3.0-beta** | v0.2.0 + Milestone 2 behind `advanced_ops` feature flag | Beta | `advanced_ops` (compile-time Cargo feature) |
+| **v0.3.0** | v0.2.0 + Milestone 2 promoted to always-on | Stable | None |
 
-Create a shared module for hardware acceleration:
-- Probe available HW device types at init time using `av_hwdevice_iterate_types()`
-- Provide a `find_hw_encoder(codec_name)` function that tries HW encoders first (e.g., `h264_nvenc`, `h264_vaapi`, `h264_qsv`) then falls back to software
-- Provide a `find_hw_decoder(codec_id)` function with same fallback logic
-- Manage `AVHWDeviceContext` creation and lifetime
-- Handle HW frame ↔ SW frame transfers (`av_hwframe_transfer_data`)
-- Expose a `hw_pix_fmt_callback` for decoder HW format negotiation
-- Key FFmpeg APIs: `av_hwdevice_ctx_create`, `av_hwdevice_iterate_types`, `av_hwframe_transfer_data`, `avcodec_get_hw_config`
+**Rules**:
 
-#### Task A2: Enhance `transcode` signature and codec selection (`src/transcode.rs`)
+- **v0.2.0 is the first hard ship target.** If M2 estimates slip, v0.2.0 still ships on schedule with the M1 feature set. This avoids the failure mode where users wait months for any improvement because M2 is "almost done."
+- **`advanced_ops` Cargo feature** gates all Milestone 2 modules (`gif.rs`, `waveform.rs`, `subtitles.rs`, `overlay.rs`, `filter_complex.rs`, `concat.rs`, `encode.rs`). Their `#[pg_extern]` functions are wrapped in `#[cfg(feature = "advanced_ops")]` so the SQL surface is clean in builds without the flag.
+- **The default Cargo build does NOT enable `advanced_ops` until v0.3.0 stable.** During the v0.3.0-beta window, adventurous users opt in with `cargo pgrx install --features advanced_ops`; distro packages ship without it.
+- **v0.3.0-beta → v0.3.0 promotion criteria**: (a) all M2 functions have ≥ 2 weeks in beta without a P0 bug report, (b) `filter_complex` has had a dedicated security review, (c) memory-limit GUCs from F4 have been validated against M2 workloads with > 1 week of production telemetry from at least one deployment.
+- **Foundation modules (F1–F7) are ALWAYS compiled**, even in v0.2.0 — they are dependencies of M1 and cannot be feature-gated.
+- **GUCs introduced in F4 are registered unconditionally** in both v0.2.0 and v0.3.0 so that configuration carries forward without rename.
+- **Per-function gating inside M2 is not supported.** If any M2 function is unstable, the whole `advanced_ops` feature stays in beta. This keeps the mental model simple: one flag, one promotion decision.
 
-Extend the existing function signature:
+**If milestone gates slip**:
+
+- M1 slip → push v0.2.0 date, do not start M2.
+- M2 slip → ship v0.2.0 on schedule; v0.3.0-beta date floats; v0.3.0 stable requires the criteria above regardless of calendar.
+- A single M2 task is blocked → remove it from v0.3.0 scope and document in `CHANGELOG.md`. Do not hold v0.3.0 for a single function.
+
+---
+
+## Milestone F: Foundation
+
+**Gate to advance**: All foundation modules compile, unit tests pass, CI green on PG 16/17/18.
+**Parallelism**: All F tasks can run in parallel.
+
+### Task F1: Shared transcoder/filter helpers (`src/pipeline.rs`)
+
+Extract reusable building blocks from `src/transcode.rs` into a new module:
+
+- `VideoPipeline` — generalized decode→filter→encode for a **single video stream**. Takes input stream, optional filter spec, encoder codec (name or ID), encoder options (CRF/preset/bitrate), and output context.
+- `AudioPipeline` — same pattern for audio (uses `abuffer`/`abuffersink` sinks, handles `channel_layout`, `sample_fmt`, `sample_rate`).
+- `build_video_filter_graph(spec, decoder_params)` — helper that assembles `buffer → spec → buffersink`, returns the graph plus resolved output (w, h, pix_fmt, time_base).
+- `build_audio_filter_graph(spec, decoder_params)` — same for audio.
+- `copy_stream(ictx, octx, index)` — helper for stream-copy path.
+
+Current `Transcoder` in `src/transcode.rs` becomes a thin wrapper around `VideoPipeline`. This is a pure refactor — no behavior change.
+
+### Task F1b: Multi-input pipeline plumbing (`src/pipeline.rs`)
+
+**Separated from F1 per review feedback.** `overlay`, `filter_complex`, and `encode` (image sequence) all need to feed **multiple input streams into a single filter graph**. The single-stream `VideoPipeline`/`AudioPipeline` APIs from F1 do not cover this.
+
+Add to `src/pipeline.rs`:
+
+- `MultiInputGraph` — struct that owns:
+  - A `filter::Graph`
+  - A `Vec<(source_label, BufferSourceRef)>` — one buffer/abuffer source per user input stream
+  - A `Vec<(sink_label, BufferSinkRef)>` — one buffersink/abuffersink per output pad
+- `MultiInputGraph::builder()` — fluent API:
+  - `.add_video_input(label, width, height, pix_fmt, time_base, sample_aspect_ratio)`
+  - `.add_audio_input(label, sample_rate, sample_fmt, channel_layout, time_base)`
+  - `.add_video_output(label)` → adds `buffersink`
+  - `.add_audio_output(label)` → adds `abuffersink`
+  - `.parse(filter_spec)` → calls `avfilter_graph_parse_ptr` wiring pre-declared sources/sinks to the spec's pads
+  - `.build()` → validates and returns `MultiInputGraph`
+- `MultiInputGraph::push_video_frame(input_index, frame)` / `push_audio_frame(...)` — feed a decoded frame into the N-th source
+- `MultiInputGraph::try_recv_video(output_index)` / `try_recv_audio(...)` — pull a filtered frame from the N-th sink
+- `MultiInputGraph::flush(input_index)` — signal EOF on one source (overlay handles uneven input lengths this way)
+
+This is a focused primitive — it does NOT own decoders or encoders. Callers (`overlay`, `filter_complex`) own their decoders and encoders and use `MultiInputGraph` just for the graph wiring.
+
+`overlay` (Task 2D), `filter_complex` (Task 2E), and `encode` (Task 2G, for image sequences) depend on this.
+
+### Task F2: Lazy hardware acceleration module (`src/hwaccel.rs`)
+
+Per review feedback, **probe HW lazily per backend** (Postgres forks processes; init-time probing is wrong):
+
+- `fn codec_family(codec_name: &str) -> Option<&'static str>` — normalizes SW codec names to HW family keys:
+  - `libx264` → `h264`
+  - `libx265` → `hevc`
+  - `libaom-av1`, `libsvtav1` → `av1`
+  - `libvpx-vp9` → `vp9`
+  - `libmp3lame` → `mp3` (audio; no HW but used for consistent lookup)
+  - Bare codec names (`h264`, `hevc`, ...) map to themselves
+  - Returns `None` for unknown codecs (HW path skipped)
+- `fn hw_encoder(codec_name: &str) -> Option<&'static ffmpeg::Codec>` — returns a HW encoder variant if available, else `None`. Flow:
+  1. Look up `family = codec_family(codec_name)` (e.g. `libx264` → `h264`)
+  2. Try encoder names in order: `{family}_nvenc`, `{family}_vaapi`, `{family}_qsv`, `{family}_videotoolbox`
+  3. First successful `avcodec_find_encoder_by_name` wins
+- `fn hw_decoder(codec_id: CodecId) -> Option<&'static ffmpeg::Codec>` — same pattern, keyed on codec ID since decoders are found from input stream.
+- `fn hw_device_for(codec: &Codec) -> Option<HwDeviceRef>` — returns a device context, creating it on first use per backend.
+- `thread_local! { static HW_CACHE: RefCell<HwCache> }` — per-backend cache. Each Postgres worker maintains its own cache; no cross-process state.
+- `HwCache` stores: `probed: bool`, `available_types: Vec<AvHwDeviceType>`, `device_contexts: HashMap<AvHwDeviceType, AvBufferRef>`.
+- Device contexts are created via `av_hwdevice_ctx_create` on first request and freed when the backend exits (via `ProcessExitShmemExit` or `atexit`).
+- **Fallback semantics**: if HW encoder open fails (device busy, driver mismatch, unsupported profile), log `WARNING` and fall back to software encoder. Never hard-error on HW unavailability.
+- **Capability matrix** (documented in module header comment):
+
+  | Codec | HW encoder names tried | SW fallback |
+  |-------|------------------------|-------------|
+  | h264  | `h264_nvenc`, `h264_vaapi`, `h264_qsv`, `h264_videotoolbox` | `libx264` |
+  | hevc  | `hevc_nvenc`, `hevc_vaapi`, `hevc_qsv`, `hevc_videotoolbox` | `libx265` |
+  | av1   | `av1_nvenc`, `av1_vaapi`, `av1_qsv` | `libaom-av1`, `libsvtav1` |
+  | vp9   | `vp9_vaapi`, `vp9_qsv` | `libvpx-vp9` |
+
+### Task F3: Safe filter validation (`src/filter_safety.rs`)
+
+Per review feedback, arbitrary filter graph strings are a security risk. FFmpeg filters like `movie`, `amovie`, `lavfi/concat` (with file path), and `sendcmd` can read files or open URLs. This module enforces an allow-list.
+
+**Parser strategy — mandatory**: validation MUST use FFmpeg's own graph parser (`avfilter_graph_parse2` / `avfilter_graph_parse_ptr`) followed by walking the resulting `AVFilterGraph`'s `filters` array and checking each `filter->filter->name` against the allow-list. **Regex/string splitting is explicitly forbidden** — filter specs contain nested expressions, escaped characters, and option strings that cannot be reliably tokenized by hand, and a regex-based check has already been the source of security bugs in similar projects.
+
+- `fn validate_filter_spec(spec: &str) -> Result<(), FilterError>` — parses the filter spec via `avfilter_graph_parse2`, walks the resulting node list, checks each filter name + options against the allow-list, then frees the graph. Returns `Err` on any deny-list hit or parse failure.
+- **Allow-list**: common safe filters — `scale`, `crop`, `pad`, `rotate`, `hflip`, `vflip`, `transpose`, `setpts`, `fps`, `format`, `null`, `copy`, `overlay`, `drawtext` (with restrictions on `textfile=`), `hstack`, `vstack`, `palettegen`, `paletteuse`, `showwavespic`, `showspectrumpic`, `volume`, `atempo`, `aresample`, `amerge`, `amix`, `anull`, `afade`, `equalizer`, `loudnorm`, `split`, `asplit`, `trim`, `atrim`, `concat` (with `n=` only, no file mode).
+- **Denylist (rejected outright)**: `movie`, `amovie`, `sendcmd`, `zmq`, `azmq`, any filter matching `*_lavfi` with file paths.
+- **`drawtext` restrictions**: `text=` literal is always allowed. `textfile=` and `fontfile=` options are governed by the `pg_ffmpeg.drawtext_font_dir` GUC:
+  - **Empty** (default): `textfile=` / `fontfile=` options cause `drawtext` to be rejected entirely. Any user relying on them must explicitly configure the font directory.
+  - **Non-empty**: the referenced path is:
+    1. Resolved to an absolute path via `std::fs::canonicalize` (this follows symlinks to their real target)
+    2. Compared against the canonicalized `drawtext_font_dir`
+    3. Rejected unless the resolved path is strictly inside the directory (prefix match with trailing path separator)
+  - Symlink traversal OUT of the directory is blocked by step 1 (canonicalization dereferences the symlink before the prefix check). A symlink pointing to `/etc/passwd` would canonicalize to `/etc/passwd`, which fails the prefix check.
+  - Non-existent files ERROR immediately with a clear message — we never let FFmpeg silently fail-open.
+- GUC `pg_ffmpeg.unsafe_filters = false` (default) — when set to `true` by a superuser, bypasses the allow-list. Used for testing/advanced ops only.
+- **Only called on user-supplied filter strings.** Specifically:
+  - `transcode(filter, audio_filter)` — both user-supplied → validated
+  - `extract_audio(filter)` — user-supplied → validated
+  - `filter_complex(filter_graph)` — user-supplied → validated
+  - `generate_gif`, `waveform`, `overlay` — filter spec is **built-in and hardcoded** from function parameters (fps, width, x, y, etc.); NOT passed through the validator because no user filter string exists. The parameter values are numeric/bounded, not filter DSL.
+
+### Task F4: Memory limit GUCs and enforcement (`src/limits.rs`)
+
+- Register GUCs via pgrx `GucRegistry`:
+  - `pg_ffmpeg.max_input_bytes` (int, default `64 * 1024 * 1024`)
+  - `pg_ffmpeg.max_output_bytes` (int, default `256 * 1024 * 1024`)
+  - `pg_ffmpeg.max_inputs` (int, default `32`)
+  - `pg_ffmpeg.max_aggregate_state_bytes` (int, default `512 * 1024 * 1024`)
+  - `pg_ffmpeg.unsafe_filters` (bool, default `false`)
+  - `pg_ffmpeg.drawtext_font_dir` (text, default empty)
+- `fn check_input_size(len: usize) -> Result<(), LimitError>` — called at the top of every function before `MemInput::open`.
+- `fn check_output_size(len: usize) -> Result<(), LimitError>` — hooked into `MemOutput::write_cb` so the AVIO callback aborts when exceeded.
+- `fn check_array_size(n: usize) -> Result<(), LimitError>` — for `bytea[]` parameters. Consistent `Result` return with the other checks so all three compose into the same error-plumbing pattern at call sites.
+- `fn check_aggregate_state(current: usize, adding: usize) -> Result<(), LimitError>` — used by `concat_agg`.
+- Exceeding a limit raises `ERROR` with a clear message: `"pg_ffmpeg: input size 128 MB exceeds pg_ffmpeg.max_input_bytes (64 MB)"`.
+
+### Task F5: CI gates for HW-dependent tests
+
+- Add `#[cfg(feature = "hwaccel_tests")]` gate for any test that actually requires a GPU.
+- Default `cargo pgrx test` runs do NOT exercise HW encoders (only the fallback path).
+- Add a separate CI job `test-hwaccel` that runs only on a self-hosted GPU runner (future — gate optional).
+- Document in `README.md` how to run the HW test suite locally.
+
+### Task F6: Shared test utilities (`src/test_utils.rs`)
+
+- Move `generate_test_video_bytes()` from `src/transcode.rs` tests.
+- Add `generate_test_video_with_audio_bytes()` — MPEG-TS with both video and AAC audio stream (needed for Tasks 1B, 2E tests).
+- Add `generate_test_image_bytes(format, width, height)` — PNG/JPEG generation.
+- Gated behind `#[cfg(any(test, feature = "pg_test"))]`.
+
+### Task F7: Codec/format availability error contract (`src/codec_lookup.rs`)
+
+**Per review feedback**: every function that selects a codec or container must produce the same error format when the requested name is unavailable in the linked FFmpeg build. Without a shared helper, each function invents its own message, and users can't tell "typo" from "not compiled in" from "wrong type."
+
+All codec and container lookups MUST go through this module. Direct calls to `codec::encoder::find_by_name` / `format::output::find` are forbidden outside of `codec_lookup.rs` (enforced by a clippy deny-list in X4).
+
+**API**:
+
+- `fn find_encoder(name: &str, kind: CodecKind) -> Result<&'static ffmpeg::Codec, CodecError>`
+  - `CodecKind` is `Video` | `Audio` | `Subtitle`. Used for the error message and to reject a subtitle codec name passed to a video parameter.
+- `fn find_decoder(id: ffmpeg::codec::Id) -> Result<&'static ffmpeg::Codec, CodecError>`
+- `fn find_muxer(name: &str) -> Result<&'static ffmpeg::format::Output, CodecError>`
+- `fn find_demuxer_probe(buf: &[u8]) -> Result<&'static ffmpeg::format::Input, CodecError>`
+
+**Error contract** — exact message format (users grep on these):
+
+| Condition | SQLSTATE | Message template |
+|-----------|----------|------------------|
+| Encoder name not found | `feature_not_supported` (0A000) | `pg_ffmpeg: {kind} encoder '{name}' is not available in this FFmpeg build` |
+| Decoder for codec id not found | `feature_not_supported` (0A000) | `pg_ffmpeg: decoder for codec '{codec_name}' (id {id}) is not available in this FFmpeg build` |
+| Muxer/container name not found | `feature_not_supported` (0A000) | `pg_ffmpeg: container format '{name}' is not available in this FFmpeg build` |
+| Demuxer probe failed | `invalid_parameter_value` (22023) | `pg_ffmpeg: could not detect input container format` |
+| Encoder exists but wrong kind | `invalid_parameter_value` (22023) | `pg_ffmpeg: '{name}' is a {actual_kind} encoder, expected {expected_kind}` |
+| Encoder open failed (codec options invalid) | `invalid_parameter_value` (22023) | `pg_ffmpeg: failed to open {kind} encoder '{name}': {ffmpeg_error}` |
+
+Rules every caller follows:
+- Always translate via the helper and propagate `CodecError` — never craft a custom message at the call site.
+- HW-encoder fallback (Task F2) uses `find_encoder` for both the HW and SW lookups; when HW fails open, the `WARNING` message is the HW-specific one, then the SW error (if any) comes from this helper unchanged.
+- `CodecError::from_ffmpeg(err, context)` attaches the FFmpeg numeric error (`AVERROR`) and the `av_strerror` string so users can correlate with FFmpeg documentation.
+
+**Functions that MUST use this helper** (complete list — reviewed at every milestone gate): `transcode`, `extract_audio`, `trim` (precise), `generate_gif`, `waveform`, `extract_subtitles`, `overlay`, `filter_complex`, `concat`, `encode`, `thumbnail`, `extract_frames`, `media_info`.
+
+Tests:
+- `test_find_encoder_unknown_name` — verify exact error message
+- `test_find_encoder_wrong_kind` — `libmp3lame` requested as video encoder
+- `test_find_muxer_unknown` — `format => 'not_a_real_format'` produces the contract message
+- `test_codec_error_sqlstate` — SQL-level test that catches `SQLSTATE '0A000'` for an unknown codec
+
+**Milestone F Deliverables**: 10 files touched, zero user-facing API changes, all existing tests still pass.
+
+| File | Action |
+|------|--------|
+| `src/pipeline.rs` | **New** (F1) |
+| `src/hwaccel.rs` | **New** (F2) |
+| `src/filter_safety.rs` | **New** (F3) |
+| `src/limits.rs` | **New** (F4) |
+| `src/test_utils.rs` | **New** (F6) |
+| `src/codec_lookup.rs` | **New** (F7) |
+| `src/transcode.rs` | Modify — refactor `Transcoder` onto `VideoPipeline` (F1), route codec lookups through F7 |
+| `src/mem_io.rs` | Modify — hook `write_cb` to call `check_output_size()` (F4) |
+| `src/lib.rs` | Modify — declare new modules, register GUCs |
+| `.github/workflows/test.yml` | Modify — add `hwaccel_tests` feature flag handling (F5) |
+
+---
+
+## Milestone 1: Core APIs
+
+**Gate to advance**: All Milestone 1 functions have passing tests + benchmarks, README documents them, CI green.
+**Parallelism**: Tasks 1A–1E can run in parallel (they depend only on Foundation, not on each other).
+
+### Task 1A: Enhanced `transcode` (`src/transcode.rs`)
+
+New signature (backward-compatible — all new params default NULL):
 
 ```sql
 transcode(
-    data         bytea,
-    format       text     DEFAULT NULL,   -- output container (e.g. 'matroska', 'mp4')
-    filter       text     DEFAULT NULL,   -- video filter graph (e.g. 'scale=-1:720')
-    codec        text     DEFAULT NULL,   -- video codec name (e.g. 'libx264', 'libx265')
-    preset       text     DEFAULT NULL,   -- encoder preset (e.g. 'fast', 'slow')
-    crf          int      DEFAULT NULL,   -- constant rate factor (0-51 for x264)
-    audio_codec  text     DEFAULT NULL,   -- audio codec (e.g. 'aac', 'libopus')
-    audio_filter text     DEFAULT NULL,   -- audio filter graph (e.g. 'volume=0.5')
-    audio_bitrate int     DEFAULT NULL,   -- audio bitrate in bits/sec
-    hwaccel      bool     DEFAULT true    -- attempt hardware acceleration
+    data          bytea,
+    format        text     DEFAULT NULL,
+    filter        text     DEFAULT NULL,
+    codec         text     DEFAULT NULL,   -- 'libx264', 'libx265', 'libvpx-vp9', ...
+    preset        text     DEFAULT NULL,
+    crf           int      DEFAULT NULL,
+    bitrate       int      DEFAULT NULL,   -- video bitrate in bits/sec
+    audio_codec   text     DEFAULT NULL,
+    audio_filter  text     DEFAULT NULL,
+    audio_bitrate int      DEFAULT NULL,
+    hwaccel       bool     DEFAULT false   -- opt-in; see below
 ) → bytea
 ```
 
-Implementation:
-- When `codec` is provided, look up encoder by name via `codec::encoder::find_by_name()` instead of matching input codec ID. If `hwaccel` is true, try HW variant first via `hwaccel::find_hw_encoder()`.
-- When `preset`/`crf` provided, set via `av_opt_set` on the encoder's private data (`(*enc_ptr).priv_data`)
-- Build a parallel `AudioTranscoder` struct (mirroring the video `Transcoder`) when `audio_codec` or `audio_filter` is specified
-- Audio filter graph: `abuffer → user_spec → abuffersink` (mirrors video pattern but with audio parameters: sample_rate, sample_fmt, channel_layout)
-- When only `audio_filter` is provided without `audio_codec`, re-encode with same audio codec after filtering
-- Zero-copy remux path remains when no filter/codec/audio params given
-- Register module in `src/lib.rs`: `mod hwaccel;` (make it `pub(crate)`)
+Implementation uses `VideoPipeline` + `AudioPipeline` from Task F1. Codec lookup via `codec::encoder::find_by_name()` when `codec` is provided. `filter`/`audio_filter` validated via `validate_filter_spec()` (F3).
 
-#### Task A3: Tests for enhanced transcode
+**HW acceleration policy**:
+- Default `hwaccel = false` (opt-in). Review feedback: HW paths have surprising format-compatibility failures; safer to make it explicit.
+- When `hwaccel = true`: try HW encoder; on open failure, log `WARNING "pg_ffmpeg: HW encoder {name} unavailable, falling back to software"` and use software encoder.
+- HW+filter interaction: if filter produces SW frames but encoder expects HW frames, insert an `hwupload` filter automatically. Document this in module comment.
 
-Add to `src/transcode.rs` test module:
-- `test_transcode_with_codec_selection` — transcode MPEG2 to a different codec, verify via `media_info`
-- `test_transcode_with_crf` — verify CRF parameter is accepted
-- `test_transcode_audio_filter` — apply volume filter, verify output has audio
-- `test_transcode_audio_codec` — re-encode audio to different codec
-- `test_transcode_hwaccel_fallback` — verify hwaccel=true doesn't error when no HW available (graceful fallback)
+**Zero-copy remux path** (no filter/codec/audio params) is preserved unchanged.
 
----
+Tests:
+- `test_transcode_with_codec_selection` — MPEG2 → h264 via `libx264`
+- `test_transcode_with_crf_and_preset`
+- `test_transcode_audio_filter_volume`
+- `test_transcode_audio_codec_change`
+- `test_transcode_hwaccel_fallback` — `hwaccel=true` on a system without HW; verify software fallback + `WARNING` in logs
+- `test_transcode_rejects_unsafe_filter` — `filter => 'movie=/etc/passwd'` must ERROR
 
-### Workstream B: Trim, Extract Audio Enhancement, and Subtitles
-
-**Files to modify**: `src/extract_audio.rs`, `src/lib.rs`
-**New files**: `src/trim.rs`, `src/subtitles.rs`
-**Dependencies**: None
-
-#### Task B1: `trim` function (`src/trim.rs`)
-
-```sql
-trim(
-    data         bytea,
-    start_time   float8 DEFAULT 0.0,   -- seconds
-    end_time     float8 DEFAULT NULL,  -- NULL = to end
-    precise      bool   DEFAULT false  -- true = decode for frame-accurate cut
-) → bytea
-```
-
-Implementation:
-- Open MemInput, create MemOutput matching input format
-- Convert `start_time`/`end_time` to AV_TIME_BASE units
-- When `precise = false`:
-  - Call `ictx.seek(start_timestamp, ..)` to seek to nearest keyframe
-  - Copy all stream metadata/parameters to output
-  - Iterate packets, skip those before `start_time`, stop after `end_time`
-  - Rescale all timestamps to start from 0 (subtract start offset)
-- When `precise = true`:
-  - Seek to keyframe before `start_time`
-  - Decode→re-encode video frames at boundaries (first/last GOPs)
-  - Stream-copy packets in the middle range
-  - Audio: always stream-copy (frame-accurate audio cuts are rarely needed)
-- Register module in `src/lib.rs`
-
-#### Task B2: Enhance `extract_audio` (`src/extract_audio.rs`)
+### Task 1B: Enhanced `extract_audio` (`src/extract_audio.rs`)
 
 ```sql
 extract_audio(
-    data         bytea,
-    format       text DEFAULT 'mp3',
-    codec        text DEFAULT NULL,    -- audio codec name (e.g. 'libmp3lame', 'aac')
-    bitrate      int  DEFAULT NULL,    -- bits/sec
-    sample_rate  int  DEFAULT NULL,    -- e.g. 44100
-    channels     int  DEFAULT NULL,    -- e.g. 1 for mono
-    filter       text DEFAULT NULL     -- audio filter graph (e.g. 'volume=0.5,atempo=1.5')
+    data        bytea,
+    format      text DEFAULT 'mp3',
+    codec       text DEFAULT NULL,
+    bitrate     int  DEFAULT NULL,
+    sample_rate int  DEFAULT NULL,
+    channels    int  DEFAULT NULL,
+    filter      text DEFAULT NULL
 ) → bytea
 ```
 
-Implementation:
-- When all new params are NULL, keep existing stream-copy path (backward compatible)
-- When any param is set, switch to decode→filter→encode:
-  - Open audio decoder from input stream parameters
-  - Build audio filter graph if `filter` provided (`abuffer → spec → abuffersink`)
-  - Open encoder by name (or match input codec if `codec` is NULL)
-  - Set bitrate/sample_rate/channels on encoder if provided
-  - Decode frames → push through filter → encode → write packets
+- When all new params NULL → existing stream-copy path (backward compatible)
+- Otherwise → `AudioPipeline` (F1) with codec lookup, filter validation (F3)
+- Tests: `test_extract_audio_with_codec`, `test_extract_audio_with_filter`, `test_extract_audio_rejects_unsafe_filter`
 
-#### Task B3: `extract_subtitles` function (`src/subtitles.rs`)
+### Task 1C: `trim` function (`src/trim.rs`)
+
+**Revised per review feedback**: the hybrid precise-mode design had A/V sync risks. Replaced with two clean modes:
 
 ```sql
-extract_subtitles(
-    data         bytea,
-    format       text DEFAULT 'srt',   -- 'srt', 'ass', 'webvtt'
-    stream_index int  DEFAULT NULL     -- NULL = best subtitle stream
-) → text
+trim(
+    data       bytea,
+    start_time float8 DEFAULT 0.0,
+    end_time   float8 DEFAULT NULL,
+    precise    bool   DEFAULT false
+) → bytea
 ```
 
-Implementation:
-- Open MemInput, find subtitle stream (by index or best match)
-- Create MemOutput with requested subtitle format
-- Copy subtitle packets to output (stream copy — subtitle formats are text-based)
-- Return `String` (maps to SQL `text`) via `String::from_utf8` on output bytes
-- Register module in `src/lib.rs`
+- **`precise = false`** (fast, keyframe-aligned):
+  - Seek to nearest keyframe ≤ `start_time`
+  - Stream-copy packets until `end_time`
+  - Rescale all timestamps to start at 0 (apply same offset to all streams for A/V sync)
+  - Audio streams: trim at packet boundaries (audio packets are short; near-frame accuracy)
+  - Output may start slightly before requested `start_time` — documented behavior
+- **`precise = true`** (frame-accurate, full re-encode):
+  - **Video and audio streams** are decoded and re-encoded using `VideoPipeline` + `AudioPipeline` (F1). Same codec as input; no codec change.
+  - Video filter graph: `trim=start={start}:end={end},setpts=PTS-STARTPTS`
+  - Audio filter graph: `atrim=start={start}:end={end},asetpts=PTS-STARTPTS`
+  - **Subtitle and data streams are dropped** in v1. This is a deliberate scope reduction: cue-level subtitle trimming requires per-codec handling (text vs. image) and is out of scope for the initial trim implementation. Callers who need subtitles preserved across a precise trim should use the fast mode (`precise=false`), which stream-copies all subtitle tracks with timestamp rewriting.
+  - A `WARNING` is logged once if subtitles/data streams are present and dropped: `"pg_ffmpeg: trim(precise=true) dropped N subtitle/data stream(s); use precise=false to preserve them"`.
+  - Slower and larger output than fast mode but A/V sync is guaranteed
+  - Future v2: bring subtitle handling into precise mode (tracked as out-of-scope in the plan's exclusions).
+- Tests: `test_trim_fast_keyframe`, `test_trim_precise_reencode`, `test_trim_to_end`, `test_trim_av_sync_precise` (verify audio/video durations match within 1 frame)
 
-#### Task B4: Tests
+### Task 1D: `extract_frames` set-returning function (`src/extract_frames.rs`)
 
-- `src/trim.rs`: `test_trim_basic` (trim 1s video to 0.5s range), `test_trim_precise`, `test_trim_to_end`
-- `src/extract_audio.rs`: `test_extract_audio_with_codec`, `test_extract_audio_with_filter`
-- `src/subtitles.rs`: `test_extract_subtitles_srt` (requires test video with subtitle track)
-
----
-
-### Workstream C: Frame Extraction and GIF Generation
-
-**Files to modify**: `src/lib.rs`
-**New files**: `src/extract_frames.rs`, `src/gif.rs`
-**Dependencies**: None
-
-#### Task C1: `extract_frames` set-returning function (`src/extract_frames.rs`)
+**Revised per review feedback**: original design buffered all frames and did repeated seeks. New design uses a lazy iterator state machine.
 
 ```sql
 extract_frames(
     data           bytea,
-    interval       float8 DEFAULT 1.0,   -- seconds between frames
+    interval       float8 DEFAULT 1.0,
     format         text   DEFAULT 'png',
-    keyframes_only bool   DEFAULT false
+    keyframes_only bool   DEFAULT false,
+    max_frames     int    DEFAULT 1000
 ) → TABLE(timestamp float8, frame bytea)
 ```
 
-Implementation:
-- Use pgrx `TableIterator<'static, (name!(timestamp, f64), name!(frame, Vec<u8>))>` return type
-- Open MemInput, find best video stream
-- Collect frames into a Vec of (timestamp, encoded_frame) tuples:
-  - When `keyframes_only`: check `packet.is_key()`, only decode those
-  - When `interval` set: seek to each `N * interval` timestamp, decode one frame
-  - Encode each decoded frame using `thumbnail.rs` pattern (RGB24 conversion → PNG/JPEG encoder)
-- Return `TableIterator::new(frames)`
-- Register module in `src/lib.rs`
+- Use pgrx `TableIterator<'static, (name!(timestamp, f64), name!(frame, Vec<u8>))>`
+- **Note**: pgrx `TableIterator` materializes the iterator before returning. So we still buffer in memory — but we bound it.
+- `max_frames` parameter caps the output; default 1000 is well within memory for HLS-segment-sized inputs
+- **Semantics**: exactly up to `max_frames` rows may be emitted. If the input would yield a `(max_frames + 1)`-th frame, the function raises `ERROR "pg_ffmpeg: extract_frames would emit more than max_frames ({max_frames}) rows; increase max_frames or use a larger interval"`. Truncation is never silent.
 
-#### Task C2: `generate_gif` function (`src/gif.rs`)
+**Parameter semantics (hard rules)**:
+- `interval <= 0.0` → `ERROR "pg_ffmpeg: interval must be > 0"`. No implicit "every frame" mode; callers wanting every frame should use `interval => 1.0 / fps`.
+- `max_frames <= 0` → `ERROR "pg_ffmpeg: max_frames must be > 0"`.
+- `format` must be `png` | `jpeg` | `jpg` (same set as `thumbnail`); any other value ERRORs.
+
+**Timestamp origin**:
+- Emitted `timestamp` values are in **seconds from the start of the input stream**, converted from the video stream's PTS via `pts * stream.time_base`. They are NOT wall-clock times and NOT relative to the first decoded frame.
+- First frame's timestamp may not be exactly 0.0 if the stream has a non-zero start offset — documented in the README.
+
+**Interaction between `keyframes_only` and `interval`**:
+- `keyframes_only = true` → `interval` parameter is **ignored**; a log `WARNING` is emitted once per call if `interval` was also explicitly set to a non-default value. Emit one row per keyframe in decode order.
+- `keyframes_only = false` → emit frames whose timestamp crosses the next `N * interval` threshold (walking N from 0). This snaps to the decoded frame nearest but not before each threshold — not a re-sampled frame rate.
+
+**Decoding strategy**:
+- Single forward pass through all packets (no seeks)
+- `keyframes_only = true`: check `packet.is_key()` before decode, skip non-keyframes
+- `keyframes_only = false`: decode every frame, track last-emitted timestamp, emit when `(frame.pts_sec - last_emit) >= interval`
+- Stop scanning when attempting to emit the `(max_frames + 1)`-th row → ERROR (do not silently truncate). Exactly `max_frames` rows are the legal maximum.
+- Frame encoding via helper extracted from `src/thumbnail.rs`
+
+Tests: `test_extract_frames_keyframes_only`, `test_extract_frames_interval`, `test_extract_frames_max_frames_limit`, `test_extract_frames_invalid_interval_errors`, `test_extract_frames_keyframes_only_ignores_interval`
+
+### Task 1E: Enhanced `media_info` (`src/media_info.rs`)
+
+Add to JSONB output:
+- `chapters`: array of `{id, start, end, title}` from `ictx.chapters()`
+- `tags`: format-level metadata dict from `ictx.metadata()`
+- Per-stream:
+  - `bit_rate` (from params or codec context)
+  - `disposition` (default/forced/hearing_impaired/...)
+  - `tags` (per-stream metadata)
+  - `language` (from stream tag)
+  - For subtitle streams: include `codec_type` = 'text' or 'image' (see Task 2E)
+- Tests: `test_media_info_tags`, `test_media_info_chapters_present`
+
+**Milestone 1 Deliverables**: 5 enhanced/new functions, full test coverage, benchmarks for 1A/1C, README updated.
+
+---
+
+## Milestone 2: Advanced & Multi-Input
+
+**Gate to advance**: All Milestone 2 functions tested, security review of `filter_complex` complete, CI green.
+**Parallelism**: Tasks 2A–2G can run in parallel after Milestone 1.
+
+### Task 2A: `generate_gif` (`src/gif.rs`)
 
 ```sql
 generate_gif(
-    data         bytea,
-    start_time   float8 DEFAULT 0.0,
-    duration     float8 DEFAULT 5.0,
-    width        int    DEFAULT NULL,   -- NULL = original
-    fps          int    DEFAULT 10,
-    format       text   DEFAULT 'gif'   -- also 'apng', 'webp'
+    data       bytea,
+    start_time float8 DEFAULT 0.0,
+    duration   float8 DEFAULT 5.0,
+    width      int    DEFAULT NULL,
+    fps        int    DEFAULT 10,
+    format     text   DEFAULT 'gif'   -- 'gif', 'apng', 'webp'
 ) → bytea
 ```
 
-Implementation:
-- Open MemInput, seek to `start_time`
-- Build filter graph for high-quality GIF:
-  - `fps=<fps>,scale=<width>:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`
-  - For apng/webp: simpler filter — just `fps=<fps>,scale=<width>:-1`
-- Decode video frames until `start_time + duration`
-- Push through filter graph
-- Encode to GIF/APNG/WebP muxer via MemOutput
-- For GIF: use `codec::Id::GIF` encoder, format `"gif"`
-- For APNG: use `codec::Id::APNG`, format `"apng"`
-- Register module in `src/lib.rs`
+- Built-in filter spec (not user-provided, so no allow-list check needed): for GIF, `fps={fps},scale={width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`
+- For APNG/WebP: just `fps={fps},scale={width}:-1`
+- Uses `VideoPipeline` from F1 with custom encoder (`codec::Id::GIF`, `APNG`, `WEBP`)
+- Tests: `test_generate_gif` (verify `GIF89a` magic bytes), `test_generate_apng`
 
-#### Task C3: Tests
-
-- `src/extract_frames.rs`: `test_extract_frames_interval` (1s video, 0.5s interval → expect ~2 frames), `test_extract_frames_keyframes_only`
-- `src/gif.rs`: `test_generate_gif` (verify non-empty output, verify it's valid GIF by checking magic bytes `GIF89a`)
-
----
-
-### Workstream D: Multi-Input Operations (Overlay, Filter Complex, Concat)
-
-**Files to modify**: `src/lib.rs`
-**New files**: `src/overlay.rs`, `src/filter_complex.rs`, `src/concat.rs`
-**Dependencies**: Workstream A (hwaccel module) is optional but beneficial
-
-#### Task D1: `overlay` function (`src/overlay.rs`)
-
-```sql
-overlay(
-    background   bytea,
-    foreground   bytea,
-    x            int     DEFAULT 0,
-    y            int     DEFAULT 0,
-    start_time   float8  DEFAULT 0.0,
-    end_time     float8  DEFAULT NULL
-) → bytea
-```
-
-Implementation:
-- Open two MemInput contexts (background, foreground)
-- Build multi-input filter graph:
-  - Two `buffer` sources: `[0:v]` and `[1:v]` with respective dimensions/formats
-  - Filter: `[0:v][1:v]overlay=<x>:<y>:enable='between(t,<start>,<end>)'`
-  - One `buffersink` output
-- Decode frames from both inputs, feeding to respective buffer sources
-- Handle different-length inputs (foreground may be shorter — overlay filter handles this with `eof_action=pass`)
-- Encode filtered output, copy audio from background
-- Write to MemOutput
-- Register module in `src/lib.rs`
-
-#### Task D2: `filter_complex` function (`src/filter_complex.rs`)
-
-```sql
-filter_complex(
-    inputs       bytea[],         -- array of input media
-    filter_graph text,            -- full FFmpeg filter graph string
-    format       text DEFAULT 'matroska',
-    codec        text DEFAULT NULL,
-    hwaccel      bool DEFAULT true
-) → bytea
-```
-
-Implementation:
-- Open N MemInput contexts from the `bytea[]` array (pgrx `Vec<Option<Vec<u8>>>`)
-- Parse the filter_graph string to determine input/output pad count
-- Build FFmpeg filter graph with N buffer sources (`[0:v]`, `[1:v]`, `[0:a]`, etc.)
-- Main processing loop: round-robin read packets from all inputs, decode, feed to filter graph
-- Collect filtered frames from buffersink, encode to output
-- If `codec` specified, use it; otherwise infer from first input
-- If `hwaccel` true, attempt HW encoder via `hwaccel::find_hw_encoder()`
-- This is the "escape hatch" covering: hstack, vstack, amerge, amix, drawtext, crossfade, etc.
-- Register module in `src/lib.rs`
-
-#### Task D3: `concat` aggregate and function (`src/concat.rs`)
-
-```sql
--- Simple function form
-concat(
-    inputs bytea[]
-) → bytea
-
--- Aggregate form (for use with ORDER BY)
-concat_agg(data bytea ORDER BY ...) → bytea
-```
-
-Implementation for `concat(bytea[])`:
-- Open each input via MemInput, verify stream compatibility (codec, dimensions for video; codec, sample_rate for audio)
-- Create MemOutput with stream parameters from first input
-- For each input in order: iterate packets, rescale timestamps (offset by cumulative duration), write to output
-- Track cumulative duration per stream for timestamp offsetting
-
-Implementation for `concat_agg`:
-- Use pgrx `#[pg_aggregate]` derive macro
-- State type: `Internal` wrapping a `Vec<Vec<u8>>`
-- `state` function: append each `bytea` to the Vec
-- `finalize` function: call `concat()` on the accumulated array
-- Register module in `src/lib.rs`
-
-#### Task D4: Tests
-
-- `src/overlay.rs`: `test_overlay_basic` (overlay small image on video, verify output dimensions match background)
-- `src/filter_complex.rs`: `test_filter_complex_hstack` (stack two videos side-by-side, verify output width = 2x input)
-- `src/concat.rs`: `test_concat_two_videos` (concat two 1s videos, verify output duration ~2s via `media_info`), `test_concat_agg`
-
----
-
-### Workstream E: Metadata, Waveform, and Encode
-
-**Files to modify**: `src/media_info.rs`, `src/lib.rs`
-**New files**: `src/waveform.rs`, `src/encode.rs`
-**Dependencies**: None
-
-#### Task E1: Enhance `media_info` (`src/media_info.rs`)
-
-Add to the JSONB output:
-- `chapters`: iterate `ictx.chapters()` → array of `{id, start, end, title}` (times in seconds)
-- `tags`: iterate `ictx.metadata()` → key/value object of format-level tags
-- Per-stream additions:
-  - `bit_rate`: from `stream.parameters()` or codec context
-  - `disposition`: from `stream.disposition()` flags (default, forced, etc.)
-  - `tags`: per-stream metadata dictionary
-  - `language`: from stream tags `language` key
-  - For subtitle streams: include codec info
-
-Implementation: extend the existing `for stream in ictx.streams()` loop and the final JSON object.
-
-#### Task E2: `waveform` function (`src/waveform.rs`)
+### Task 2B: `waveform` (`src/waveform.rs`)
 
 ```sql
 waveform(
-    data         bytea,
-    width        int    DEFAULT 800,
-    height       int    DEFAULT 200,
-    format       text   DEFAULT 'png',   -- 'png' or 'jpeg'
-    mode         text   DEFAULT 'waveform'  -- 'waveform' or 'spectrum'
+    data   bytea,
+    width  int  DEFAULT 800,
+    height int  DEFAULT 200,
+    format text DEFAULT 'png',
+    mode   text DEFAULT 'waveform'    -- 'waveform' or 'spectrum'
 ) → bytea
 ```
 
-Implementation:
-- Open MemInput, find best audio stream
-- Build audio→video filter graph:
-  - For waveform: `abuffer → showwavespic=s=<width>x<height>:colors=white → buffersink`
-  - For spectrum: `abuffer → showspectrumpic=s=<width>x<height> → buffersink`
-- Feed all decoded audio frames through the filter
-- The filter produces a single video frame (the visualization image)
-- Encode that frame as PNG/JPEG using the pattern from `thumbnail.rs`
-- Return image bytes
-- Register module in `src/lib.rs`
+- Built-in filter: `showwavespic=s={width}x{height}:colors=white` or `showspectrumpic=s={width}x{height}`
+- Decodes all audio frames, pushes through filter, collects the single output video frame
+- Encodes via frame encoding helper (shared with `extract_frames`, `thumbnail`)
+- Tests: `test_waveform_png`, `test_spectrum_png`
 
-#### Task E3: `encode` function (`src/encode.rs`)
+### Task 2C: `extract_subtitles` (`src/subtitles.rs`)
+
+**Revised per review feedback**: explicit support matrix. Image-based subtitles (PGS/DVB/DVD) cannot be losslessly extracted to text and require OCR — out of scope.
+
+```sql
+extract_subtitles(
+    data         bytea,
+    format       text DEFAULT 'srt',     -- 'srt', 'ass', 'webvtt'
+    stream_index int  DEFAULT NULL
+) → text
+```
+
+**Support matrix**:
+
+| Input codec | Supported output | Behavior |
+|-------------|------------------|----------|
+| `subrip` (SRT), `ass`, `ssa`, `webvtt`, `mov_text` | `srt`, `ass`, `webvtt` | Transcode via FFmpeg subtitle codecs |
+| `dvd_subtitle`, `hdmv_pgs_subtitle`, `dvb_subtitle` | — | `ERROR`: "image-based subtitles require OCR, use extract_frames + external OCR" |
+| No subtitle stream found | — | `ERROR`: "no subtitle stream in input" |
+
+- Uses FFmpeg subtitle decoder → encoder path (not stream copy) so we can convert between text formats
+- Returns `String` mapped to SQL `text`
+- Tests: `test_extract_subtitles_srt_to_webvtt`, `test_extract_subtitles_rejects_pgs`, `test_extract_subtitles_no_stream_errors`
+
+### Task 2D: `overlay` (`src/overlay.rs`)
+
+```sql
+overlay(
+    background bytea,
+    foreground bytea,
+    x          int    DEFAULT 0,
+    y          int    DEFAULT 0,
+    start_time float8 DEFAULT 0.0,
+    end_time   float8 DEFAULT NULL
+) → bytea
+```
+
+- Opens two `MemInput` contexts
+- Fixed filter graph (not user-provided, so no allow-list check): `[0:v][1:v]overlay={x}:{y}:enable='between(t,{start},{end})':eof_action=pass`
+- Audio from background only (stream-copied)
+- Uses `MultiInputGraph` (F1b) to wire two video inputs into the overlay filter, plus its own decoders and encoder for the output
+- Tests: `test_overlay_basic` (output dims match background), `test_overlay_time_range`
+
+### Task 2E: `filter_complex` (`src/filter_complex.rs`) — with safety review
+
+**Per review feedback**: this is the highest-risk function. The design includes:
+
+```sql
+filter_complex(
+    inputs       bytea[],
+    filter_graph text,
+    format       text DEFAULT 'matroska',
+    codec        text DEFAULT NULL,
+    audio_codec  text DEFAULT NULL,
+    hwaccel      bool DEFAULT false
+) → bytea
+```
+
+**Input grammar** (documented contract):
+
+The user's `filter_graph` string MUST reference inputs using the fixed pattern `[i0:v]`, `[i0:a]`, `[i1:v]`, `[i1:a]`, ... where `iN` refers to the Nth element of the `inputs` array (zero-indexed). Output must be exactly one `[vout]` and optionally one `[aout]` label. Example:
+
+```sql
+filter_complex(
+  ARRAY[v1, v2],
+  '[i0:v][i1:v]hstack=inputs=2[vout];[i0:a][i1:a]amix=inputs=2[aout]'
+)
+```
+
+This is stricter than FFmpeg's native filter graph grammar (which allows any label), and it lets us:
+- Know unambiguously which filter-graph label maps to which `bytea` input
+- Auto-generate the `buffer`/`abuffer` sources without parsing user-supplied labels
+- Reject graphs that reference inputs outside the array range before calling into FFmpeg
+
+**Pre-processing step**: before validation, the module rewrites `[iN:v]` / `[iN:a]` labels to FFmpeg-internal pad names (`[in_N_v]` / `[in_N_a]`), then hands the rewritten string to `avfilter_graph_parse_ptr`. If any `[iN:*]` where `N >= inputs.len()` appears, ERROR with a specific message.
+
+**Safety requirements** (must ship with initial implementation):
+1. Rewritten `filter_graph` passes through `validate_filter_spec()` (F3) — `movie`/`amovie`/etc. rejected
+2. `inputs` array length checked against `pg_ffmpeg.max_inputs` (F4)
+3. Each input size checked against `pg_ffmpeg.max_input_bytes` (F4)
+4. Output size enforced via `MemOutput` callback (F4)
+5. **Input reference check**: every `[iN:*]` label in the user string must satisfy `N < inputs.len()`, else ERROR
+6. After parsing via `avfilter_graph_parse_ptr`, verify all unconnected input pads correspond to declared `[iN:*]` labels — no dangling/extra inputs
+7. **At least one of `[vout]` / `[aout]` required.** Video-only graphs have `[vout]`; audio-only graphs (e.g., `amix`) have `[aout]`; mixed graphs have both. A graph with neither ERRORs.
+
+**Implementation**:
+- Parse user string, extract set of `[iN:*]` references
+- Validate N < `inputs.len()` for all references
+- Rewrite labels to internal names
+- Run allow-list validation on the rewritten string
+- Open N `MemInput` contexts
+- Build filter graph via `avfilter_graph_parse_ptr` with pre-declared `buffer`/`abuffer` sources bound to the internal input names
+- Bind `buffersink`/`abuffersink` to `[vout]`/`[aout]`
+- Main loop: read packets from all inputs, decode, feed the matching source
+- Collect from sinks, encode to single output
+
+Tests:
+- `test_filter_complex_hstack` — two videos side-by-side
+- `test_filter_complex_amix` — mix two audio tracks
+- `test_filter_complex_rejects_movie_filter`
+- `test_filter_complex_rejects_too_many_inputs`
+- `test_filter_complex_input_count_mismatch_errors`
+
+**Parser hardening tests** (must ship with initial implementation — per review feedback):
+- `test_filter_complex_label_rewrite_escaped_brackets` — `[i0:v]` inside a `drawtext=text='foo [bar]'` string must not be interpreted as an input reference
+- `test_filter_complex_label_rewrite_nested_graphs` — `split[a][b];[a]scale=...[out1];[b]scale=...[out2]` with user `[iN:*]` references at the top level
+- `test_filter_complex_label_out_of_range` — `[i9:v]` with a 2-element input array must ERROR before invoking FFmpeg
+- `test_filter_complex_label_negative_index` — `[i-1:v]` must ERROR
+- `test_filter_complex_label_non_numeric` — `[iX:v]` must ERROR
+- `test_filter_complex_label_collision_with_internal` — user tries to use `[in_0_v]` (our internal rewritten name); must be rejected or safely namespaced
+- `test_filter_complex_empty_filter_graph` — empty string must ERROR
+- `test_filter_complex_missing_output_labels` — filter with no `[vout]` or `[aout]` must ERROR
+- `test_filter_complex_both_output_labels` — graph with both `[vout]` and `[aout]` must succeed (tested via a graph that produces both)
+- `test_filter_complex_unused_input` — `inputs` array has 3 elements but filter only references `[i0:*]` and `[i1:*]`; behavior: ERROR with clear message (unused inputs are a caller mistake, not silently dropped)
+
+**Future extension** (not in initial ship): support multiple outputs via a TableIterator return type. Out of scope for this plan.
+
+### Task 2F: `concat` and `concat_agg` (`src/concat.rs`)
+
+**Revised per review feedback**: the original `Vec<Vec<u8>>` aggregate state could blow backend memory. New design:
+
+```sql
+concat(inputs bytea[]) → bytea
+concat_agg(bytea ORDER BY ...) → bytea
+```
+
+- **`concat(bytea[])`**: Open each input, verify stream compatibility (codecs, dimensions, sample_rate must match first input — error with specific message if not), stream-copy with timestamp offsetting
+- **`concat_agg`**: pgrx `#[pg_aggregate]`
+  - State type: `ConcatState { total_bytes: usize, inputs: Vec<Vec<u8>> }`
+  - On each `accum`: check `total_bytes + new.len() <= max_aggregate_state_bytes` (F4), else ERROR
+  - Finalize: calls `concat()` on accumulated Vec
+  - `parallel = unsafe` — aggregates are not parallel-safe (order matters for concat)
+  - `COMBINEFUNC` not implemented (same reason)
+- Documentation must warn: "concat_agg is O(total_size) in memory. For concatenating many large videos, use an external pipeline."
+- Tests: `test_concat_two_videos`, `test_concat_incompatible_formats_errors`, `test_concat_agg_with_order_by`, `test_concat_agg_exceeds_state_limit_errors`
+
+### Task 2G: `encode` from image sequence (`src/encode.rs`)
 
 ```sql
 encode(
-    frames       bytea[],         -- array of image frames (PNG/JPEG bytes)
-    fps          int DEFAULT 24,
-    codec        text DEFAULT 'libx264',
-    format       text DEFAULT 'mp4',
-    hwaccel      bool DEFAULT true
+    frames      bytea[],
+    fps         int  DEFAULT 24,
+    codec       text DEFAULT 'libx264',
+    format      text DEFAULT 'mp4',
+    crf         int  DEFAULT 23,
+    hwaccel     bool DEFAULT false
 ) → bytea
 ```
 
-Implementation:
-- For each bytea in the array: open as MemInput, decode single image frame
-- Create MemOutput with specified format
-- Open video encoder by name (try HW variant if `hwaccel`)
-- Set dimensions from first frame, set fps, set reasonable defaults (CRF 23, gop=fps*2)
-- Encode each decoded frame with incrementing PTS
-- Flush encoder, write trailer
-- Register module in `src/lib.rs`
+- Each bytea decoded as single image frame
+- All frames must share dimensions (error if not)
+- Encoder opened via codec name (HW attempt if `hwaccel=true`)
+- Tests: `test_encode_from_frames`, `test_encode_hwaccel_fallback`, `test_encode_mismatched_dimensions_errors`
 
-#### Task E4: Tests
-
-- `src/media_info.rs`: `test_media_info_tags` (verify tags/chapters fields present in output)
-- `src/waveform.rs`: `test_waveform_png` (generate waveform from video with audio, verify PNG magic bytes)
-- `src/encode.rs`: `test_encode_from_frames` (extract 3 frames via thumbnail, encode back to video, verify via media_info)
+**Milestone 2 Deliverables**: 7 new functions, security allow-list validated, memory limits enforced across all multi-input paths.
 
 ---
 
-## Cross-Workstream Tasks (After All Workstreams Complete)
+## Cross-Cutting Tasks (at end of each milestone)
 
-### Task X1: Update `src/lib.rs` module declarations
+### X1: Update `src/lib.rs` module declarations
 
-Add all new modules:
-```rust
-mod concat;
-mod encode;
-mod extract_frames;
-mod filter_complex;
-mod gif;
-pub(crate) mod hwaccel;
-mod overlay;
-mod subtitles;
-mod trim;
-mod waveform;
-```
+Add modules as milestones complete.
 
-### Task X2: Move test video generation to shared module
+### X2: Update `Cargo.toml`
 
-Move `generate_test_video_bytes()` from `src/transcode.rs` tests to a shared `src/test_utils.rs` module (gated behind `#[cfg(any(test, feature = "pg_test"))]`). Update all test modules to import from there.
+Version bumps follow the Rollout Strategy:
+- After M1 gate passes: `0.1.10 → 0.2.0` (stable release).
+- When M2 code lands: `0.2.0 → 0.3.0-beta.1`, with all M2 modules gated behind the `advanced_ops` Cargo feature (not in `default`).
+- After M2 promotion criteria met: `0.3.0-beta.N → 0.3.0` and `advanced_ops` added to `default` features.
 
-### Task X3: Update `Cargo.toml`
+Clippy deny-list (added in F7): configure `disallowed-methods` in `clippy.toml` to forbid direct calls to `ffmpeg::codec::encoder::find_by_name`, `ffmpeg::codec::decoder::find`, and `ffmpeg::format::output::find` outside `src/codec_lookup.rs`.
 
-Bump version from `0.1.10` to `0.2.0` (new features warrant minor version bump).
+### X3: Update `README.md`
 
-### Task X4: Update `README.md`
+Document new functions, GUCs, and the security model (allow-list, limits). Add a "when to use HW acceleration" section.
 
-Add all new functions to the function table and usage examples section.
+### X4: CI validation (every milestone gate)
 
-### Task X5: Run full CI validation
+**Gating commands** (must pass to advance a milestone):
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets --features pg16 -- -D warnings
 cargo pgrx test pg16
-cargo pgrx bench pg16
+cargo pgrx test pg17
+cargo pgrx test pg18
 ```
+
+**Non-gating commands** (run in separate CI jobs; failures reported but do not block milestone gates):
+
+```bash
+# Perf regression watch — flaky and machine-dependent
+cargo pgrx bench pg16 --features pg_bench
+
+# HW acceleration smoke tests — require GPU runner
+cargo pgrx test pg16 --features hwaccel_tests
+```
+
+Per review feedback: benches were previously gating, but perf benchmarks are inherently noisy on shared CI runners and would create flaky gates. They are now tracked as a separate regression-watch job that posts results as PR comments but does not block merges. The `hwaccel_tests` feature (Task F5) runs only on a self-hosted GPU runner when available, also non-gating.
 
 ---
 
 ## Key Files Summary
 
-| File | Workstream | Action |
-|------|------------|--------|
-| `src/hwaccel.rs` | A | **New** — HW accel runtime detection & fallback |
-| `src/transcode.rs` | A | Modify — add codec/crf/preset/audio/hwaccel params |
-| `src/trim.rs` | B | **New** — time range extraction |
-| `src/extract_audio.rs` | B | Modify — add re-encoding path |
-| `src/subtitles.rs` | B | **New** — subtitle extraction |
-| `src/extract_frames.rs` | C | **New** — set-returning frame extraction |
-| `src/gif.rs` | C | **New** — animated GIF/APNG/WebP |
-| `src/overlay.rs` | D | **New** — two-input video compositing |
-| `src/filter_complex.rs` | D | **New** — N-input arbitrary filter graphs |
-| `src/concat.rs` | D | **New** — concatenation function + aggregate |
-| `src/media_info.rs` | E | Modify — add chapters/tags/disposition |
-| `src/waveform.rs` | E | **New** — audio visualization |
-| `src/encode.rs` | E | **New** — image sequence to video |
-| `src/mem_io.rs` | — | No changes (reused by all) |
-| `src/lib.rs` | X | Modify — add module declarations |
-| `Cargo.toml` | X | Modify — version bump |
-| `README.md` | X | Modify — document new functions |
+| File | Milestone | Action |
+|------|-----------|--------|
+| `src/pipeline.rs` | F | **New** — shared VideoPipeline/AudioPipeline (F1) + MultiInputGraph (F1b) |
+| `src/hwaccel.rs` | F | **New** — lazy per-backend HW detection |
+| `src/filter_safety.rs` | F | **New** — filter allow-list validator |
+| `src/limits.rs` | F | **New** — GUCs + size enforcement |
+| `src/test_utils.rs` | F | **New** — shared test fixture generators |
+| `src/codec_lookup.rs` | F | **New** — shared codec/format lookup with error contract (F7) |
+| `src/transcode.rs` | F, 1 | Modify — refactor onto `pipeline`, add params |
+| `src/extract_audio.rs` | 1 | Modify — add re-encoding path |
+| `src/trim.rs` | 1 | **New** — two-mode trim |
+| `src/extract_frames.rs` | 1 | **New** — set-returning with max_frames cap |
+| `src/media_info.rs` | 1 | Modify — add chapters/tags/disposition |
+| `src/gif.rs` | 2 | **New** — animated image generation |
+| `src/waveform.rs` | 2 | **New** — audio visualization |
+| `src/subtitles.rs` | 2 | **New** — text subtitle extraction only |
+| `src/overlay.rs` | 2 | **New** — two-input compositing |
+| `src/filter_complex.rs` | 2 | **New** — N-input with allow-list |
+| `src/concat.rs` | 2 | **New** — concat + memory-bounded aggregate |
+| `src/encode.rs` | 2 | **New** — image sequence → video (gated by `advanced_ops`) |
+| `src/lib.rs` | F/1/2 | Modify — module declarations, `#[cfg(feature = "advanced_ops")]` on M2 modules |
+| `src/mem_io.rs` | F | Modify — hook output size check |
+| `Cargo.toml` | 1, 2 | Version bumps + `advanced_ops` feature declaration |
+| `clippy.toml` | F | **New** — deny-list direct codec lookups outside `codec_lookup.rs` |
+| `README.md` | 1, 2 | Document new functions + GUCs + security model + rollout stages |
 
 ## Reuse Existing Code
 
-- **MemInput / MemOutput** (`src/mem_io.rs`): Used by every new function. No changes needed.
-- **Transcoder struct** (`src/transcode.rs`): decode→filter→encode pattern reused by `trim` (precise mode), `gif`, `overlay`, `filter_complex`. If duplicated >2x, factor into shared helper.
-- **generate_test_video_bytes** (currently in `src/transcode.rs` tests): Move to shared `test_utils` module for all test modules.
-- **Frame encoding pattern** (`src/thumbnail.rs`): RGB24 conversion + PNG/JPEG encoding reused by `extract_frames`, `waveform`.
+- **MemInput / MemOutput** (`src/mem_io.rs`): Used by every function. F4 adds an output-size callback hook.
+- **VideoPipeline / AudioPipeline** (`src/pipeline.rs`, new in F1): Replaces the current `Transcoder` struct. Used by `transcode`, `trim` (precise), `generate_gif`, `overlay`, `filter_complex`, `encode`.
+- **Frame encoding helper** (extracted from `src/thumbnail.rs` in F1): Reused by `extract_frames`, `waveform`.
+- **test_utils** (F6): Reused by every test module.
 
 ## What's Deliberately Excluded
 
 - **Real-time streaming** (RTMP/RTSP output): Doesn't fit Postgres request/response model.
 - **Device capture**: No devices on a DB server.
-- **Custom Postgres types**: `bytea` + `jsonb` + `text` are sufficient. Functions are composable via bytea piping.
+- **Custom Postgres types**: `bytea` + `jsonb` + `text` are sufficient.
+- **Image-based subtitle OCR**: Out of scope; error clearly when encountered.
+- **Multi-output filter_complex**: Single output only in v1.
+- **Cross-process HW device sharing**: Each Postgres backend has its own HW context cache.
+- **Parallel aggregate support** for `concat_agg`: Order matters; not safe to parallelize.
