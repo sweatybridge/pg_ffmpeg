@@ -25,7 +25,6 @@ pg_ffmpeg is a Rust/pgrx PostgreSQL extension that wraps FFmpeg for in-memory me
 **Every function assumes `bytea` inputs are on the order of a few MB — roughly the size of a single HLS segment (2–10 MB).** This shapes the design throughout:
 
 - All processing happens in-memory via `MemInput`/`MemOutput`; no spill to disk
-- Whole-input buffering is acceptable (`Vec<u8>` copies, `bytea[]` arrays held concurrently)
 - No streaming/chunked interfaces — one call processes one segment
 - For full videos, callers pre-segment via `hls()` and process segments in parallel: `SELECT ffmpeg.transcode(data) FROM hls_segments`
 - **Hard limits enforced** (configurable via GUCs, see Task F4):
@@ -33,7 +32,23 @@ pg_ffmpeg is a Rust/pgrx PostgreSQL extension that wraps FFmpeg for in-memory me
   - `pg_ffmpeg.max_output_bytes` — default 256 MB per function call, ERROR if exceeded
   - `pg_ffmpeg.max_inputs` — default 32 elements in a `bytea[]` array
   - `pg_ffmpeg.max_aggregate_state_bytes` — default 512 MB for `concat_agg` state
+  - Set-returning and text-returning functions (`extract_frames`, `extract_subtitles`) rely on `max_input_bytes` and function-specific caps (e.g., `extract_frames.max_frames`) rather than aggregate output GUCs — Postgres' `work_mem` / OOM killer is the ultimate backstop.
 - Hardware acceleration paths inherit the same assumption — HW upload/download cost per call is amortized over a segment, not a full movie
+
+### Zero-Copy Discipline
+
+Inputs are small **per call**, but many concurrent backends each holding multi-MB copies compounds fast. Every module must minimise buffer copying. The target is **one copy per input byte** (pgrx bytea → AVIO `read_cb` → FFmpeg internals) and **one copy per output byte** (FFmpeg `write_cb` → return `bytea`).
+
+Rules enforced across the codebase:
+
+- **`MemInput` borrows, not owns**: the current `MemInput::open(data: Vec<u8>)` signature forces a copy from the pgrx bytea slice into an owned `Vec<u8>`. Task F1 rewrites it to `MemInput::open<'a>(data: &'a [u8]) -> MemInput<'a>` backed by `Cursor<&'a [u8]>`. Callers pass the pgrx bytea slice directly — no `.to_vec()` / `.to_owned()` at the call site.
+- **`bytea[]` parameters borrow each element**: `filter_complex`, `overlay`, `concat`, and `encode` iterate the array and pass `&[u8]` slices to `MemInput`. Never materialise a `Vec<Vec<u8>>`.
+- **`MemOutput` is already single-buffer**: it writes into one `Box<Vec<u8>>` that grows, then `into_data()` moves the `Vec` out via `std::mem::take`. Do not introduce intermediate staging buffers.
+- **Frames move, not clone**: pipeline stages pass `ffmpeg::frame::Video` / `frame::Audio` by move through decode→filter→encode. No `.clone()` on frames unless there's a split filter that genuinely forks the stream.
+- **`concat_agg` state owns its chunks** (pgrx aggregate state lifetime requires it), but each call to `accum` appends the new `bytea` once into a `Vec<Box<[u8]>>` (see Task 2F for the full state type), never re-allocates existing chunks, and frees chunks progressively as the muxer consumes them at finalize time.
+- **Boundary test**: every new function ships with a test that asserts the number of large allocations is O(1) with respect to input size. Concretely: for each function, run the same operation on a small input (e.g., 1 MB) and a large input (e.g., 8 MB), capture the count of allocations ≥ 256 KiB via the `CountingAllocator` helper (F6), and assert the counts are **equal** (not "within N"). FFmpeg's internal buffering is input-size-independent for a given codec/container combination at this size range, so the counts should match exactly; if they don't, the regression is either a real leak or a legitimate codec-dependent buffer growth that must be explained in the test comment. The allocation size threshold (256 KiB) is tuned to ignore small bookkeeping allocations from FFmpeg's struct churn. CI runs the boundary tests as gating; if a specific codec turns out to be genuinely variable, its boundary test can be marked `#[ignore]` with a comment linking to the reason, but the default is strict equality.
+
+This discipline applies even though per-call inputs are small — concurrency × unnecessary copies is the failure mode that motivates it.
 
 ---
 
@@ -65,40 +80,21 @@ Milestone F (Foundation)  →  Milestone 1 (Core APIs)  →  Milestone 2 (Advanc
 
 **Why this order** (per review feedback): the original "5 parallel workstreams" claim was optimistic. The shared `Transcoder` struct, filter graph helpers, HW detection, and memory-limit enforcement are cross-cutting dependencies. Building them once in a foundation milestone prevents duplicated work and API drift.
 
----
-
-## Rollout Strategy
-
-**Per review feedback**: shipping all 3 milestones as a single big-bang release creates a long window where nothing is in users' hands. The plan ships in staged releases so Milestone 2 scope can slip without blocking Milestone 1 value.
-
-| Release | Contents | Stability | Feature flags |
-|---------|----------|-----------|---------------|
-| **v0.2.0** | Milestone F + Milestone 1 | Stable | None — all M1 functions are always-on |
-| **v0.3.0-beta** | v0.2.0 + Milestone 2 behind `advanced_ops` feature flag | Beta | `advanced_ops` (compile-time Cargo feature) |
-| **v0.3.0** | v0.2.0 + Milestone 2 promoted to always-on | Stable | None |
-
-**Rules**:
-
-- **v0.2.0 is the first hard ship target.** If M2 estimates slip, v0.2.0 still ships on schedule with the M1 feature set. This avoids the failure mode where users wait months for any improvement because M2 is "almost done."
-- **`advanced_ops` Cargo feature** gates all Milestone 2 modules (`gif.rs`, `waveform.rs`, `subtitles.rs`, `overlay.rs`, `filter_complex.rs`, `concat.rs`, `encode.rs`). Their `#[pg_extern]` functions are wrapped in `#[cfg(feature = "advanced_ops")]` so the SQL surface is clean in builds without the flag.
-- **The default Cargo build does NOT enable `advanced_ops` until v0.3.0 stable.** During the v0.3.0-beta window, adventurous users opt in with `cargo pgrx install --features advanced_ops`; distro packages ship without it.
-- **v0.3.0-beta → v0.3.0 promotion criteria**: (a) all M2 functions have ≥ 2 weeks in beta without a P0 bug report, (b) `filter_complex` has had a dedicated security review, (c) memory-limit GUCs from F4 have been validated against M2 workloads with > 1 week of production telemetry from at least one deployment.
-- **Foundation modules (F1–F7) are ALWAYS compiled**, even in v0.2.0 — they are dependencies of M1 and cannot be feature-gated.
-- **GUCs introduced in F4 are registered unconditionally** in both v0.2.0 and v0.3.0 so that configuration carries forward without rename.
-- **Per-function gating inside M2 is not supported.** If any M2 function is unstable, the whole `advanced_ops` feature stays in beta. This keeps the mental model simple: one flag, one promotion decision.
-
-**If milestone gates slip**:
-
-- M1 slip → push v0.2.0 date, do not start M2.
-- M2 slip → ship v0.2.0 on schedule; v0.3.0-beta date floats; v0.3.0 stable requires the criteria above regardless of calendar.
-- A single M2 task is blocked → remove it from v0.3.0 scope and document in `CHANGELOG.md`. Do not hold v0.3.0 for a single function.
+This is a greenfield project with no external users to protect. **Breaking changes to existing SQL signatures are allowed and encouraged when they simplify the design.** No deprecation windows, no backward-compat shims, no staged feature flags beyond what's needed for real optional dependencies (e.g. GPU-only tests).
 
 ---
 
 ## Milestone F: Foundation
 
 **Gate to advance**: All foundation modules compile, unit tests pass, CI green on PG 16/17/18.
-**Parallelism**: All F tasks can run in parallel.
+
+**Parallelism**: F tasks are mostly parallelizable but have real coupling:
+- **F1 must land first or merge first** — it owns the breaking `MemInput` API change that every other module imports.
+- **F1b depends on F1** — `MultiInputGraph` lives in the same file (`src/pipeline.rs`) and reuses F1's frame-handling helpers.
+- **F4 partially depends on F1** — the `MemOutput::write_cb` hook for `check_output_size` needs F1's refactored `MemOutput` signatures to land first so the hook site is stable.
+- **F3, F5, F6, F7** are independently parallelizable against each other once F1 is merged.
+
+In practice: one person/agent lands F1, then the rest fan out. Do not try to merge F1b, F4's `MemOutput` hook, or any F1-consuming module before F1 itself.
 
 ### Task F1: Shared transcoder/filter helpers (`src/pipeline.rs`)
 
@@ -110,7 +106,21 @@ Extract reusable building blocks from `src/transcode.rs` into a new module:
 - `build_audio_filter_graph(spec, decoder_params)` — same for audio.
 - `copy_stream(ictx, octx, index)` — helper for stream-copy path.
 
-Current `Transcoder` in `src/transcode.rs` becomes a thin wrapper around `VideoPipeline`. This is a pure refactor — no behavior change.
+Current `Transcoder` in `src/transcode.rs` becomes a thin wrapper around `VideoPipeline`. Mostly a refactor, except for the one behavior change in the bullet below.
+
+**Breaking `MemInput` API change (part of F1)**: rewrite `src/mem_io.rs::MemInput::open` from
+
+```rust
+pub fn open(data: Vec<u8>) -> Self            // current — takes ownership, forces a copy
+```
+
+to
+
+```rust
+pub fn open<'a>(data: &'a [u8]) -> MemInput<'a>   // borrow the pgrx bytea slice directly
+```
+
+The internal `Cursor<Vec<u8>>` becomes `Cursor<&'a [u8]>`. The AVIO opaque pointer's lifetime is tied to the borrowed slice via the `MemInput<'a>` lifetime parameter. All existing callers (`transcode`, `thumbnail`, `extract_audio`, `media_info`, `hls`) are updated in the same PR to pass `data.as_slice()` (or equivalent) from the pgrx bytea argument — no `.to_vec()`. This is the single biggest lever for the Zero-Copy Discipline and must land in Milestone F before any module that accepts `bytea[]` is built.
 
 ### Task F1b: Multi-input pipeline plumbing (`src/pipeline.rs`)
 
@@ -135,7 +145,7 @@ Add to `src/pipeline.rs`:
 
 This is a focused primitive — it does NOT own decoders or encoders. Callers (`overlay`, `filter_complex`) own their decoders and encoders and use `MultiInputGraph` just for the graph wiring.
 
-`overlay` (Task 2D), `filter_complex` (Task 2E), and `encode` (Task 2G, for image sequences) depend on this.
+`overlay` (Task 2D) and `filter_complex` (Task 2E) depend on this. `encode` (Task 2G) does NOT — an image sequence is a single video input to a single encoder, so it uses `VideoPipeline` from F1 directly with a custom input loop that synthesizes frames from decoded images.
 
 ### Task F2: Lazy hardware acceleration module (`src/hwaccel.rs`)
 
@@ -194,6 +204,8 @@ Per review feedback, arbitrary filter graph strings are a security risk. FFmpeg 
 
 ### Task F4: Memory limit GUCs and enforcement (`src/limits.rs`)
 
+**Scope**: only per-single-input and per-single-output caps plus the `concat_agg` state cap. No aggregate-sum, row-total, or text-total GUCs — those reject legitimate workloads (e.g., concatenating 32 HLS segments) and Postgres `work_mem`/OOM is the ultimate backstop.
+
 - Register GUCs via pgrx `GucRegistry`:
   - `pg_ffmpeg.max_input_bytes` (int, default `64 * 1024 * 1024`)
   - `pg_ffmpeg.max_output_bytes` (int, default `256 * 1024 * 1024`)
@@ -201,14 +213,16 @@ Per review feedback, arbitrary filter graph strings are a security risk. FFmpeg 
   - `pg_ffmpeg.max_aggregate_state_bytes` (int, default `512 * 1024 * 1024`)
   - `pg_ffmpeg.unsafe_filters` (bool, default `false`)
   - `pg_ffmpeg.drawtext_font_dir` (text, default empty)
-- `fn check_input_size(len: usize) -> Result<(), LimitError>` — called at the top of every function before `MemInput::open`.
-- `fn check_output_size(len: usize) -> Result<(), LimitError>` — hooked into `MemOutput::write_cb` so the AVIO callback aborts when exceeded.
-- `fn check_array_size(n: usize) -> Result<(), LimitError>` — for `bytea[]` parameters. Consistent `Result` return with the other checks so all three compose into the same error-plumbing pattern at call sites.
+- `fn check_input_size(len: usize) -> Result<(), LimitError>` — called at the top of every function before `MemInput::open`. For `bytea[]` parameters, called once per element.
+- `fn check_output_size(cumulative_written: usize) -> Result<(), LimitError>` — takes the **cumulative total bytes written so far** (not the incoming chunk size). Hooked into `MemOutput::write_cb`, which tracks a running total in the opaque state and passes it to this helper on every callback invocation. The AVIO callback returns `AVERROR` when the check fails so FFmpeg aborts cleanly.
+- `fn check_array_size(n: usize) -> Result<(), LimitError>` — enforces `max_inputs` on `bytea[]` length.
 - `fn check_aggregate_state(current: usize, adding: usize) -> Result<(), LimitError>` — used by `concat_agg`.
 - Exceeding a limit raises `ERROR` with a clear message: `"pg_ffmpeg: input size 128 MB exceeds pg_ffmpeg.max_input_bytes (64 MB)"`.
+- All limit checks return `Result` with consistent error plumbing so every call site uses the same `?`-propagation pattern.
 
 ### Task F5: CI gates for HW-dependent tests
 
+- Declare the `hwaccel_tests` feature in `Cargo.toml` under `[features]` (empty feature — it only acts as a compile-time flag for `#[cfg(feature = "hwaccel_tests")]`).
 - Add `#[cfg(feature = "hwaccel_tests")]` gate for any test that actually requires a GPU.
 - Default `cargo pgrx test` runs do NOT exercise HW encoders (only the fallback path).
 - Add a separate CI job `test-hwaccel` that runs only on a self-hosted GPU runner (future — gate optional).
@@ -219,6 +233,7 @@ Per review feedback, arbitrary filter graph strings are a security risk. FFmpeg 
 - Move `generate_test_video_bytes()` from `src/transcode.rs` tests.
 - Add `generate_test_video_with_audio_bytes()` — MPEG-TS with both video and AAC audio stream (needed for Tasks 1B, 2E tests).
 - Add `generate_test_image_bytes(format, width, height)` — PNG/JPEG generation.
+- Add `CountingAllocator` — a `#[global_allocator]` wrapper (test-only) that counts allocations at or above **256 KiB** during a scoped block (matching the Zero-Copy Discipline threshold). Exposed as `assert_large_allocs_at_most(n, || { ... })`. Used by every module's "zero-copy boundary" test to assert that processing an N-byte input triggers O(1) large allocations rather than O(N) or O(inputs * N).
 - Gated behind `#[cfg(any(test, feature = "pg_test"))]`.
 
 ### Task F7: Codec/format availability error contract (`src/codec_lookup.rs`)
@@ -259,7 +274,7 @@ Tests:
 - `test_find_muxer_unknown` — `format => 'not_a_real_format'` produces the contract message
 - `test_codec_error_sqlstate` — SQL-level test that catches `SQLSTATE '0A000'` for an unknown codec
 
-**Milestone F Deliverables**: 10 files touched, zero user-facing API changes, all existing tests still pass.
+**Milestone F Deliverables**: 10 files touched, all existing tests still pass. User-facing SQL signatures for the 5 current functions are unchanged. New user-visible surface added in this milestone is limited to the GUCs from Task F4 (`pg_ffmpeg.max_input_bytes`, etc.) and the error message format from Task F7 — no new SQL functions ship in F.
 
 | File | Action |
 |------|--------|
@@ -283,7 +298,7 @@ Tests:
 
 ### Task 1A: Enhanced `transcode` (`src/transcode.rs`)
 
-New signature (backward-compatible — all new params default NULL):
+New signature (replaces the current 3-arg version; greenfield — breaking change is fine):
 
 ```sql
 transcode(
@@ -301,14 +316,14 @@ transcode(
 ) → bytea
 ```
 
-Implementation uses `VideoPipeline` + `AudioPipeline` from Task F1. Codec lookup via `codec::encoder::find_by_name()` when `codec` is provided. `filter`/`audio_filter` validated via `validate_filter_spec()` (F3).
+Implementation uses `VideoPipeline` + `AudioPipeline` from Task F1. Codec lookup via `codec_lookup::find_encoder()` (F7) when `codec` is provided. `filter`/`audio_filter` validated via `validate_filter_spec()` (F3).
 
 **HW acceleration policy**:
-- Default `hwaccel = false` (opt-in). Review feedback: HW paths have surprising format-compatibility failures; safer to make it explicit.
+- Default `hwaccel = false` (opt-in). HW paths have surprising format-compatibility failures; safer to make the opt-in explicit.
 - When `hwaccel = true`: try HW encoder; on open failure, log `WARNING "pg_ffmpeg: HW encoder {name} unavailable, falling back to software"` and use software encoder.
 - HW+filter interaction: if filter produces SW frames but encoder expects HW frames, insert an `hwupload` filter automatically. Document this in module comment.
 
-**Zero-copy remux path** (no filter/codec/audio params) is preserved unchanged.
+**Zero-copy remux path** (no filter/codec/audio params) is the default when those params are NULL.
 
 Tests:
 - `test_transcode_with_codec_selection` — MPEG2 → h264 via `libx264`
@@ -323,7 +338,7 @@ Tests:
 ```sql
 extract_audio(
     data        bytea,
-    format      text DEFAULT 'mp3',
+    format      text DEFAULT NULL,   -- NULL = auto-pick container based on source codec
     codec       text DEFAULT NULL,
     bitrate     int  DEFAULT NULL,
     sample_rate int  DEFAULT NULL,
@@ -332,9 +347,16 @@ extract_audio(
 ) → bytea
 ```
 
-- When all new params NULL → existing stream-copy path (backward compatible)
-- Otherwise → `AudioPipeline` (F1) with codec lookup, filter validation (F3)
-- Tests: `test_extract_audio_with_codec`, `test_extract_audio_with_filter`, `test_extract_audio_rejects_unsafe_filter`
+**Mode selection** (the previous `format DEFAULT 'mp3'` + stream-copy default was wrong: copying an AAC stream into an MP3 container is invalid, and the old spec didn't say what happened):
+
+- **Fast stream-copy path** — requires ALL of:
+  1. `codec`, `bitrate`, `sample_rate`, `channels`, `filter` are all NULL, AND
+  2. either `format` is NULL (auto-pick), OR `format` is a container that accepts the source audio codec (`aac`/`adts`, `mp3`, `opus`/`ogg`, `flac`, `wav` → matching container).
+  - When `format` is NULL, the auto-pick table is: `aac → adts`, `mp3 → mp3`, `opus → ogg`, `vorbis → ogg`, `flac → flac`, `pcm_s16le → wav`, anything else → ERROR with a message telling the caller to supply `format` + `codec` for re-encode.
+- **Re-encode path** — any other combination uses `AudioPipeline` (F1) with codec lookup via F7, filter validation (F3). If `codec` is NULL in this path, it is inferred from `format` via a small container→default-codec table (`mp3→libmp3lame`, `ogg→libopus`, `adts→aac`, `flac→flac`, `wav→pcm_s16le`); unknown `format` ERRORs.
+- **Container/codec incompatibility** — the re-encode path validates `codec` is muxable into `format` before opening the encoder; mismatches ERROR with the F7 error contract template rather than failing mid-stream.
+
+Tests: `test_extract_audio_copy_aac_auto_adts`, `test_extract_audio_copy_aac_rejects_mp3_container`, `test_extract_audio_reencode_to_mp3`, `test_extract_audio_with_filter`, `test_extract_audio_rejects_unsafe_filter`, `test_extract_audio_unknown_format_errors`.
 
 ### Task 1C: `trim` function (`src/trim.rs`)
 
@@ -356,9 +378,10 @@ trim(
   - Audio streams: trim at packet boundaries (audio packets are short; near-frame accuracy)
   - Output may start slightly before requested `start_time` — documented behavior
 - **`precise = true`** (frame-accurate, full re-encode):
-  - **Video and audio streams** are decoded and re-encoded using `VideoPipeline` + `AudioPipeline` (F1). Same codec as input; no codec change.
+  - **Video and audio streams** are decoded and re-encoded using `VideoPipeline` + `AudioPipeline` (F1). Default: re-encode with the same codec as the input.
   - Video filter graph: `trim=start={start}:end={end},setpts=PTS-STARTPTS`
   - Audio filter graph: `atrim=start={start}:end={end},asetpts=PTS-STARTPTS`
+  - **Decode-only codec fallback**: some codecs in FFmpeg builds are decode-only (no encoder linked in — e.g., decoder-only builds of `h264` when only `libx264` provides encoding, or obscure legacy codecs). When `codec_lookup::find_encoder` for the source codec returns `CodecError::NotAvailable`, `trim` falls back to a fixed default encoder per stream type — `libx264` for video, `aac` for audio — and logs `WARNING "pg_ffmpeg: trim(precise=true) source {codec} has no encoder in this FFmpeg build; re-encoding video as libx264/audio as aac"`. If the fallback encoder itself is unavailable, ERROR with the F7 error contract. The fallback set is documented in the README and is NOT user-configurable in v1 (keeps the API surface small).
   - **Subtitle and data streams are dropped** in v1. This is a deliberate scope reduction: cue-level subtitle trimming requires per-codec handling (text vs. image) and is out of scope for the initial trim implementation. Callers who need subtitles preserved across a precise trim should use the fast mode (`precise=false`), which stream-copies all subtitle tracks with timestamp rewriting.
   - A `WARNING` is logged once if subtitles/data streams are present and dropped: `"pg_ffmpeg: trim(precise=true) dropped N subtitle/data stream(s); use precise=false to preserve them"`.
   - Slower and larger output than fast mode but A/V sync is guaranteed
@@ -403,6 +426,8 @@ extract_frames(
 - `keyframes_only = false`: decode every frame, track last-emitted timestamp, emit when `(frame.pts_sec - last_emit) >= interval`
 - Stop scanning when attempting to emit the `(max_frames + 1)`-th row → ERROR (do not silently truncate). Exactly `max_frames` rows are the legal maximum.
 - Frame encoding via helper extracted from `src/thumbnail.rs`
+
+**Memory bounding**: row accumulation is bounded by `max_frames` (default 1000) alone. No separate byte-total GUC — `max_frames` plus the per-input `max_input_bytes` cap is sufficient, and Postgres `work_mem`/OOM is the backstop for pathological combinations.
 
 Tests: `test_extract_frames_keyframes_only`, `test_extract_frames_interval`, `test_extract_frames_max_frames_limit`, `test_extract_frames_invalid_interval_errors`, `test_extract_frames_keyframes_only_ignores_interval`
 
@@ -485,6 +510,7 @@ extract_subtitles(
 
 - Uses FFmpeg subtitle decoder → encoder path (not stream copy) so we can convert between text formats
 - Returns `String` mapped to SQL `text`
+- No separate text-size GUC — `max_input_bytes` bounds the input and subtitle text is bounded by the input duration. Postgres is the ultimate backstop.
 - Tests: `test_extract_subtitles_srt_to_webvtt`, `test_extract_subtitles_rejects_pgs`, `test_extract_subtitles_no_stream_errors`
 
 ### Task 2D: `overlay` (`src/overlay.rs`)
@@ -523,7 +549,7 @@ filter_complex(
 
 **Input grammar** (documented contract):
 
-The user's `filter_graph` string MUST reference inputs using the fixed pattern `[i0:v]`, `[i0:a]`, `[i1:v]`, `[i1:a]`, ... where `iN` refers to the Nth element of the `inputs` array (zero-indexed). Output must be exactly one `[vout]` and optionally one `[aout]` label. Example:
+The user's `filter_graph` string MUST reference inputs using the fixed pattern `[i0:v]`, `[i0:a]`, `[i1:v]`, `[i1:a]`, ... where `iN` refers to the Nth element of the `inputs` array (zero-indexed). The graph must declare at least one of `[vout]` / `[aout]`: video-only graphs have just `[vout]`, audio-only graphs (e.g., `amix`) have just `[aout]`, and mixed graphs have both. A graph with neither ERRORs. Example:
 
 ```sql
 filter_complex(
@@ -589,13 +615,13 @@ concat(inputs bytea[]) → bytea
 concat_agg(bytea ORDER BY ...) → bytea
 ```
 
-- **`concat(bytea[])`**: Open each input, verify stream compatibility (codecs, dimensions, sample_rate must match first input — error with specific message if not), stream-copy with timestamp offsetting
+- **`concat(bytea[])`**: Open each input with `MemInput::open(&[u8])` (borrowing directly from the `bytea[]` elements — no copy), verify stream compatibility (codecs, dimensions, sample_rate must match first input — error with specific message if not), stream-copy with timestamp offsetting into one `MemOutput`. Single pass, single output allocation.
 - **`concat_agg`**: pgrx `#[pg_aggregate]`
-  - State type: `ConcatState { total_bytes: usize, inputs: Vec<Vec<u8>> }`
-  - On each `accum`: check `total_bytes + new.len() <= max_aggregate_state_bytes` (F4), else ERROR
-  - Finalize: calls `concat()` on accumulated Vec
-  - `parallel = unsafe` — aggregates are not parallel-safe (order matters for concat)
-  - `COMBINEFUNC` not implemented (same reason)
+  - State type: `ConcatState { total_bytes: usize, chunks: Vec<Box<[u8]>> }` — each chunk is appended once from the `accum` argument and never re-cloned. `Box<[u8]>` instead of `Vec<u8>` so the allocator returns the memory exactly once on finalize.
+  - On each `accum`: check `total_bytes + new.len() <= max_aggregate_state_bytes` (F4), else ERROR. Append the incoming `bytea` as a single `Box<[u8]>`; do not concatenate into a single growing buffer (that would be O(N²)).
+  - Finalize: iterate `chunks` in order, open each as a `MemInput` borrowing its slice, mux into one `MemOutput`, then drop each chunk as soon as it has been fully demuxed (freeing memory progressively so peak usage is `total_bytes`, not `2 × total_bytes`).
+  - `parallel = unsafe` — aggregates are not parallel-safe (order matters for concat).
+  - `COMBINEFUNC` not implemented (same reason).
 - Documentation must warn: "concat_agg is O(total_size) in memory. For concatenating many large videos, use an external pipeline."
 - Tests: `test_concat_two_videos`, `test_concat_incompatible_formats_errors`, `test_concat_agg_with_order_by`, `test_concat_agg_exceeds_state_limit_errors`
 
@@ -629,12 +655,9 @@ Add modules as milestones complete.
 
 ### X2: Update `Cargo.toml`
 
-Version bumps follow the Rollout Strategy:
-- After M1 gate passes: `0.1.10 → 0.2.0` (stable release).
-- When M2 code lands: `0.2.0 → 0.3.0-beta.1`, with all M2 modules gated behind the `advanced_ops` Cargo feature (not in `default`).
-- After M2 promotion criteria met: `0.3.0-beta.N → 0.3.0` and `advanced_ops` added to `default` features.
+Version bumps: `0.1.10 → 0.2.0` after M1 gate, `0.2.0 → 0.3.0` after M2 gate.
 
-Clippy deny-list (added in F7): configure `disallowed-methods` in `clippy.toml` to forbid direct calls to `ffmpeg::codec::encoder::find_by_name`, `ffmpeg::codec::decoder::find`, and `ffmpeg::format::output::find` outside `src/codec_lookup.rs`.
+Clippy deny-list (added in F7): add a `clippy.toml` at the repo root with a `disallowed-methods` list naming `ffmpeg::codec::encoder::find_by_name`, `ffmpeg::codec::decoder::find`, `ffmpeg::format::output::find`, and `ffmpeg::format::input`. Clippy's `disallowed_methods` lint does not support per-file allow-lists directly, so `src/codec_lookup.rs` applies `#![allow(clippy::disallowed_methods)]` at the module level. All other modules inherit the deny. CI runs `cargo clippy --all-targets -- -D warnings` so any direct lookup outside `codec_lookup.rs` fails the build.
 
 ### X3: Update `README.md`
 
@@ -687,12 +710,12 @@ Per review feedback: benches were previously gating, but perf benchmarks are inh
 | `src/overlay.rs` | 2 | **New** — two-input compositing |
 | `src/filter_complex.rs` | 2 | **New** — N-input with allow-list |
 | `src/concat.rs` | 2 | **New** — concat + memory-bounded aggregate |
-| `src/encode.rs` | 2 | **New** — image sequence → video (gated by `advanced_ops`) |
-| `src/lib.rs` | F/1/2 | Modify — module declarations, `#[cfg(feature = "advanced_ops")]` on M2 modules |
+| `src/encode.rs` | 2 | **New** — image sequence → video |
+| `src/lib.rs` | F/1/2 | Modify — module declarations |
 | `src/mem_io.rs` | F | Modify — hook output size check |
-| `Cargo.toml` | 1, 2 | Version bumps + `advanced_ops` feature declaration |
+| `Cargo.toml` | 1, 2 | Version bumps |
 | `clippy.toml` | F | **New** — deny-list direct codec lookups outside `codec_lookup.rs` |
-| `README.md` | 1, 2 | Document new functions + GUCs + security model + rollout stages |
+| `README.md` | 1, 2 | Document new functions + GUCs + security model |
 
 ## Reuse Existing Code
 
