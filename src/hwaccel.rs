@@ -33,7 +33,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ptr;
 
+use ffmpeg_next::codec::Id as CodecId;
+use ffmpeg_next::sys::{
+    av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, av_hwdevice_iterate_types,
+    AVBufferRef, AVHWDeviceType,
+};
 use ffmpeg_next::Codec;
 
 /// Normalize a software codec name (or a bare family name) to the HW
@@ -65,13 +71,84 @@ const HW_ENCODER_TABLE: &[(&str, &[&str])] = &[
     ("vp9", &["vp9_vaapi", "vp9_qsv"]),
 ];
 
+/// Fixed list of HW decoder names to try per family, in preference order.
+/// These are intentionally best-effort probes; callers always fall back
+/// to software when no matching decoder is available.
+const HW_DECODER_TABLE: &[(&str, &[&str])] = &[
+    (
+        "h264",
+        &["h264_cuvid", "h264_qsv", "h264_videotoolbox", "h264_vaapi"],
+    ),
+    (
+        "hevc",
+        &["hevc_cuvid", "hevc_qsv", "hevc_videotoolbox", "hevc_vaapi"],
+    ),
+    ("av1", &["av1_cuvid", "av1_qsv", "av1_vaapi"]),
+    ("vp9", &["vp9_cuvid", "vp9_qsv", "vp9_vaapi"]),
+];
+
 thread_local! {
     static HW_CACHE: RefCell<HwCache> = RefCell::new(HwCache::default());
 }
 
+#[derive(Debug)]
+pub struct HwDeviceRef {
+    raw: *mut AVBufferRef,
+}
+
+impl HwDeviceRef {
+    fn from_existing(raw: *mut AVBufferRef) -> Option<Self> {
+        if raw.is_null() {
+            return None;
+        }
+        let cloned = unsafe { av_buffer_ref(raw) };
+        if cloned.is_null() {
+            None
+        } else {
+            Some(Self { raw: cloned })
+        }
+    }
+
+    pub fn as_ptr(&self) -> *mut AVBufferRef {
+        self.raw
+    }
+}
+
+impl Clone for HwDeviceRef {
+    fn clone(&self) -> Self {
+        Self::from_existing(self.raw).expect("av_buffer_ref failed for cached HW device context")
+    }
+}
+
+impl Drop for HwDeviceRef {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.raw.is_null() {
+                av_buffer_unref(&mut self.raw);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct HwCache {
+    probed: bool,
+    available_types: Vec<AVHWDeviceType>,
+    device_contexts: HashMap<AVHWDeviceType, *mut AVBufferRef>,
     encoders: HashMap<String, Option<&'static str>>,
+    decoders: HashMap<CodecId, Option<&'static str>>,
+}
+
+impl Drop for HwCache {
+    fn drop(&mut self) {
+        for ctx in self.device_contexts.values_mut() {
+            unsafe {
+                if !ctx.is_null() {
+                    av_buffer_unref(ctx);
+                }
+            }
+        }
+    }
 }
 
 /// Find a hardware encoder variant for a given codec name.
@@ -111,6 +188,112 @@ pub fn hw_encoder(codec_name: &str) -> Option<Codec> {
     });
 
     cached_name.and_then(ffmpeg_next::codec::encoder::find_by_name)
+}
+
+fn codec_family_from_id(codec_id: CodecId) -> Option<&'static str> {
+    match codec_id {
+        CodecId::H264 => Some("h264"),
+        CodecId::HEVC => Some("hevc"),
+        CodecId::AV1 => Some("av1"),
+        CodecId::VP9 => Some("vp9"),
+        CodecId::MP3 => Some("mp3"),
+        _ => None,
+    }
+}
+
+/// Find a hardware decoder variant for a given codec id.
+///
+/// The decoder lookup mirrors `hw_encoder()`, but starts from the input
+/// stream's codec id rather than a user-supplied encoder name.
+pub fn hw_decoder(codec_id: CodecId) -> Option<Codec> {
+    let family = codec_family_from_id(codec_id)?;
+    let candidates = HW_DECODER_TABLE
+        .iter()
+        .find(|(f, _)| *f == family)
+        .map(|(_, names)| *names)?;
+
+    let cached_name: Option<&'static str> = HW_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(entry) = cache.decoders.get(&codec_id) {
+            return *entry;
+        }
+        let mut found: Option<&'static str> = None;
+        for name in candidates {
+            if ffmpeg_next::codec::decoder::find_by_name(name).is_some() {
+                found = Some(*name);
+                break;
+            }
+        }
+        cache.decoders.insert(codec_id, found);
+        found
+    });
+
+    cached_name.and_then(ffmpeg_next::codec::decoder::find_by_name)
+}
+
+fn ensure_probed(cache: &mut HwCache) {
+    if cache.probed {
+        return;
+    }
+
+    let mut device_type = AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+    loop {
+        device_type = unsafe { av_hwdevice_iterate_types(device_type) };
+        if device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+            break;
+        }
+        cache.available_types.push(device_type);
+    }
+    cache.probed = true;
+}
+
+fn device_type_for_codec(codec: &Codec) -> Option<AVHWDeviceType> {
+    match codec.name() {
+        name if name.ends_with("_nvenc") || name.ends_with("_cuvid") => {
+            Some(AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA)
+        }
+        name if name.ends_with("_vaapi") => Some(AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI),
+        name if name.ends_with("_qsv") => Some(AVHWDeviceType::AV_HWDEVICE_TYPE_QSV),
+        name if name.ends_with("_videotoolbox") => {
+            Some(AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
+        }
+        _ => None,
+    }
+}
+
+/// Return a cloned device context for the given hardware codec, creating
+/// the per-backend context on first use.
+pub fn hw_device_for(codec: &Codec) -> Option<HwDeviceRef> {
+    let device_type = device_type_for_codec(codec)?;
+
+    HW_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        ensure_probed(&mut cache);
+        if !cache.available_types.contains(&device_type) {
+            return None;
+        }
+
+        if let Some(existing) = cache.device_contexts.get(&device_type) {
+            return HwDeviceRef::from_existing(*existing);
+        }
+
+        let mut device_ctx: *mut AVBufferRef = ptr::null_mut();
+        let ret = unsafe {
+            av_hwdevice_ctx_create(
+                &mut device_ctx,
+                device_type,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if ret < 0 || device_ctx.is_null() {
+            return None;
+        }
+
+        cache.device_contexts.insert(device_type, device_ctx);
+        HwDeviceRef::from_existing(device_ctx)
+    })
 }
 
 /// Log a `WARNING` that HW acceleration is unavailable and we're falling

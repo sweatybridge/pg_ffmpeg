@@ -11,7 +11,7 @@ use ffmpeg_next::sys::{
 };
 use pgrx::error;
 
-use crate::limits;
+use crate::{codec_lookup, limits};
 
 const BUF_SIZE: usize = 32768;
 
@@ -209,6 +209,7 @@ pub struct MemOutput {
 
 impl MemOutput {
     pub fn open(format: &str) -> Self {
+        codec_lookup::find_muxer(format).unwrap_or_else(|e| error!("{e}"));
         unsafe {
             let mut sink = Box::new(OutputSink::new());
             let avio_buf = av_malloc(BUF_SIZE) as *mut u8;

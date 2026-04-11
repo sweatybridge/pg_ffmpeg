@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 
+use crate::filter_safety;
 use crate::mem_io::{MemInput, MemOutput};
 use crate::pipeline::{self, VideoPipeline};
 
@@ -59,6 +60,7 @@ fn transcode(
     }
 
     let filter_spec = filter.unwrap_or("null");
+    filter_safety::validate_filter_spec(filter_spec).unwrap_or_else(|e| error!("{e}"));
     let mut octx = MemOutput::open(out_format);
 
     // Identify video streams and build pipelines
