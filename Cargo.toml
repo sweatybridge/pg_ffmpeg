@@ -17,6 +17,11 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = ["tempfile"]
 pg_bench = ["tempfile", "pgrx-bench"]
+# Compile-time flag that enables tests requiring a real GPU-backed
+# hardware encoder. Default `cargo pgrx test` runs never exercise HW
+# encoders (only the software-fallback path); the HW tests run in a
+# separate CI job on a self-hosted GPU runner.
+hwaccel_tests = []
 
 [dependencies]
 ffmpeg-next = "8"

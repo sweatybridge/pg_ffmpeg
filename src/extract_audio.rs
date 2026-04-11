@@ -6,7 +6,7 @@ use crate::mem_io::{MemInput, MemOutput};
 fn extract_audio(data: Vec<u8>, format: default!(&str, "'mp3'")) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 
-    let mut ictx = MemInput::open(data);
+    let mut ictx = MemInput::open(&data);
     let mut octx = MemOutput::open(format);
 
     let audio_stream = ictx

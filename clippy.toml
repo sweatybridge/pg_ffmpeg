@@ -1,0 +1,17 @@
+# Direct codec / muxer / demuxer lookups are banned outside of
+# `src/codec_lookup.rs`. Every call site must go through that module so
+# the user-facing error messages follow the uniform F7 contract.
+#
+# `src/codec_lookup.rs` and `src/hwaccel.rs` (which needs to probe
+# hardware encoder names on the fast lazy path) apply
+# `#![allow(clippy::disallowed_methods)]` at module scope — clippy's
+# `disallowed_methods` lint does not support per-file allow-lists
+# directly, so the allow attribute inside those modules is the
+# supported escape hatch.
+disallowed-methods = [
+    { path = "ffmpeg_next::codec::encoder::find_by_name", reason = "use crate::codec_lookup::find_encoder" },
+    { path = "ffmpeg_next::codec::decoder::find", reason = "use crate::codec_lookup::find_decoder" },
+    # `format::output::find` is not exposed by every ffmpeg-next version
+    # we support; allow-invalid lets older versions still lint cleanly.
+    { path = "ffmpeg_next::format::output::find", reason = "use crate::codec_lookup::find_muxer", allow-invalid = true },
+]

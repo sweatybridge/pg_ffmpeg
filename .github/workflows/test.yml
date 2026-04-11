@@ -58,3 +58,45 @@ jobs:
 
       - name: Bench
         run: cargo pgrx bench "pg${{ matrix.pg_version }}"
+
+  # HW-encoder smoke tests (Task F5). Opt-in job that only runs when
+  # a self-hosted runner with a GPU is available. It is never required
+  # for a PR to merge — the default `test` matrix above covers every
+  # code path via the software-fallback branch of `hwaccel::hw_encoder`.
+  test-hwaccel:
+    runs-on: [self-hosted, gpu]
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'hwaccel') || github.event_name == 'workflow_dispatch' }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+          cache-key: pg16-hwaccel
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libavfilter-dev libavdevice-dev \
+            libreadline-dev
+
+      - name: Install cargo-pgrx
+        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
+
+      - name: Initialize pgrx
+        run: |
+          set +e
+          v=$(cargo pgrx info version pg16)
+          if [ $? -ne 0 ]; then
+            cargo pgrx init --pg16 download
+          fi
+
+      - name: HW acceleration tests
+        run: cargo pgrx test pg16 --features hwaccel_tests
