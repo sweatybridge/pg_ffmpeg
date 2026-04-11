@@ -292,9 +292,10 @@ pub(crate) fn generate_video(
     encoder.set_time_base((1, fps));
 
     let mut encoder = encoder.open().expect("failed to open encoder");
-    stream.set_parameters(&encoder);
-    let out_time_base = stream.time_base();
-    drop(stream);
+    let out_time_base = {
+        stream.set_parameters(&encoder);
+        stream.time_base()
+    };
 
     octx.write_header().expect("failed to write header");
 

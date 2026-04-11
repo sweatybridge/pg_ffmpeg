@@ -5,7 +5,9 @@ use ffmpeg_next::media::Type;
 use ffmpeg_next::software::scaling::{context::Context, flag::Flags};
 use ffmpeg_next::util::frame::video::Video;
 
+use crate::limits;
 use crate::mem_io::MemInput;
+use crate::mem_io::MemOutput;
 
 #[pg_extern]
 fn thumbnail(
@@ -108,8 +110,9 @@ fn thumbnail(
 
 fn encode_ppm(frame: &Video) -> Vec<u8> {
     let header = format!("P6\n{} {}\n255\n", frame.width(), frame.height());
-    let mut output =
-        Vec::with_capacity(header.len() + (frame.width() * frame.height() * 3) as usize);
+    let total_len = header.len() + (frame.width() * frame.height() * 3) as usize;
+    limits::check_output_size(total_len).unwrap_or_else(|e| error!("{e}"));
+    let mut output = Vec::with_capacity(total_len);
     output.extend_from_slice(header.as_bytes());
     let stride = frame.stride(0);
     let width_bytes = frame.width() as usize * 3;
@@ -164,18 +167,38 @@ fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
     let mut encoder = encoder
         .open_as(codec)
         .unwrap_or_else(|e| error!("failed to open encoder: {e}"));
+    let mut octx = MemOutput::open("image2pipe");
+    let out_time_base = {
+        let mut stream = octx
+            .add_stream(codec)
+            .unwrap_or_else(|e| error!("failed to add thumbnail stream: {e}"));
+        stream.set_time_base((1, 25));
+        stream.set_parameters(&encoder);
+        stream.time_base()
+    };
+
+    octx.write_header()
+        .unwrap_or_else(|e| error!("failed to write thumbnail header: {e}"));
 
     encoder
         .send_frame(enc_frame)
         .unwrap_or_else(|e| error!("encode send_frame error: {e}"));
-    encoder.send_eof().unwrap();
+    encoder
+        .send_eof()
+        .unwrap_or_else(|e| error!("encode send_eof error: {e}"));
 
     let mut packet = ffmpeg_next::Packet::empty();
-    encoder
-        .receive_packet(&mut packet)
-        .unwrap_or_else(|e| error!("encode receive_packet error: {e}"));
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(0);
+        packet.rescale_ts((1, 25), out_time_base);
+        packet
+            .write_interleaved(&mut octx)
+            .unwrap_or_else(|e| error!("encode write_interleaved error: {e}"));
+    }
 
-    packet.data().unwrap().to_vec()
+    octx.write_trailer()
+        .unwrap_or_else(|e| error!("failed to write thumbnail trailer: {e}"));
+    octx.into_data()
 }
 
 #[cfg(any(test, feature = "pg_test"))]
