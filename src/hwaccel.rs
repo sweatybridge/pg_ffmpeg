@@ -136,7 +136,7 @@ struct HwCache {
     available_types: Vec<AVHWDeviceType>,
     device_contexts: HashMap<AVHWDeviceType, *mut AVBufferRef>,
     encoders: HashMap<String, Option<&'static str>>,
-    decoders: HashMap<CodecId, Option<&'static str>>,
+    decoders: HashMap<String, Option<&'static str>>,
 }
 
 impl Drop for HwCache {
@@ -214,7 +214,7 @@ pub fn hw_decoder(codec_id: CodecId) -> Option<Codec> {
 
     let cached_name: Option<&'static str> = HW_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
-        if let Some(entry) = cache.decoders.get(&codec_id) {
+        if let Some(entry) = cache.decoders.get(family) {
             return *entry;
         }
         let mut found: Option<&'static str> = None;
@@ -224,7 +224,7 @@ pub fn hw_decoder(codec_id: CodecId) -> Option<Codec> {
                 break;
             }
         }
-        cache.decoders.insert(codec_id, found);
+        cache.decoders.insert(family.to_owned(), found);
         found
     });
 
