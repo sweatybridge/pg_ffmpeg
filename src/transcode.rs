@@ -436,13 +436,7 @@ impl AudioTranscodePipeline {
             encoder_time_base,
             config,
         );
-        let graph = build_audio_filter_graph(
-            &decoder,
-            sample_rate,
-            channel_layout,
-            sample_format,
-            config.filter_spec,
-        );
+        let graph = build_audio_filter_graph(&decoder, &encoder, config.filter_spec);
 
         let mut ost = octx
             .add_stream(selected_codec)
@@ -764,9 +758,7 @@ fn open_audio_encoder(
 
 fn build_audio_filter_graph(
     decoder: &ffmpeg_next::decoder::Audio,
-    sample_rate: u32,
-    channel_layout: ChannelLayout,
-    sample_format: Sample,
+    encoder: &ffmpeg_next::encoder::Audio,
     spec: &str,
 ) -> filter::Graph {
     let mut graph = filter::Graph::new();
@@ -790,9 +782,12 @@ fn build_audio_filter_graph(
     graph
         .add(&filter::find("abuffersink").unwrap(), "out", "")
         .unwrap_or_else(|e| error!("failed to add abuffer sink: {e}"));
-    graph.get("out").unwrap().set_sample_rate(sample_rate);
-    graph.get("out").unwrap().set_channel_layout(channel_layout);
-    graph.get("out").unwrap().set_sample_format(sample_format);
+    {
+        let mut out = graph.get("out").unwrap();
+        out.set_sample_rate(encoder.rate() as u32);
+        out.set_channel_layout(encoder.channel_layout());
+        out.set_sample_format(encoder.format());
+    }
     graph
         .output("in", 0)
         .unwrap()
@@ -803,6 +798,18 @@ fn build_audio_filter_graph(
     graph
         .validate()
         .unwrap_or_else(|e| error!("failed to validate audio filter graph: {e}"));
+    if let Some(codec) = encoder.codec() {
+        if !codec
+            .capabilities()
+            .contains(codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
+        {
+            graph
+                .get("out")
+                .unwrap()
+                .sink()
+                .set_frame_size(encoder.frame_size());
+        }
+    }
     graph
 }
 
