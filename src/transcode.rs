@@ -235,6 +235,8 @@ pub(crate) fn transcode(
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
+    drop(video_pipelines);
+    drop(audio_pipelines);
     octx.into_data()
 }
 
@@ -498,6 +500,7 @@ impl AudioTranscodePipeline {
                 .timestamp()
                 .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
                 .unwrap_or(self.next_decoded_pts);
+            let timestamp = timestamp.max(self.next_decoded_pts);
             decoded.set_pts(Some(timestamp));
             self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
             self.graph
@@ -524,13 +527,8 @@ impl AudioTranscodePipeline {
             .frame(&mut filtered)
             .is_ok()
         {
-            filtered.set_channel_layout(self.encoder.channel_layout());
-            filtered.set_channels(
-                u16::try_from(self.encoder.channel_layout().channels())
-                    .expect("audio channel count should fit into u16"),
-            );
-            filtered.set_rate(self.encoder.rate());
             let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
+            let timestamp = timestamp.max(self.next_encoded_pts);
             filtered.set_pts(Some(timestamp));
             self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
             self.encoder.send_frame(&filtered).unwrap_or_else(|e| {
@@ -680,7 +678,7 @@ fn resolve_audio_encoder(
     if let Some(name) = requested {
         let codec =
             codec_lookup::find_encoder(name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
-        (codec, name.to_owned())
+        (codec, codec.name().to_owned())
     } else {
         let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
             error!(
@@ -854,14 +852,13 @@ fn build_audio_filter_graph(
 ) -> filter::Graph {
     let mut graph = filter::Graph::new();
     let decoder_layout = decoder_channel_layout(decoder);
-    let decoder_time_base = audio_frame_time_base(decoder);
-    let sample_fmt = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
+    let decoder_time_base = decoder.time_base();
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
         decoder_time_base.numerator(),
         decoder_time_base.denominator(),
         decoder.rate(),
-        sample_fmt,
+        decoder.format().name(),
         decoder_layout.bits(),
     );
     graph
@@ -886,12 +883,18 @@ fn build_audio_filter_graph(
     graph
         .validate()
         .unwrap_or_else(|e| error!("failed to validate audio filter graph: {e}"));
-    if encoder.frame_size() > 0 {
-        graph
-            .get("out")
-            .unwrap()
-            .sink()
-            .set_frame_size(encoder.frame_size());
+    if let Some(codec) = encoder.codec() {
+        if encoder.frame_size() > 0
+            && !codec
+                .capabilities()
+                .contains(ffmpeg_next::codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
+        {
+            graph
+                .get("out")
+                .unwrap()
+                .sink()
+                .set_frame_size(encoder.frame_size());
+        }
     }
     graph
 }
