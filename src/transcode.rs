@@ -10,7 +10,7 @@ use ffmpeg_next::codec;
 use ffmpeg_next::filter;
 use ffmpeg_next::format::{self, Pixel, Sample};
 use ffmpeg_next::media::Type;
-use ffmpeg_next::{frame, ChannelLayout, Dictionary, Packet, Rational};
+use ffmpeg_next::{frame, ChannelLayout, Dictionary, Packet, Rational, Rescale};
 
 use std::collections::HashMap;
 
@@ -480,7 +480,10 @@ impl AudioTranscodePipeline {
     ) {
         let mut decoded = frame::Audio::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            let timestamp = decoded.timestamp();
+            let frame_time_base = audio_frame_time_base(&self.decoder);
+            let timestamp = decoded
+                .timestamp()
+                .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base));
             decoded.set_pts(timestamp);
             self.graph
                 .get("in")
