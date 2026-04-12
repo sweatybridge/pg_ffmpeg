@@ -176,7 +176,7 @@ fn subtitle_codec_type(codec_id: ffmpeg_next::codec::Id) -> Option<&'static str>
 }
 
 fn timestamp_seconds(timestamp: i64, time_base: ffmpeg_next::Rational) -> Option<f64> {
-    if time_base.denominator() == 0 {
+    if timestamp == ffmpeg_next::ffi::AV_NOPTS_VALUE || time_base.denominator() == 0 {
         None
     } else {
         Some(timestamp as f64 * f64::from(time_base))
@@ -193,6 +193,10 @@ mod tests {
     use ffmpeg_next::{Dictionary, Rational};
 
     fn generate_tagged_chaptered_video_bytes() -> Vec<u8> {
+        generate_video_with_chapters(&[(1, 0, 1000, "Intro"), (2, 1000, 2000, "Main")])
+    }
+
+    fn generate_video_with_chapters(chapters: &[(i64, i64, i64, &str)]) -> Vec<u8> {
         ffmpeg_next::init().unwrap();
 
         let input_bytes = generate_test_video_bytes(64, 64, 25, 2);
@@ -226,10 +230,10 @@ mod tests {
                 .into_iter()
                 .collect::<Dictionary<'static>>(),
         );
-        octx.add_chapter(1, Rational::new(1, 1000), 0, 1000, "Intro")
-            .expect("failed to add intro chapter");
-        octx.add_chapter(2, Rational::new(1, 1000), 1000, 2000, "Main")
-            .expect("failed to add main chapter");
+        for (id, start, end, title) in chapters {
+            octx.add_chapter(*id, Rational::new(1, 1000), *start, *end, title)
+                .expect("failed to add chapter");
+        }
 
         octx.write_header()
             .expect("failed to write metadata fixture header");
@@ -319,6 +323,22 @@ mod tests {
         assert!(
             (second_start - 1.0).abs() < 1e-6,
             "expected second chapter to start at 1 second"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn test_timestamp_seconds_nopts_is_none() {
+        assert_eq!(
+            timestamp_seconds(
+                ffmpeg_next::ffi::AV_NOPTS_VALUE,
+                ffmpeg_next::Rational::new(1, 1000)
+            ),
+            None
         );
     }
 }
