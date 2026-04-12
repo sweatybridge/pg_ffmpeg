@@ -32,7 +32,7 @@ fn extract_frames(
         keyframes_only,
         max_frames as usize,
     );
-    TableIterator::new(rows.into_iter())
+    TableIterator::new(rows)
 }
 
 fn validate_extract_frames_args(interval: f64, format: &str, max_frames: i32) {

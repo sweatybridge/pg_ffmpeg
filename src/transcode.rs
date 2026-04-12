@@ -49,7 +49,7 @@ struct AudioTranscodePipeline {
 
 #[allow(clippy::too_many_arguments)]
 #[pg_extern]
-fn transcode(
+pub(crate) fn transcode(
     data: Vec<u8>,
     format: default!(Option<&str>, "NULL"),
     filter: default!(Option<&str>, "NULL"),
@@ -1004,7 +1004,7 @@ mod tests {
             packet.set_stream(0);
             packet.rescale_ts((1, 1), out_time_base);
             packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .expect("failed to write packet");
         }
 

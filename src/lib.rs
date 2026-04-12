@@ -71,8 +71,7 @@ mod tests {
 
     #[pg_test]
     fn test_extension_loads() {
-        // Extension loaded successfully if we get here
-        assert!(true);
+        // Extension loaded successfully if we get here.
     }
 }
 
