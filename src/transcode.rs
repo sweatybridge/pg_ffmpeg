@@ -41,7 +41,6 @@ struct AudioTranscodePipeline {
     ost_index: usize,
     decoder: ffmpeg_next::decoder::Audio,
     encoder: ffmpeg_next::encoder::Audio,
-    encoder_time_base: Rational,
     graph: filter::Graph,
 }
 
@@ -315,7 +314,6 @@ impl VideoTranscodePipeline {
             ost_index,
             decoder,
             encoder,
-            encoder_time_base,
             graph,
         }
     }
