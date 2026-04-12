@@ -61,7 +61,7 @@ fn collect_frame_rows(
         .best(Type::Video)
         .unwrap_or_else(|| error!("no video stream found"));
     let video_stream_index = input.index();
-    let time_base = input.time_base();
+    let stream_time_base = input.time_base();
 
     let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
         .unwrap_or_else(|e| error!("failed to create decoder context: {e}"));
@@ -69,7 +69,8 @@ fn collect_frame_rows(
         .decoder()
         .video()
         .unwrap_or_else(|e| error!("failed to open video decoder: {e}"));
-    decoder.set_packet_time_base(time_base);
+    decoder.set_packet_time_base(stream_time_base);
+    let time_base = decoder.time_base();
 
     let mut scaler = ScaleContext::get(
         decoder.format(),
@@ -159,7 +160,7 @@ fn drain_decoded_frames(
         rows.push((timestamp, thumbnail::encode_frame(&rgb_frame, format)));
 
         if !keyframes_only {
-            *next_threshold = timestamp + interval;
+            advance_threshold_past_timestamp(next_threshold, interval, timestamp);
         }
     }
 }
@@ -169,25 +170,16 @@ fn should_emit_frame(timestamp: f64, keyframes_only: bool, next_threshold: f64) 
 }
 
 fn frame_timestamp_seconds(frame: &Video, time_base: Rational) -> f64 {
-    let packet = frame.packet();
     let pts = frame
         .pts()
         .or_else(|| frame.timestamp())
-        .or_else(|| non_nopts_timestamp(packet.dts))
         .unwrap_or_else(|| error!("pg_ffmpeg: decoded frame is missing PTS"));
-    let scaled_pts = scale_timestamp_units(pts, packet.duration);
-    timestamp_seconds(scaled_pts, time_base)
+    timestamp_seconds(pts, time_base)
 }
 
-fn non_nopts_timestamp(timestamp: i64) -> Option<i64> {
-    (timestamp != ffmpeg_next::ffi::AV_NOPTS_VALUE).then_some(timestamp)
-}
-
-fn scale_timestamp_units(timestamp: i64, duration: i64) -> i64 {
-    if duration > 1 && timestamp.unsigned_abs() < duration as u64 {
-        timestamp.saturating_mul(duration)
-    } else {
-        timestamp
+fn advance_threshold_past_timestamp(next_threshold: &mut f64, interval: f64, timestamp: f64) {
+    while *next_threshold <= timestamp {
+        *next_threshold += interval;
     }
 }
 
@@ -222,34 +214,31 @@ mod tests {
 
     #[pg_test]
     fn test_extract_frames_interval() {
-        let data = generate_test_video_bytes(64, 64, 10, 4);
-        let rows = collect_frame_rows(&data, 1.0, "png", false, 1000);
-        let timestamps = rows
-            .iter()
-            .map(|(timestamp, _)| *timestamp)
-            .collect::<Vec<_>>();
+        let mut next_threshold = 0.0;
+        let mut emitted = Vec::new();
+
+        for timestamp in [0.0, 0.9, 1.033, 2.0, 2.1, 3.05] {
+            if should_emit_frame(timestamp, false, next_threshold) {
+                emitted.push(timestamp);
+                advance_threshold_past_timestamp(&mut next_threshold, 1.0, timestamp);
+            }
+        }
 
         assert_eq!(
-            timestamps.len(),
-            4,
-            "interval=1.0 should emit one frame per second"
+            emitted,
+            vec![0.0, 1.033, 2.0, 3.05],
+            "interval mode should snap to the first decoded frame at or after each fixed threshold"
         );
         assert!(
-            timestamps[0] >= 0.0,
-            "timestamps should be stream-relative seconds"
+            (next_threshold - 4.0).abs() < 1e-9,
+            "thresholds should advance on the fixed N * interval schedule without drift"
         );
-        for pair in timestamps.windows(2) {
-            assert!(
-                ((pair[1] - pair[0]) - 1.0).abs() < 1e-9,
-                "successive emitted frames should be spaced by the interval"
-            );
-        }
     }
 
     #[pg_test]
     fn test_extract_frames_max_frames_limit() {
         let data = generate_test_video_bytes(64, 64, 10, 4);
-        let result = std::panic::catch_unwind(|| collect_frame_rows(&data, 1.0, "png", false, 3));
+        let result = std::panic::catch_unwind(|| collect_frame_rows(&data, 1.0, "png", true, 3));
 
         assert!(
             result.is_err(),
@@ -264,6 +253,21 @@ mod tests {
             std::panic::catch_unwind(|| extract_frames(data, 0.0, "png".to_string(), false, 1000));
 
         assert!(result.is_err(), "non-positive interval should error");
+    }
+
+    #[pg_test]
+    fn test_frame_timestamp_seconds_uses_frame_pts_directly() {
+        let mut frame = Video::empty();
+        unsafe {
+            (*frame.as_mut_ptr()).pts = 1;
+            (*frame.as_mut_ptr()).best_effort_timestamp = 2;
+        }
+
+        let timestamp = frame_timestamp_seconds(&frame, Rational(1, 90000));
+        assert!(
+            (timestamp - (1.0 / 90000.0)).abs() < 1e-12,
+            "frame timestamps should use frame PTS directly without packet-duration scaling"
+        );
     }
 
     #[pg_test]
