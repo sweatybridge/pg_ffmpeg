@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 
 mod codec_lookup;
 mod extract_audio;
+mod extract_frames;
 mod filter_safety;
 mod hls;
 mod hwaccel;
@@ -71,8 +72,7 @@ mod tests {
 
     #[pg_test]
     fn test_extension_loads() {
-        // Extension loaded successfully if we get here
-        assert!(true);
+        // Extension loaded successfully if we get here.
     }
 }
 
