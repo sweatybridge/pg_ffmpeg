@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 
 mod codec_lookup;
 mod extract_audio;
+mod extract_frames;
 mod filter_safety;
 mod hls;
 mod hwaccel;
@@ -15,6 +16,7 @@ mod pipeline;
 mod test_utils;
 mod thumbnail;
 mod transcode;
+mod trim;
 
 /// Postgres `_PG_init` entrypoint. Postgres calls this once per backend
 /// when the shared library is first loaded. We use it to register the
@@ -70,8 +72,7 @@ mod tests {
 
     #[pg_test]
     fn test_extension_loads() {
-        // Extension loaded successfully if we get here
-        assert!(true);
+        // Extension loaded successfully if we get here.
     }
 }
 

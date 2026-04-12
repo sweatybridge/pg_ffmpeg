@@ -175,7 +175,7 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
             packet.set_stream(0);
             packet.rescale_ts((1, fps), out_time_base);
             packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .expect("failed to write packet");
         }
     }
@@ -185,7 +185,7 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
         packet.set_stream(0);
         packet.rescale_ts((1, fps), out_time_base);
         packet
-            .write_interleaved(&mut *octx)
+            .write_interleaved(&mut octx)
             .expect("failed to write packet");
     }
 
@@ -315,7 +315,7 @@ pub fn generate_test_video_with_audio_bytes(
             video_packet.set_stream(0);
             video_packet.rescale_ts((1, fps), video_out_time_base);
             video_packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .expect("failed to write video packet");
         }
     }
@@ -325,7 +325,7 @@ pub fn generate_test_video_with_audio_bytes(
         video_packet.set_stream(0);
         video_packet.rescale_ts((1, fps), video_out_time_base);
         video_packet
-            .write_interleaved(&mut *octx)
+            .write_interleaved(&mut octx)
             .expect("failed to flush video packet");
     }
 
@@ -364,7 +364,7 @@ pub fn generate_test_video_with_audio_bytes(
             audio_packet.set_stream(1);
             audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
             audio_packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .expect("failed to write audio packet");
         }
         next_audio_pts += samples_per_frame;
@@ -375,7 +375,7 @@ pub fn generate_test_video_with_audio_bytes(
         audio_packet.set_stream(1);
         audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
         audio_packet
-            .write_interleaved(&mut *octx)
+            .write_interleaved(&mut octx)
             .expect("failed to flush audio packet");
     }
 
@@ -554,7 +554,7 @@ pub fn generate_test_image_bytes(format: &str, width: u32, height: u32) -> Vec<u
         packet.set_stream(0);
         packet.rescale_ts((1, 1), out_time_base);
         packet
-            .write_interleaved(&mut *octx)
+            .write_interleaved(&mut octx)
             .expect("failed to write packet");
     }
 
