@@ -515,35 +515,24 @@ impl AudioTranscodePipeline {
             .frame(&mut filtered)
             .is_ok()
         {
-            let mut encoded_frame = frame::Audio::new(
-                self.encoder.format(),
-                filtered.samples(),
-                self.encoder.channel_layout(),
-            );
-            encoded_frame.set_channel_layout(self.encoder.channel_layout());
-            encoded_frame.set_channels(
+            filtered.set_channel_layout(self.encoder.channel_layout());
+            filtered.set_channels(
                 u16::try_from(self.encoder.channel_layout().channels())
                     .expect("audio channel count should fit into u16"),
             );
-            encoded_frame.set_samples(filtered.samples());
-            encoded_frame.set_rate(self.encoder.rate());
+            filtered.set_rate(self.encoder.rate());
             let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
-            encoded_frame.set_pts(Some(timestamp));
+            filtered.set_pts(Some(timestamp));
             self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
-            for plane in 0..filtered.planes() {
-                encoded_frame
-                    .data_mut(plane)
-                    .copy_from_slice(filtered.data(plane));
-            }
-            self.encoder.send_frame(&encoded_frame).unwrap_or_else(|e| {
+            self.encoder.send_frame(&filtered).unwrap_or_else(|e| {
                 error!(
                     "audio encode error: {e} (frame: pts={:?} samples={} rate={} channels={} layout=0x{:x} format={:?}; encoder: frame_size={} rate={} channels={} layout=0x{:x} format={:?} time_base={}/{})",
-                    encoded_frame.timestamp(),
-                    encoded_frame.samples(),
-                    encoded_frame.rate(),
-                    encoded_frame.channels(),
-                    encoded_frame.channel_layout().bits(),
-                    encoded_frame.format(),
+                    filtered.timestamp(),
+                    filtered.samples(),
+                    filtered.rate(),
+                    filtered.channels(),
+                    filtered.channel_layout().bits(),
+                    filtered.format(),
                     self.encoder.frame_size(),
                     self.encoder.rate(),
                     self.encoder.channels(),
