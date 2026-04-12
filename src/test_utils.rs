@@ -344,7 +344,10 @@ pub fn generate_test_video_with_audio_bytes(
         let mut frame =
             AudioFrame::new(audio_sample_format, samples_per_frame, audio_channel_layout);
         frame.set_channel_layout(audio_channel_layout);
-        frame.set_channels(audio_channel_layout.channels());
+        frame.set_channels(
+            u16::try_from(audio_channel_layout.channels())
+                .expect("audio channel count should fit into u16"),
+        );
         frame.set_samples(samples_per_frame);
         frame.set_rate(audio_sample_rate);
         frame.set_pts(Some(next_audio_pts as i64));
