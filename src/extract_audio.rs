@@ -194,7 +194,7 @@ fn reencode_audio(
     let decoder = {
         let ist = ictx.stream(audio_stream_index).unwrap();
         let params = ist.parameters();
-        let decoder_ctx = codec::context::Context::from_parameters(params)
+        let decoder_ctx = codec::context::Context::from_parameters(params.clone())
             .unwrap_or_else(|e| error!("failed to create audio decoder context: {e}"));
         let mut decoder = decoder_ctx
             .decoder()
