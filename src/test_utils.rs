@@ -193,7 +193,7 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
     octx.into_data()
 }
 
-/// Generate a minimal MPEG-TS asset with one video stream and one AAC
+/// Generate a minimal MPEG-TS asset with one video stream and one MP2
 /// audio stream.
 pub fn generate_test_video_with_audio_bytes(
     width: u32,
@@ -206,7 +206,7 @@ pub fn generate_test_video_with_audio_bytes(
     let total_frames = fps * duration_secs;
     let video_codec =
         ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
-    let audio_codec = ffmpeg_next::encoder::find(codec::Id::AAC).expect("AAC encoder not found");
+    let audio_codec = ffmpeg_next::encoder::find(codec::Id::MP2).expect("MP2 encoder not found");
 
     let mut octx = MemOutput::open("mpegts");
     let global_header = octx
@@ -249,7 +249,7 @@ pub fn generate_test_video_with_audio_bytes(
         .expect("failed to add audio stream");
     let audio_props = audio_codec
         .audio()
-        .expect("AAC codec is not an audio encoder");
+        .expect("MP2 codec is not an audio encoder");
     let sample_rate = audio_props
         .rates()
         .and_then(|mut rates| rates.next())
@@ -272,6 +272,7 @@ pub fn generate_test_video_with_audio_bytes(
         .expect("failed to create audio encoder");
     audio_encoder.set_rate(sample_rate);
     audio_encoder.set_channel_layout(channel_layout);
+    audio_encoder.set_channels(channel_layout.channels());
     audio_encoder.set_format(sample_format);
     audio_encoder.set_bit_rate(128_000);
     audio_encoder.set_time_base((1, sample_rate));
@@ -282,7 +283,11 @@ pub fn generate_test_video_with_audio_bytes(
     let mut audio_encoder = audio_encoder
         .open_as(audio_codec)
         .expect("failed to open audio encoder");
+    let audio_sample_rate = audio_encoder.rate();
+    let audio_channel_layout = audio_encoder.channel_layout();
+    let audio_sample_format = audio_encoder.format();
     let audio_out_time_base = {
+        audio_stream.set_time_base((1, audio_sample_rate as i32));
         audio_stream.set_parameters(&audio_encoder);
         audio_stream.time_base()
     };
@@ -329,15 +334,22 @@ pub fn generate_test_video_with_audio_bytes(
     if samples_per_frame == 0 {
         samples_per_frame = 1024;
     }
-    let total_audio_samples = (duration_secs as usize).saturating_mul(sample_rate as usize)
+    let total_audio_samples = (duration_secs as usize).saturating_mul(audio_sample_rate as usize)
         / samples_per_frame
         * samples_per_frame;
     let total_audio_samples = total_audio_samples.max(samples_per_frame);
 
     let mut next_audio_pts = 0usize;
     while next_audio_pts < total_audio_samples {
-        let mut frame = AudioFrame::new(sample_format, samples_per_frame, channel_layout);
-        frame.set_rate(sample_rate as u32);
+        let mut frame =
+            AudioFrame::new(audio_sample_format, samples_per_frame, audio_channel_layout);
+        frame.set_channel_layout(audio_channel_layout);
+        frame.set_channels(
+            u16::try_from(audio_channel_layout.channels())
+                .expect("audio channel count should fit into u16"),
+        );
+        frame.set_samples(samples_per_frame);
+        frame.set_rate(audio_sample_rate);
         frame.set_pts(Some(next_audio_pts as i64));
         for plane in 0..frame.planes() {
             for byte in frame.data_mut(plane).iter_mut() {
@@ -350,7 +362,7 @@ pub fn generate_test_video_with_audio_bytes(
             .expect("failed to send audio frame");
         while audio_encoder.receive_packet(&mut audio_packet).is_ok() {
             audio_packet.set_stream(1);
-            audio_packet.rescale_ts((1, sample_rate), audio_out_time_base);
+            audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
             audio_packet
                 .write_interleaved(&mut *octx)
                 .expect("failed to write audio packet");
@@ -361,7 +373,7 @@ pub fn generate_test_video_with_audio_bytes(
     audio_encoder.send_eof().expect("failed to send audio eof");
     while audio_encoder.receive_packet(&mut audio_packet).is_ok() {
         audio_packet.set_stream(1);
-        audio_packet.rescale_ts((1, sample_rate), audio_out_time_base);
+        audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
         audio_packet
             .write_interleaved(&mut *octx)
             .expect("failed to flush audio packet");
