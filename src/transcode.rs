@@ -423,7 +423,6 @@ impl AudioTranscodePipeline {
         let sample_rate = resolve_audio_sample_rate(&decoder, &audio_props);
         let channel_layout = resolve_audio_channel_layout(&decoder, &audio_props);
         let sample_format = resolve_audio_sample_format(&decoder, &audio_props);
-        let encoder_time_base = Rational::new(1, sample_rate as i32);
 
         let encoder = open_audio_encoder(
             octx,
@@ -433,9 +432,10 @@ impl AudioTranscodePipeline {
             sample_rate,
             channel_layout,
             sample_format,
-            encoder_time_base,
+            Rational::new(1, sample_rate as i32),
             config,
         );
+        let encoder_time_base = encoder.time_base();
         let graph = build_audio_filter_graph(&decoder, &encoder, config.filter_spec);
 
         let mut ost = octx
@@ -767,11 +767,12 @@ fn build_audio_filter_graph(
     } else {
         ChannelLayout::STEREO
     };
+    let sample_time_base = Rational::new(1, decoder.rate() as i32);
     let sample_fmt = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
-        decoder.time_base().numerator(),
-        decoder.time_base().denominator(),
+        sample_time_base.numerator(),
+        sample_time_base.denominator(),
         decoder.rate(),
         sample_fmt,
         decoder_layout.bits(),
