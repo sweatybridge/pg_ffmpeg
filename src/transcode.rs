@@ -1111,7 +1111,7 @@ mod tests {
             None,
             None,
             None,
-            Some("libmp3lame"),
+            Some("aac"),
             None,
             Some(96_000),
             false,
@@ -1123,7 +1123,7 @@ mod tests {
             .streams()
             .best(Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), codec::Id::MP3);
+        assert_eq!(audio.parameters().id(), codec::Id::AAC);
     }
 
     #[pg_test]
