@@ -309,6 +309,9 @@ impl VideoTranscodePipeline {
             .unwrap_or_else(|e| error!("failed to add video output stream: {e}"));
         ost.set_time_base(encoder_time_base);
         ost.set_parameters(&encoder);
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
 
         Self {
             ost_index,
@@ -442,6 +445,9 @@ impl AudioTranscodePipeline {
             .unwrap_or_else(|e| error!("failed to add audio output stream: {e}"));
         ost.set_time_base(encoder_time_base);
         ost.set_parameters(&encoder);
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
 
         Self {
             ost_index,
@@ -760,11 +766,7 @@ fn build_audio_filter_graph(
     spec: &str,
 ) -> filter::Graph {
     let mut graph = filter::Graph::new();
-    let decoder_layout = if decoder.channel_layout().bits() != 0 {
-        decoder.channel_layout()
-    } else {
-        ChannelLayout::STEREO
-    };
+    let decoder_layout = decoder_channel_layout(decoder);
     let sample_fmt = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
@@ -834,16 +836,22 @@ fn resolve_audio_channel_layout(
     decoder: &ffmpeg_next::decoder::Audio,
     codec: &ffmpeg_next::codec::audio::Audio,
 ) -> ChannelLayout {
+    let decoder_layout = decoder_channel_layout(decoder);
+    let decoder_channels = decoder.channels() as i32;
     codec
         .channel_layouts()
-        .map(|layouts| layouts.best(decoder.channel_layout().channels()))
-        .unwrap_or_else(|| {
-            if decoder.channel_layout().bits() != 0 {
-                decoder.channel_layout()
-            } else {
-                ChannelLayout::STEREO
-            }
-        })
+        .map(|layouts| layouts.best(decoder_channels))
+        .unwrap_or(decoder_layout)
+}
+
+fn decoder_channel_layout(decoder: &ffmpeg_next::decoder::Audio) -> ChannelLayout {
+    if decoder.channel_layout().bits() != 0 {
+        decoder.channel_layout()
+    } else if decoder.channels() > 0 {
+        ChannelLayout::default(decoder.channels() as i32)
+    } else {
+        ChannelLayout::STEREO
+    }
 }
 
 fn resolve_audio_sample_format(
@@ -1103,9 +1111,9 @@ mod tests {
             None,
             None,
             None,
-            Some("pcm_s16le"),
+            Some("libmp3lame"),
             None,
-            None,
+            Some(96_000),
             false,
         );
         assert!(!result.is_empty());
@@ -1115,7 +1123,7 @@ mod tests {
             .streams()
             .best(Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), codec::Id::PCM_S16LE);
+        assert_eq!(audio.parameters().id(), codec::Id::MP3);
     }
 
     #[pg_test]
@@ -1123,9 +1131,9 @@ mod tests {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
             data,
-            Some("matroska"),
+            Some("mpegts"),
             None,
-            Some("libx264"),
+            Some("mpeg2video"),
             None,
             None,
             None,
@@ -1135,6 +1143,13 @@ mod tests {
             true,
         );
         assert!(!result.is_empty());
+
+        let probe = MemInput::open(&result);
+        let video = probe
+            .streams()
+            .best(Type::Video)
+            .expect("no video stream in output");
+        assert_eq!(video.parameters().id(), codec::Id::MPEG2VIDEO);
     }
 
     #[pg_test]
