@@ -1118,10 +1118,7 @@ mod tests {
             .streams()
             .best(Type::Audio)
             .expect("no audio stream in output");
-        let params = audio.parameters();
-        let ctx = ffmpeg_next::codec::context::Context::from_parameters(params).unwrap();
-        let dec = ctx.decoder().audio().unwrap();
-        assert_eq!(dec.id(), codec::Id::MP3);
+        assert_eq!(audio.parameters().id(), codec::Id::MP3);
     }
 
     #[pg_test]
