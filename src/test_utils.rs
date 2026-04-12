@@ -338,6 +338,9 @@ pub fn generate_test_video_with_audio_bytes(
     let mut next_audio_pts = 0usize;
     while next_audio_pts < total_audio_samples {
         let mut frame = AudioFrame::new(sample_format, samples_per_frame, channel_layout);
+        frame.set_channel_layout(channel_layout);
+        frame.set_channels(channel_layout.channels());
+        frame.set_samples(samples_per_frame);
         frame.set_rate(sample_rate as u32);
         frame.set_pts(Some(next_audio_pts as i64));
         for plane in 0..frame.planes() {
