@@ -265,7 +265,11 @@ fn reencode_audio(
 
         for (stream, mut packet) in ictx.packets() {
             if stream.index() == audio_stream_index {
-                normalize_audio_packet_duration(&mut packet, stream.time_base(), pipe.decoder.time_base());
+                normalize_audio_packet_duration(
+                    &mut packet,
+                    stream.time_base(),
+                    pipe.decoder.time_base(),
+                );
                 pipe.send_packet(&packet);
                 pipe.process_decoded_frames(&mut octx, ost_time_base);
             }
@@ -286,7 +290,11 @@ fn reencode_audio(
 
         for (stream, mut packet) in ictx.packets() {
             if stream.index() == audio_stream_index {
-                normalize_audio_packet_duration(&mut packet, stream.time_base(), pipe.decoder.time_base());
+                normalize_audio_packet_duration(
+                    &mut packet,
+                    stream.time_base(),
+                    pipe.decoder.time_base(),
+                );
                 pipe.send_packet(&packet);
                 pipe.process_decoded_frames(&mut octx, ost_time_base);
             }
@@ -671,7 +679,11 @@ fn open_resampler(
     .unwrap_or_else(|e| error!("failed to create audio resampler: {e}"))
 }
 
-fn normalize_audio_packet_duration(packet: &mut Packet, src_time_base: Rational, dst_time_base: Rational) {
+fn normalize_audio_packet_duration(
+    packet: &mut Packet,
+    src_time_base: Rational,
+    dst_time_base: Rational,
+) {
     if packet.duration() > 0 {
         packet.set_duration(packet.duration().rescale(src_time_base, dst_time_base));
     }
@@ -721,9 +733,7 @@ fn audio_frame_time_base(decoder: &ffmpeg_next::decoder::Audio) -> Rational {
 mod tests {
     use super::*;
     use crate::test_utils::{generate_test_aac_adts_bytes, generate_test_video_with_audio_bytes};
-    use serial_test::serial;
 
-    #[serial]
     #[pg_test]
     fn test_extract_audio_copy_aac_auto_adts() {
         let data = generate_test_aac_adts_bytes(1);
@@ -738,10 +748,9 @@ mod tests {
         assert_eq!(audio.parameters().id(), CodecId::AAC);
     }
 
-    #[serial]
     #[pg_test]
-    fn test_extract_audio_copy_aac_rejects_mp3_container() {
-        // AAC source with an incompatible container rejects stream-copy and
+    fn test_extract_audio_copy_aac_rejects_wav_container_stream_copy() {
+        // AAC source with an incompatible WAV container rejects stream-copy and
         // falls through to re-encode via the default encoder for that format.
         let data = generate_test_aac_adts_bytes(1);
         let result = extract_audio(data, Some("wav"), None, None, None, None, None);
@@ -755,10 +764,9 @@ mod tests {
         assert_eq!(audio.parameters().id(), CodecId::PCM_S16LE);
     }
 
-    #[serial]
     #[pg_test]
-    fn test_extract_audio_reencode_to_mp3() {
-        // MP2 source explicitly re-encoded to FLAC.
+    fn test_extract_audio_reencode_to_wav_pcm() {
+        // MP2 source explicitly re-encoded to PCM audio in a WAV container.
         let data = generate_test_video_with_audio_bytes(64, 64, 10, 1);
         let result = extract_audio(data, Some("wav"), Some("pcm_s16le"), None, None, None, None);
         assert!(!result.is_empty());
@@ -771,7 +779,6 @@ mod tests {
         assert_eq!(audio.parameters().id(), CodecId::PCM_S16LE);
     }
 
-    #[serial]
     #[pg_test]
     fn test_extract_audio_with_filter() {
         let data = generate_test_aac_adts_bytes(1);
@@ -793,7 +800,6 @@ mod tests {
             .is_some());
     }
 
-    #[serial]
     #[pg_test]
     #[should_panic(expected = "always denied")]
     fn test_extract_audio_rejects_unsafe_filter() {
@@ -801,7 +807,6 @@ mod tests {
         extract_audio(data, None, None, None, None, None, Some("movie=foo.mp4"));
     }
 
-    #[serial]
     #[pg_test]
     #[should_panic(expected = "cannot infer default audio codec for format")]
     fn test_extract_audio_unknown_format_errors() {
