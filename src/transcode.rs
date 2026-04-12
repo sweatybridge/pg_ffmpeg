@@ -1106,9 +1106,9 @@ mod tests {
             None,
             None,
             None,
-            Some("libmp3lame"),
+            Some("flac"),
             None,
-            Some(96_000),
+            None,
             false,
         );
         assert!(!result.is_empty());
@@ -1118,7 +1118,7 @@ mod tests {
             .streams()
             .best(Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), codec::Id::MP3);
+        assert_eq!(audio.parameters().id(), codec::Id::FLAC);
     }
 
     #[pg_test]
