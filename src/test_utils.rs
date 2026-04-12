@@ -119,6 +119,27 @@ pub fn assert_large_allocs_at_most<T>(n: usize, f: impl FnOnce() -> T) -> T {
     result
 }
 
+fn alloc_audio_frame(
+    format: Sample,
+    samples: usize,
+    channel_layout: ffmpeg_next::ChannelLayout,
+    rate: u32,
+) -> AudioFrame {
+    let mut frame = AudioFrame::new(format, samples, channel_layout);
+    frame.set_rate(rate);
+    set_audio_frame_channels(&mut frame, channel_layout);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(0);
+    }
+    frame
+}
+
+#[allow(unexpected_cfgs)]
+fn set_audio_frame_channels(frame: &mut AudioFrame, channel_layout: ffmpeg_next::ChannelLayout) {
+    #[cfg(not(feature = "ffmpeg_7_0"))]
+    frame.set_channels(channel_layout.channels() as u16);
+}
+
 /// Generate a minimal MPEG-TS video (video stream only) in memory.
 ///
 /// All-intra encoding: every frame is a keyframe so seeks land exactly
@@ -341,21 +362,13 @@ pub fn generate_test_video_with_audio_bytes(
 
     let mut next_audio_pts = 0usize;
     while next_audio_pts < total_audio_samples {
-        let mut frame =
-            AudioFrame::new(audio_sample_format, samples_per_frame, audio_channel_layout);
-        frame.set_channel_layout(audio_channel_layout);
-        frame.set_channels(
-            u16::try_from(audio_channel_layout.channels())
-                .expect("audio channel count should fit into u16"),
+        let mut frame = alloc_audio_frame(
+            audio_sample_format,
+            samples_per_frame,
+            audio_channel_layout,
+            audio_sample_rate,
         );
-        frame.set_samples(samples_per_frame);
-        frame.set_rate(audio_sample_rate);
         frame.set_pts(Some(next_audio_pts as i64));
-        for plane in 0..frame.planes() {
-            for byte in frame.data_mut(plane).iter_mut() {
-                *byte = 0;
-            }
-        }
 
         audio_encoder
             .send_frame(&frame)
@@ -460,21 +473,13 @@ pub fn generate_test_aac_adts_bytes(duration_secs: i32) -> Vec<u8> {
 
     let mut next_audio_pts = 0usize;
     while next_audio_pts < total_audio_samples {
-        let mut frame =
-            AudioFrame::new(audio_sample_format, samples_per_frame, audio_channel_layout);
-        frame.set_channel_layout(audio_channel_layout);
-        frame.set_channels(
-            u16::try_from(audio_channel_layout.channels())
-                .expect("audio channel count should fit into u16"),
+        let mut frame = alloc_audio_frame(
+            audio_sample_format,
+            samples_per_frame,
+            audio_channel_layout,
+            audio_sample_rate,
         );
-        frame.set_samples(samples_per_frame);
-        frame.set_rate(audio_sample_rate);
         frame.set_pts(Some(next_audio_pts as i64));
-        for plane in 0..frame.planes() {
-            for byte in frame.data_mut(plane).iter_mut() {
-                *byte = 0;
-            }
-        }
 
         audio_encoder
             .send_frame(&frame)
