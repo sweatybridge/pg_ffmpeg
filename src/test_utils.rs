@@ -193,7 +193,7 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
     octx.into_data()
 }
 
-/// Generate a minimal MPEG-TS asset with one video stream and one AAC
+/// Generate a minimal MPEG-TS asset with one video stream and one MP2
 /// audio stream.
 pub fn generate_test_video_with_audio_bytes(
     width: u32,
@@ -206,7 +206,7 @@ pub fn generate_test_video_with_audio_bytes(
     let total_frames = fps * duration_secs;
     let video_codec =
         ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
-    let audio_codec = ffmpeg_next::encoder::find(codec::Id::AAC).expect("AAC encoder not found");
+    let audio_codec = ffmpeg_next::encoder::find(codec::Id::MP2).expect("MP2 encoder not found");
 
     let mut octx = MemOutput::open("mpegts");
     let global_header = octx
@@ -249,7 +249,7 @@ pub fn generate_test_video_with_audio_bytes(
         .expect("failed to add audio stream");
     let audio_props = audio_codec
         .audio()
-        .expect("AAC codec is not an audio encoder");
+        .expect("MP2 codec is not an audio encoder");
     let sample_rate = audio_props
         .rates()
         .and_then(|mut rates| rates.next())
