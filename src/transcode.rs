@@ -509,6 +509,12 @@ impl AudioTranscodePipeline {
             .frame(&mut filtered)
             .is_ok()
         {
+            filtered.set_channel_layout(self.encoder.channel_layout());
+            filtered.set_channels(
+                u16::try_from(self.encoder.channel_layout().channels())
+                    .expect("audio channel count should fit into u16"),
+            );
+            filtered.set_rate(self.encoder.rate());
             self.encoder
                 .send_frame(&filtered)
                 .unwrap_or_else(|e| error!("audio encode error: {e}"));
