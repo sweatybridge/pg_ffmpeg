@@ -322,8 +322,6 @@ impl VideoTranscodePipeline {
             encoder,
             encoder_time_base,
             graph,
-            next_decoded_pts: 0,
-            next_encoded_pts: 0,
         }
     }
 
@@ -460,6 +458,8 @@ impl AudioTranscodePipeline {
             encoder,
             encoder_time_base,
             graph,
+            next_decoded_pts: 0,
+            next_encoded_pts: 0,
         }
     }
 
