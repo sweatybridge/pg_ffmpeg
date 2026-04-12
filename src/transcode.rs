@@ -523,7 +523,7 @@ impl AudioTranscodePipeline {
         let mut encoded = Packet::empty();
         while self.encoder.receive_packet(&mut encoded).is_ok() {
             encoded.set_stream(self.ost_index);
-            encoded.rescale_ts(self.encoder_time_base, ost_time_base);
+            encoded.rescale_ts(self.decoder.time_base(), ost_time_base);
             encoded.set_position(-1);
             encoded
                 .write_interleaved(octx)
@@ -767,12 +767,11 @@ fn build_audio_filter_graph(
     } else {
         ChannelLayout::STEREO
     };
-    let sample_time_base = Rational::new(1, decoder.rate() as i32);
     let sample_fmt = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
-        sample_time_base.numerator(),
-        sample_time_base.denominator(),
+        decoder.time_base().numerator(),
+        decoder.time_base().denominator(),
         decoder.rate(),
         sample_fmt,
         decoder_layout.bits(),
