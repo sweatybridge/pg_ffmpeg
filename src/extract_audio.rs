@@ -193,15 +193,14 @@ fn reencode_audio(
     // Scope the stream borrow so ictx can be used for packets later.
     let decoder = {
         let ist = ictx.stream(audio_stream_index).unwrap();
-        let params = ist.parameters();
-        let decoder_ctx = codec::context::Context::from_parameters(params)
+        let decoder_ctx = codec::context::Context::from_parameters(ist.parameters())
             .unwrap_or_else(|e| error!("failed to create audio decoder context: {e}"));
         let mut decoder = decoder_ctx
             .decoder()
             .audio()
             .unwrap_or_else(|e| error!("failed to open audio decoder: {e}"));
         decoder
-            .set_parameters(params)
+            .set_parameters(ist.parameters())
             .unwrap_or_else(|e| error!("failed to set audio decoder parameters: {e}"));
         decoder
     };
@@ -223,7 +222,7 @@ fn reencode_audio(
     let out_sample_format = resolve_sample_format(&decoder, &audio_props);
 
     let mut octx = MemOutput::open(out_format);
-    let encoder_time_base = Rational::new(1, out_sample_rate as i32);
+    let requested_encoder_time_base = Rational::new(1, out_sample_rate as i32);
 
     let encoder = open_encoder(
         &octx,
@@ -233,9 +232,10 @@ fn reencode_audio(
         out_sample_rate,
         out_channel_layout,
         out_sample_format,
-        encoder_time_base,
+        requested_encoder_time_base,
         bitrate,
     );
+    let encoder_time_base = encoder.time_base();
 
     let graph = build_filter_graph(&decoder, &encoder, filter_spec);
 
@@ -275,6 +275,7 @@ fn reencode_audio(
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
+    drop(pipe);
     octx.into_data()
 }
 
@@ -310,6 +311,7 @@ impl ReencodePipeline {
                 .timestamp()
                 .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
                 .unwrap_or(self.next_decoded_pts);
+            let timestamp = timestamp.max(self.next_decoded_pts);
             decoded.set_pts(Some(timestamp));
             self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
             self.graph
@@ -336,13 +338,8 @@ impl ReencodePipeline {
             .frame(&mut filtered)
             .is_ok()
         {
-            filtered.set_channel_layout(self.encoder.channel_layout());
-            filtered.set_channels(
-                u16::try_from(self.encoder.channel_layout().channels())
-                    .expect("audio channel count should fit into u16"),
-            );
-            filtered.set_rate(self.encoder.rate());
             let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
+            let timestamp = timestamp.max(self.next_encoded_pts);
             filtered.set_pts(Some(timestamp));
             self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
             self.encoder

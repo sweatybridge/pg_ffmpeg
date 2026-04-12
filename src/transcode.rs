@@ -234,6 +234,8 @@ fn transcode(
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
+    drop(video_pipelines);
+    drop(audio_pipelines);
     octx.into_data()
 }
 
@@ -489,6 +491,7 @@ impl AudioTranscodePipeline {
                 .timestamp()
                 .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
                 .unwrap_or(self.next_decoded_pts);
+            let timestamp = timestamp.max(self.next_decoded_pts);
             decoded.set_pts(Some(timestamp));
             self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
             self.graph
@@ -515,13 +518,8 @@ impl AudioTranscodePipeline {
             .frame(&mut filtered)
             .is_ok()
         {
-            filtered.set_channel_layout(self.encoder.channel_layout());
-            filtered.set_channels(
-                u16::try_from(self.encoder.channel_layout().channels())
-                    .expect("audio channel count should fit into u16"),
-            );
-            filtered.set_rate(self.encoder.rate());
             let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
+            let timestamp = timestamp.max(self.next_encoded_pts);
             filtered.set_pts(Some(timestamp));
             self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
             self.encoder.send_frame(&filtered).unwrap_or_else(|e| {
