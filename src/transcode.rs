@@ -515,9 +515,24 @@ impl AudioTranscodePipeline {
                     .expect("audio channel count should fit into u16"),
             );
             filtered.set_rate(self.encoder.rate());
-            self.encoder
-                .send_frame(&filtered)
-                .unwrap_or_else(|e| error!("audio encode error: {e}"));
+            self.encoder.send_frame(&filtered).unwrap_or_else(|e| {
+                error!(
+                    "audio encode error: {e} (frame: pts={:?} samples={} rate={} channels={} layout=0x{:x} format={:?}; encoder: frame_size={} rate={} channels={} layout=0x{:x} format={:?} time_base={}/{})",
+                    filtered.timestamp(),
+                    filtered.samples(),
+                    filtered.rate(),
+                    filtered.channels(),
+                    filtered.channel_layout().bits(),
+                    filtered.format(),
+                    self.encoder.frame_size(),
+                    self.encoder.rate(),
+                    self.encoder.channels(),
+                    self.encoder.channel_layout().bits(),
+                    self.encoder.format(),
+                    self.encoder_time_base.numerator(),
+                    self.encoder_time_base.denominator(),
+                )
+            });
             self.receive_and_process_encoded_packets(octx, ost_time_base);
         }
     }
