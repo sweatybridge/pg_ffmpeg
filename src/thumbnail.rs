@@ -124,7 +124,7 @@ fn encode_ppm(frame: &Video) -> Vec<u8> {
     output
 }
 
-fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
+pub(crate) fn encode_frame(frame: &Video, format: &str) -> Vec<u8> {
     let (codec_name, pixel_fmt) = match format {
         "ppm" => return encode_ppm(frame),
         "png" => ("png", Pixel::RGB24),

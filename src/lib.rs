@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 
 mod codec_lookup;
 mod extract_audio;
+mod extract_frames;
 mod filter_safety;
 mod hls;
 mod hwaccel;
