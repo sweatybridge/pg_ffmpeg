@@ -565,10 +565,11 @@ mod tests {
         let mut last_end_pts = None::<i64>;
         let mut next_pts = 0i64;
         let mut frame = AudioFrame::empty();
-        for (packet_stream, packet) in input.packets() {
+        for (packet_stream, mut packet) in input.packets() {
             if packet_stream.index() != stream_index {
                 continue;
             }
+            packet.rescale_ts(packet_stream.time_base(), decoder.time_base());
             decoder.send_packet(&packet).ok()?;
             while decoder.receive_frame(&mut frame).is_ok() {
                 let timestamp = frame
