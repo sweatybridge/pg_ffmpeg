@@ -383,6 +383,125 @@ pub fn generate_test_video_with_audio_bytes(
     octx.into_data()
 }
 
+/// Generate a minimal AAC audio stream in ADTS container.
+///
+/// Needed for Task 1B tests that require AAC source audio for the
+/// auto-pick and stream-copy code paths.
+pub fn generate_test_aac_adts_bytes(duration_secs: i32) -> Vec<u8> {
+    ffmpeg_next::init().unwrap();
+
+    let audio_codec = ffmpeg_next::encoder::find(codec::Id::AAC).expect("AAC encoder not found");
+
+    let mut octx = MemOutput::open("adts");
+    let global_header = octx
+        .format()
+        .flags()
+        .contains(ffmpeg_next::format::Flags::GLOBAL_HEADER);
+
+    let audio_props = audio_codec
+        .audio()
+        .expect("AAC codec is not an audio encoder");
+    let sample_rate = audio_props
+        .rates()
+        .and_then(|mut rates| rates.next())
+        .unwrap_or(44100);
+    let channel_layout = audio_props
+        .channel_layouts()
+        .map(|layouts| layouts.best(2))
+        .unwrap_or(ffmpeg_next::ChannelLayout::STEREO);
+    let sample_format = audio_props
+        .formats()
+        .and_then(|mut formats| formats.next())
+        .unwrap_or(Sample::F32(SampleType::Planar));
+
+    let mut audio_stream = octx
+        .add_stream(audio_codec)
+        .expect("failed to add audio stream");
+    audio_stream.set_time_base((1, sample_rate));
+
+    let audio_ctx = codec::context::Context::new_with_codec(audio_codec);
+    let mut audio_encoder = audio_ctx
+        .encoder()
+        .audio()
+        .expect("failed to create audio encoder");
+    audio_encoder.set_rate(sample_rate);
+    audio_encoder.set_channel_layout(channel_layout);
+    audio_encoder.set_channels(channel_layout.channels());
+    audio_encoder.set_format(sample_format);
+    audio_encoder.set_bit_rate(128_000);
+    audio_encoder.set_time_base((1, sample_rate));
+    if global_header {
+        audio_encoder.set_flags(codec::Flags::GLOBAL_HEADER);
+    }
+
+    let mut audio_encoder = audio_encoder
+        .open_as(audio_codec)
+        .expect("failed to open audio encoder");
+    let audio_sample_rate = audio_encoder.rate();
+    let audio_channel_layout = audio_encoder.channel_layout();
+    let audio_sample_format = audio_encoder.format();
+    let audio_out_time_base = {
+        audio_stream.set_time_base((1, audio_sample_rate as i32));
+        audio_stream.set_parameters(&audio_encoder);
+        audio_stream.time_base()
+    };
+
+    octx.write_header().expect("failed to write header");
+
+    let mut audio_packet = ffmpeg_next::Packet::empty();
+    let mut samples_per_frame = audio_encoder.frame_size() as usize;
+    if samples_per_frame == 0 {
+        samples_per_frame = 1024;
+    }
+    let total_audio_samples = (duration_secs as usize).saturating_mul(audio_sample_rate as usize)
+        / samples_per_frame
+        * samples_per_frame;
+    let total_audio_samples = total_audio_samples.max(samples_per_frame);
+
+    let mut next_audio_pts = 0usize;
+    while next_audio_pts < total_audio_samples {
+        let mut frame =
+            AudioFrame::new(audio_sample_format, samples_per_frame, audio_channel_layout);
+        frame.set_channel_layout(audio_channel_layout);
+        frame.set_channels(
+            u16::try_from(audio_channel_layout.channels())
+                .expect("audio channel count should fit into u16"),
+        );
+        frame.set_samples(samples_per_frame);
+        frame.set_rate(audio_sample_rate);
+        frame.set_pts(Some(next_audio_pts as i64));
+        for plane in 0..frame.planes() {
+            for byte in frame.data_mut(plane).iter_mut() {
+                *byte = 0;
+            }
+        }
+
+        audio_encoder
+            .send_frame(&frame)
+            .expect("failed to send audio frame");
+        while audio_encoder.receive_packet(&mut audio_packet).is_ok() {
+            audio_packet.set_stream(0);
+            audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
+            audio_packet
+                .write_interleaved(&mut *octx)
+                .expect("failed to write audio packet");
+        }
+        next_audio_pts += samples_per_frame;
+    }
+
+    audio_encoder.send_eof().expect("failed to send audio eof");
+    while audio_encoder.receive_packet(&mut audio_packet).is_ok() {
+        audio_packet.set_stream(0);
+        audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
+        audio_packet
+            .write_interleaved(&mut *octx)
+            .expect("failed to flush audio packet");
+    }
+
+    octx.write_trailer().expect("failed to write trailer");
+    octx.into_data()
+}
+
 /// Generate a single-frame PNG or JPEG in memory.
 ///
 /// Useful for tests that need to feed an image into `transcode` /
