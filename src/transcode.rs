@@ -314,6 +314,7 @@ impl VideoTranscodePipeline {
             ost_index,
             decoder,
             encoder,
+            encoder_time_base,
             graph,
         }
     }
@@ -446,7 +447,6 @@ impl AudioTranscodePipeline {
             ost_index,
             decoder,
             encoder,
-            encoder_time_base,
             graph,
         }
     }
