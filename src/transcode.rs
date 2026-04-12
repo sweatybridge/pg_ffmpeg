@@ -801,17 +801,12 @@ fn build_audio_filter_graph(
     graph
         .validate()
         .unwrap_or_else(|e| error!("failed to validate audio filter graph: {e}"));
-    if let Some(codec) = encoder.codec() {
-        if !codec
-            .capabilities()
-            .contains(codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
-        {
-            graph
-                .get("out")
-                .unwrap()
-                .sink()
-                .set_frame_size(encoder.frame_size());
-        }
+    if encoder.frame_size() > 0 {
+        graph
+            .get("out")
+            .unwrap()
+            .sink()
+            .set_frame_size(encoder.frame_size());
     }
     graph
 }
