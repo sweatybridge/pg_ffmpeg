@@ -15,6 +15,7 @@ mod pipeline;
 mod test_utils;
 mod thumbnail;
 mod transcode;
+mod trim;
 
 /// Postgres `_PG_init` entrypoint. Postgres calls this once per backend
 /// when the shared library is first loaded. We use it to register the

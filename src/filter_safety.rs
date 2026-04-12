@@ -60,6 +60,7 @@ const ALLOWED_FILTERS: &[&str] = &[
     "amerge",
     "amix",
     "anull",
+    "asetpts",
     "afade",
     "equalizer",
     "loudnorm",
