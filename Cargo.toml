@@ -15,7 +15,7 @@ default = ["pg16"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = ["tempfile"]
+pg_test = ["tempfile", "serial_test"]
 pg_bench = ["tempfile", "pgrx-bench"]
 # Compile-time flag that enables tests requiring a real GPU-backed
 # hardware encoder. Default `cargo pgrx test` runs never exercise HW
@@ -28,6 +28,7 @@ ffmpeg-next = "8"
 pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
 pgrx-bench = { git = "https://github.com/pgcentralfoundation/pgrx.git", optional = true }
 serde_json = "1"
+serial_test = { version = "3", optional = true }
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]

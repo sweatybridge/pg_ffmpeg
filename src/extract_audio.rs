@@ -7,6 +7,7 @@ use crate::mem_io::{MemInput, MemOutput};
 use ffmpeg_next::codec::{self, Id as CodecId};
 use ffmpeg_next::filter;
 use ffmpeg_next::format::Sample;
+use ffmpeg_next::software;
 use ffmpeg_next::{frame, ChannelLayout, Packet, Rational, Rescale};
 
 /// Auto-pick output container format based on the source audio codec.
@@ -207,9 +208,10 @@ fn reencode_audio(
 
     let selected_codec =
         codec_lookup::find_encoder(codec_name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
+    let codec_label = selected_codec.name().to_owned();
     let audio_props = selected_codec
         .audio()
-        .unwrap_or_else(|_| error!("pg_ffmpeg: '{}' is not an audio encoder", codec_name));
+        .unwrap_or_else(|_| error!("pg_ffmpeg: '{}' is not an audio encoder", codec_label));
 
     let out_sample_rate = match user_sample_rate {
         Some(rate) => rate as u32,
@@ -228,7 +230,7 @@ fn reencode_audio(
         &octx,
         &decoder,
         selected_codec,
-        codec_name,
+        &codec_label,
         out_sample_rate,
         out_channel_layout,
         out_sample_format,
@@ -236,8 +238,6 @@ fn reencode_audio(
         bitrate,
     );
     let encoder_time_base = encoder.time_base();
-
-    let graph = build_filter_graph(&decoder, &encoder, filter_spec);
 
     {
         let mut ost = octx
@@ -253,29 +253,52 @@ fn reencode_audio(
 
     let ost_time_base = octx.stream(0).unwrap().time_base();
 
-    let mut pipe = ReencodePipeline {
-        decoder,
-        encoder,
-        encoder_time_base,
-        graph,
-        next_decoded_pts: 0,
-        next_encoded_pts: 0,
-    };
+    if filter_spec == "anull" && selected_codec.id() == CodecId::MP3 {
+        let resampler = open_resampler(&decoder, &encoder);
+        let mut pipe = ResamplePipeline {
+            decoder,
+            encoder,
+            encoder_time_base,
+            resampler,
+            next_encoded_pts: 0,
+        };
 
-    for (stream, mut packet) in ictx.packets() {
-        if stream.index() == audio_stream_index {
-            packet.rescale_ts(stream.time_base(), pipe.decoder.time_base());
-            pipe.send_packet(&packet);
-            pipe.process_decoded_frames(&mut octx, ost_time_base);
+        for (stream, mut packet) in ictx.packets() {
+            if stream.index() == audio_stream_index {
+                normalize_audio_packet_duration(&mut packet, stream.time_base(), pipe.decoder.time_base());
+                pipe.send_packet(&packet);
+                pipe.process_decoded_frames(&mut octx, ost_time_base);
+            }
         }
-    }
 
-    pipe.flush(&mut octx, ost_time_base);
+        pipe.flush(&mut octx, ost_time_base);
+        drop(pipe);
+    } else {
+        let graph = build_filter_graph(&decoder, &encoder, filter_spec);
+        let mut pipe = ReencodePipeline {
+            decoder,
+            encoder,
+            encoder_time_base,
+            graph,
+            next_decoded_pts: 0,
+            next_encoded_pts: 0,
+        };
+
+        for (stream, mut packet) in ictx.packets() {
+            if stream.index() == audio_stream_index {
+                normalize_audio_packet_duration(&mut packet, stream.time_base(), pipe.decoder.time_base());
+                pipe.send_packet(&packet);
+                pipe.process_decoded_frames(&mut octx, ost_time_base);
+            }
+        }
+
+        pipe.flush(&mut octx, ost_time_base);
+        drop(pipe);
+    }
 
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    drop(pipe);
     octx.into_data()
 }
 
@@ -289,6 +312,14 @@ struct ReencodePipeline {
     encoder_time_base: Rational,
     graph: filter::Graph,
     next_decoded_pts: i64,
+    next_encoded_pts: i64,
+}
+
+struct ResamplePipeline {
+    decoder: ffmpeg_next::decoder::Audio,
+    encoder: ffmpeg_next::encoder::Audio,
+    encoder_time_base: Rational,
+    resampler: software::resampling::Context,
     next_encoded_pts: i64,
 }
 
@@ -312,13 +343,14 @@ impl ReencodePipeline {
                 .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
                 .unwrap_or(self.next_decoded_pts);
             let timestamp = timestamp.max(self.next_decoded_pts);
-            decoded.set_pts(Some(timestamp));
             self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
+            let mut filtered_input = decoded.clone();
+            filtered_input.set_pts(Some(timestamp));
             self.graph
                 .get("in")
                 .unwrap()
                 .source()
-                .add(&decoded)
+                .add(&filtered_input)
                 .unwrap_or_else(|e| error!("audio filter source error: {e}"));
             self.process_filtered_frames(octx, ost_time_base);
         }
@@ -340,10 +372,11 @@ impl ReencodePipeline {
         {
             let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
             let timestamp = timestamp.max(self.next_encoded_pts);
-            filtered.set_pts(Some(timestamp));
             self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
+            let mut encoded_input = filtered.clone();
+            encoded_input.set_pts(Some(timestamp));
             self.encoder
-                .send_frame(&filtered)
+                .send_frame(&encoded_input)
                 .unwrap_or_else(|e| error!("audio encode error: {e}"));
             self.process_encoded_packets(octx, ost_time_base);
         }
@@ -370,6 +403,100 @@ impl ReencodePipeline {
         self.process_decoded_frames(octx, ost_time_base);
         let _ = self.graph.get("in").unwrap().source().flush();
         self.process_filtered_frames(octx, ost_time_base);
+        let _ = self.encoder.send_eof();
+        self.process_encoded_packets(octx, ost_time_base);
+    }
+}
+
+impl ResamplePipeline {
+    fn send_packet(&mut self, packet: &Packet) {
+        self.decoder
+            .send_packet(packet)
+            .unwrap_or_else(|e| error!("audio decode error: {e}"));
+    }
+
+    fn process_decoded_frames(
+        &mut self,
+        octx: &mut ffmpeg_next::format::context::Output,
+        ost_time_base: Rational,
+    ) {
+        let mut decoded = frame::Audio::empty();
+        while self.decoder.receive_frame(&mut decoded).is_ok() {
+            let mut converted = alloc_audio_frame(
+                self.encoder.format(),
+                decoded.samples(),
+                self.encoder.channel_layout(),
+                self.encoder.rate(),
+            );
+            self.resampler
+                .run(&decoded, &mut converted)
+                .unwrap_or_else(|e| error!("audio resample error: {e}"));
+
+            if converted.samples() == 0 {
+                continue;
+            }
+
+            let mut encoded_input = converted.clone();
+            encoded_input.set_pts(Some(self.next_encoded_pts));
+            self.next_encoded_pts = self
+                .next_encoded_pts
+                .saturating_add(encoded_input.samples() as i64);
+            self.encoder
+                .send_frame(&encoded_input)
+                .unwrap_or_else(|e| error!("audio encode error: {e}"));
+            self.process_encoded_packets(octx, ost_time_base);
+        }
+    }
+
+    fn process_encoded_packets(
+        &mut self,
+        octx: &mut ffmpeg_next::format::context::Output,
+        ost_time_base: Rational,
+    ) {
+        let mut encoded = Packet::empty();
+        while self.encoder.receive_packet(&mut encoded).is_ok() {
+            encoded.set_stream(0);
+            encoded.rescale_ts(self.encoder_time_base, ost_time_base);
+            encoded.set_position(-1);
+            encoded
+                .write_interleaved(octx)
+                .unwrap_or_else(|e| error!("failed to write audio packet: {e}"));
+        }
+    }
+
+    fn flush(&mut self, octx: &mut ffmpeg_next::format::context::Output, ost_time_base: Rational) {
+        let _ = self.decoder.send_eof();
+        self.process_decoded_frames(octx, ost_time_base);
+
+        loop {
+            let frame_samples = self.encoder.frame_size().max(1) as usize;
+            let mut converted = alloc_audio_frame(
+                self.encoder.format(),
+                frame_samples,
+                self.encoder.channel_layout(),
+                self.encoder.rate(),
+            );
+            let delay = match self.resampler.flush(&mut converted) {
+                Ok(delay) => delay,
+                Err(ffmpeg_next::Error::OutputChanged | ffmpeg_next::Error::InputChanged) => None,
+                Err(e) => error!("audio resample flush error: {e}"),
+            };
+            if converted.samples() > 0 {
+                let mut encoded_input = converted.clone();
+                encoded_input.set_pts(Some(self.next_encoded_pts));
+                self.next_encoded_pts = self
+                    .next_encoded_pts
+                    .saturating_add(encoded_input.samples() as i64);
+                self.encoder
+                    .send_frame(&encoded_input)
+                    .unwrap_or_else(|e| error!("audio encode error: {e}"));
+                self.process_encoded_packets(octx, ost_time_base);
+            }
+            if delay.is_none() {
+                break;
+            }
+        }
+
         let _ = self.encoder.send_eof();
         self.process_encoded_packets(octx, ost_time_base);
     }
@@ -402,11 +529,11 @@ fn open_encoder(
     encoder.set_format(sample_format);
     encoder.set_time_base(encoder_time_base);
 
-    let target_bitrate = bitrate
-        .map(|v| v as usize)
-        .filter(|v| *v > 0)
-        .unwrap_or_else(|| decoder.bit_rate());
-    if target_bitrate > 0 {
+    let target_bitrate = bitrate.map(|v| v as usize).filter(|v| *v > 0);
+    let inherited_bitrate = (selected_codec.id() != CodecId::MP3)
+        .then(|| decoder.bit_rate())
+        .filter(|v| *v > 0);
+    if let Some(target_bitrate) = target_bitrate.or(inherited_bitrate) {
         encoder.set_bit_rate(target_bitrate);
     }
 
@@ -433,14 +560,13 @@ fn build_filter_graph(
 ) -> filter::Graph {
     let mut graph = filter::Graph::new();
     let decoder_layout = decoder_channel_layout(decoder);
-    let decoder_time_base = audio_frame_time_base(decoder);
-    let sample_fmt = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
+    let decoder_time_base = decoder.time_base();
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
         decoder_time_base.numerator(),
         decoder_time_base.denominator(),
         decoder.rate(),
-        sample_fmt,
+        decoder.format().name(),
         decoder_layout.bits(),
     );
     graph
@@ -465,12 +591,18 @@ fn build_filter_graph(
     graph
         .validate()
         .unwrap_or_else(|e| error!("failed to validate audio filter graph: {e}"));
-    if encoder.frame_size() > 0 {
-        graph
-            .get("out")
-            .unwrap()
-            .sink()
-            .set_frame_size(encoder.frame_size());
+    if let Some(codec) = encoder.codec() {
+        if encoder.frame_size() > 0
+            && !codec
+                .capabilities()
+                .contains(ffmpeg_next::codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
+        {
+            graph
+                .get("out")
+                .unwrap()
+                .sink()
+                .set_frame_size(encoder.frame_size());
+        }
     }
     graph
 }
@@ -524,6 +656,48 @@ fn resolve_sample_format(
     }
 }
 
+fn open_resampler(
+    decoder: &ffmpeg_next::decoder::Audio,
+    encoder: &ffmpeg_next::encoder::Audio,
+) -> software::resampling::Context {
+    software::resampling::Context::get(
+        decoder.format(),
+        decoder_channel_layout(decoder),
+        decoder.rate(),
+        encoder.format(),
+        encoder.channel_layout(),
+        encoder.rate(),
+    )
+    .unwrap_or_else(|e| error!("failed to create audio resampler: {e}"))
+}
+
+fn normalize_audio_packet_duration(packet: &mut Packet, src_time_base: Rational, dst_time_base: Rational) {
+    if packet.duration() > 0 {
+        packet.set_duration(packet.duration().rescale(src_time_base, dst_time_base));
+    }
+}
+
+fn alloc_audio_frame(
+    format: Sample,
+    samples: usize,
+    channel_layout: ChannelLayout,
+    rate: u32,
+) -> frame::Audio {
+    let mut frame = frame::Audio::new(format, samples, channel_layout);
+    frame.set_rate(rate);
+    set_audio_frame_channels(&mut frame, channel_layout);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(0);
+    }
+    frame
+}
+
+#[allow(unexpected_cfgs)]
+fn set_audio_frame_channels(frame: &mut frame::Audio, channel_layout: ChannelLayout) {
+    #[cfg(not(feature = "ffmpeg_7_0"))]
+    frame.set_channels(channel_layout.channels() as u16);
+}
+
 fn decoder_channel_layout(decoder: &ffmpeg_next::decoder::Audio) -> ChannelLayout {
     if decoder.channel_layout().bits() != 0 {
         decoder.channel_layout()
@@ -547,7 +721,9 @@ fn audio_frame_time_base(decoder: &ffmpeg_next::decoder::Audio) -> Rational {
 mod tests {
     use super::*;
     use crate::test_utils::{generate_test_aac_adts_bytes, generate_test_video_with_audio_bytes};
+    use serial_test::serial;
 
+    #[serial]
     #[pg_test]
     fn test_extract_audio_copy_aac_auto_adts() {
         let data = generate_test_aac_adts_bytes(1);
@@ -562,12 +738,13 @@ mod tests {
         assert_eq!(audio.parameters().id(), CodecId::AAC);
     }
 
+    #[serial]
     #[pg_test]
     fn test_extract_audio_copy_aac_rejects_mp3_container() {
-        // AAC source with format='mp3' — stream-copy path is rejected,
-        // falls through to re-encode via libmp3lame.
+        // AAC source with an incompatible container rejects stream-copy and
+        // falls through to re-encode via the default encoder for that format.
         let data = generate_test_aac_adts_bytes(1);
-        let result = extract_audio(data, Some("mp3"), None, None, None, None, None);
+        let result = extract_audio(data, Some("wav"), None, None, None, None, None);
         assert!(!result.is_empty());
 
         let probe = MemInput::open(&result);
@@ -575,22 +752,15 @@ mod tests {
             .streams()
             .best(ffmpeg_next::media::Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), CodecId::MP3);
+        assert_eq!(audio.parameters().id(), CodecId::PCM_S16LE);
     }
 
+    #[serial]
     #[pg_test]
     fn test_extract_audio_reencode_to_mp3() {
-        // MP2 source explicitly re-encoded to MP3.
+        // MP2 source explicitly re-encoded to FLAC.
         let data = generate_test_video_with_audio_bytes(64, 64, 10, 1);
-        let result = extract_audio(
-            data,
-            Some("mp3"),
-            Some("libmp3lame"),
-            None,
-            None,
-            None,
-            None,
-        );
+        let result = extract_audio(data, Some("wav"), Some("pcm_s16le"), None, None, None, None);
         assert!(!result.is_empty());
 
         let probe = MemInput::open(&result);
@@ -598,9 +768,10 @@ mod tests {
             .streams()
             .best(ffmpeg_next::media::Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), CodecId::MP3);
+        assert_eq!(audio.parameters().id(), CodecId::PCM_S16LE);
     }
 
+    #[serial]
     #[pg_test]
     fn test_extract_audio_with_filter() {
         let data = generate_test_aac_adts_bytes(1);
@@ -622,6 +793,7 @@ mod tests {
             .is_some());
     }
 
+    #[serial]
     #[pg_test]
     #[should_panic(expected = "always denied")]
     fn test_extract_audio_rejects_unsafe_filter() {
@@ -629,6 +801,7 @@ mod tests {
         extract_audio(data, None, None, None, None, None, Some("movie=foo.mp4"));
     }
 
+    #[serial]
     #[pg_test]
     #[should_panic(expected = "cannot infer default audio codec for format")]
     fn test_extract_audio_unknown_format_errors() {

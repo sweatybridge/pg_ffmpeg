@@ -626,7 +626,7 @@ fn resolve_audio_encoder(
     if let Some(name) = requested {
         let codec =
             codec_lookup::find_encoder(name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
-        (codec, name.to_owned())
+        (codec, codec.name().to_owned())
     } else {
         let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
             error!(
@@ -800,14 +800,13 @@ fn build_audio_filter_graph(
 ) -> filter::Graph {
     let mut graph = filter::Graph::new();
     let decoder_layout = decoder_channel_layout(decoder);
-    let decoder_time_base = audio_frame_time_base(decoder);
-    let sample_fmt = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
+    let decoder_time_base = decoder.time_base();
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
         decoder_time_base.numerator(),
         decoder_time_base.denominator(),
         decoder.rate(),
-        sample_fmt,
+        decoder.format().name(),
         decoder_layout.bits(),
     );
     graph
@@ -832,12 +831,18 @@ fn build_audio_filter_graph(
     graph
         .validate()
         .unwrap_or_else(|e| error!("failed to validate audio filter graph: {e}"));
-    if encoder.frame_size() > 0 {
-        graph
-            .get("out")
-            .unwrap()
-            .sink()
-            .set_frame_size(encoder.frame_size());
+    if let Some(codec) = encoder.codec() {
+        if encoder.frame_size() > 0
+            && !codec
+                .capabilities()
+                .contains(ffmpeg_next::codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
+        {
+            graph
+                .get("out")
+                .unwrap()
+                .sink()
+                .set_frame_size(encoder.frame_size());
+        }
     }
     graph
 }
