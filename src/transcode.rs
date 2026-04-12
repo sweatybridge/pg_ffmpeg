@@ -43,6 +43,8 @@ struct AudioTranscodePipeline {
     encoder: ffmpeg_next::encoder::Audio,
     encoder_time_base: Rational,
     graph: filter::Graph,
+    next_decoded_pts: i64,
+    next_encoded_pts: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +322,8 @@ impl VideoTranscodePipeline {
             encoder,
             encoder_time_base,
             graph,
+            next_decoded_pts: 0,
+            next_encoded_pts: 0,
         }
     }
 
@@ -483,8 +487,10 @@ impl AudioTranscodePipeline {
             let frame_time_base = audio_frame_time_base(&self.decoder);
             let timestamp = decoded
                 .timestamp()
-                .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base));
-            decoded.set_pts(timestamp);
+                .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
+                .unwrap_or(self.next_decoded_pts);
+            decoded.set_pts(Some(timestamp));
+            self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
             self.graph
                 .get("in")
                 .unwrap()
@@ -521,7 +527,9 @@ impl AudioTranscodePipeline {
             );
             encoded_frame.set_samples(filtered.samples());
             encoded_frame.set_rate(self.encoder.rate());
-            encoded_frame.set_pts(filtered.timestamp());
+            let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
+            encoded_frame.set_pts(Some(timestamp));
+            self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
             for plane in 0..filtered.planes() {
                 encoded_frame
                     .data_mut(plane)
