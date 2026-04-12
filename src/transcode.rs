@@ -1150,7 +1150,7 @@ mod tests {
             None,
             None,
             None,
-            Some("aac"),
+            Some("ac3"),
             None,
             Some(96_000),
             false,
@@ -1162,7 +1162,7 @@ mod tests {
             .streams()
             .best(Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), codec::Id::AAC);
+        assert_eq!(audio.parameters().id(), codec::Id::AC3);
     }
 
     #[pg_test]
