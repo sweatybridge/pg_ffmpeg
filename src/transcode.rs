@@ -34,6 +34,7 @@ struct VideoTranscodePipeline {
     decoder: ffmpeg_next::decoder::Video,
     encoder: ffmpeg_next::encoder::Video,
     encoder_time_base: Rational,
+    filter_time_base: Rational,
     graph: filter::Graph,
 }
 
@@ -49,7 +50,7 @@ struct AudioTranscodePipeline {
 
 #[allow(clippy::too_many_arguments)]
 #[pg_extern]
-fn transcode(
+pub(crate) fn transcode(
     data: Vec<u8>,
     format: default!(Option<&str>, "NULL"),
     filter: default!(Option<&str>, "NULL"),
@@ -289,6 +290,9 @@ impl VideoTranscodePipeline {
             .video()
             .unwrap_or_else(|e| error!("failed to open decoder: {e}"));
         decoder.set_time_base(ist.time_base());
+        if let Some(frame_rate) = preferred_video_frame_rate(ist, &decoder) {
+            decoder.set_frame_rate(Some(frame_rate));
+        }
 
         let mut graph = pipeline::build_video_filter_graph(&decoder, config.filter_spec);
         let (out_width, out_height, out_pix_fmt, filter_tb) = resolved_video_output(&mut graph);
@@ -321,6 +325,7 @@ impl VideoTranscodePipeline {
             decoder,
             encoder,
             encoder_time_base,
+            filter_time_base: filter_tb,
             graph,
         }
     }
@@ -372,6 +377,10 @@ impl VideoTranscodePipeline {
             .frame(&mut filtered)
             .is_ok()
         {
+            let timestamp = filtered
+                .timestamp()
+                .map(|pts| pts.rescale(self.filter_time_base, self.encoder_time_base));
+            filtered.set_pts(timestamp);
             self.encoder
                 .send_frame(&filtered)
                 .unwrap_or_else(|e| error!("encode error: {e}"));
@@ -600,6 +609,49 @@ fn resolved_video_time_base(
     } else {
         decoder.time_base()
     }
+}
+
+fn preferred_video_frame_rate(
+    ist: &ffmpeg_next::format::stream::Stream,
+    decoder: &ffmpeg_next::decoder::Video,
+) -> Option<Rational> {
+    if let Some(frame_rate) = decoder.frame_rate() {
+        if frame_rate.numerator() > 0 && frame_rate.denominator() > 0 {
+            return Some(frame_rate);
+        }
+    }
+
+    let avg_frame_rate = ist.avg_frame_rate();
+    if avg_frame_rate.numerator() > 0 && avg_frame_rate.denominator() > 0 {
+        return Some(avg_frame_rate);
+    }
+
+    let duration = ist.duration();
+    let frames = ist.frames();
+    let time_base = ist.time_base();
+    if duration > 0 && frames > 0 && time_base.numerator() > 0 && time_base.denominator() > 0 {
+        let numerator = i64::from(time_base.denominator()) * frames;
+        let denominator = i64::from(time_base.numerator()) * duration;
+        if numerator > 0 && denominator > 0 {
+            let gcd = gcd_i64(numerator, denominator);
+            let reduced_num = numerator / gcd;
+            let reduced_den = denominator / gcd;
+            if let (Ok(num), Ok(den)) = (i32::try_from(reduced_num), i32::try_from(reduced_den)) {
+                return Some(Rational(num, den));
+            }
+        }
+    }
+
+    None
+}
+
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a.abs().max(1)
 }
 
 fn resolve_video_encoder(
@@ -1004,7 +1056,7 @@ mod tests {
             packet.set_stream(0);
             packet.rescale_ts((1, 1), out_time_base);
             packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .expect("failed to write packet");
         }
 

@@ -253,7 +253,7 @@ fn build_video_filter_graph_inner(
     let mut graph = filter::Graph::new();
     let pix_fmt = Into::<ffmpeg_next::sys::AVPixelFormat>::into(decoder.format()) as i32;
     let aspect = decoder.aspect_ratio();
-    let input_time_base = decoder.time_base();
+    let input_time_base = video_filter_input_time_base(decoder);
     let buffer_args = format!(
         "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
         decoder.width(),
@@ -281,6 +281,15 @@ fn build_video_filter_graph_inner(
         .validate()
         .unwrap_or_else(|e| pgrx::error!("failed to validate filter graph: {e}"));
     graph
+}
+
+fn video_filter_input_time_base(decoder: &ffmpeg_next::decoder::Video) -> Rational {
+    if let Some(frame_rate) = decoder.frame_rate() {
+        if frame_rate.numerator() > 0 && frame_rate.denominator() > 0 {
+            return Rational(frame_rate.denominator(), frame_rate.numerator());
+        }
+    }
+    decoder.time_base()
 }
 
 // -----------------------------------------------------------------------------
