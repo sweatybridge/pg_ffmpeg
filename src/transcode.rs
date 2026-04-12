@@ -1103,7 +1103,7 @@ mod tests {
             None,
             None,
             None,
-            Some("flac"),
+            Some("pcm_s16le"),
             None,
             None,
             false,
@@ -1115,7 +1115,7 @@ mod tests {
             .streams()
             .best(Type::Audio)
             .expect("no audio stream in output");
-        assert_eq!(audio.parameters().id(), codec::Id::FLAC);
+        assert_eq!(audio.parameters().id(), codec::Id::PCM_S16LE);
     }
 
     #[pg_test]
