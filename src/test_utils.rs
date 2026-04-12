@@ -341,11 +341,8 @@ pub fn generate_test_video_with_audio_bytes(
 
     let mut next_audio_pts = 0usize;
     while next_audio_pts < total_audio_samples {
-        let mut frame = AudioFrame::new(
-            audio_sample_format,
-            samples_per_frame,
-            audio_channel_layout,
-        );
+        let mut frame =
+            AudioFrame::new(audio_sample_format, samples_per_frame, audio_channel_layout);
         frame.set_channel_layout(audio_channel_layout);
         frame.set_channels(audio_channel_layout.channels());
         frame.set_samples(samples_per_frame);
