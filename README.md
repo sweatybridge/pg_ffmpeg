@@ -8,15 +8,38 @@ All functions are in the `ffmpeg` schema.
 
 | Function | Description |
 |----------|-------------|
-| `media_info(data bytea) → jsonb` | Extract metadata: format, duration, codecs, resolution, streams |
-| `thumbnail(data bytea, seconds float8 DEFAULT 0.0, format text DEFAULT 'png') → bytea` | Extract a video frame as an image at the given timestamp |
-| `transcode(data bytea, format text DEFAULT NULL, filter text DEFAULT NULL) → bytea` | Remux media into a different container format, optionally applying a filter |
-| `extract_audio(data bytea, format text DEFAULT 'mp3') → bytea` | Extract the audio track from a video file |
-| `hls(url text, segment_duration int DEFAULT 6) → bigint` | Fetch a video via URL, split into HLS segments, and store in `ffmpeg.hls_playlists` / `ffmpeg.hls_segments` |
+| `media_info(data bytea) -> jsonb` | Extract container metadata, chapters, tags, stream codecs, bit rates, dispositions, and per-stream tags |
+| `thumbnail(data bytea, seconds float8 DEFAULT 0.0, format text DEFAULT 'png') -> bytea` | Extract a video frame as PNG or JPEG |
+| `transcode(data bytea, format text DEFAULT NULL, filter text DEFAULT NULL, codec text DEFAULT NULL, preset text DEFAULT NULL, crf int DEFAULT NULL, bitrate int DEFAULT NULL, audio_codec text DEFAULT NULL, audio_filter text DEFAULT NULL, audio_bitrate int DEFAULT NULL, hwaccel bool DEFAULT false) -> bytea` | Remux or transcode audio/video, optionally with validated filter graphs |
+| `extract_audio(data bytea, format text DEFAULT NULL, codec text DEFAULT NULL, bitrate int DEFAULT NULL, sample_rate int DEFAULT NULL, channels int DEFAULT NULL, filter text DEFAULT NULL) -> bytea` | Stream-copy compatible audio tracks or re-encode audio with optional filtering |
+| `trim(data bytea, start_time float8 DEFAULT 0.0, end_time float8 DEFAULT NULL, precise bool DEFAULT false) -> bytea` | Trim media with either keyframe-aligned stream copy or frame-accurate re-encode |
+| `extract_frames(data bytea, interval float8 DEFAULT 1.0, format text DEFAULT 'png', keyframes_only bool DEFAULT false, max_frames int DEFAULT 1000) -> TABLE(timestamp float8, frame bytea)` | Extract bounded frame sets as PNG or JPEG rows |
+| `hls(url text, segment_duration int DEFAULT 6) -> bigint` | Fetch a video via URL, split into HLS segments, and store in `ffmpeg.hls_playlists` / `ffmpeg.hls_segments` |
+
+## Milestone 1 notes
+
+`transcode` defaults to a remux path when no video/audio transcoding parameters are supplied. User-provided `filter` and `audio_filter` values are validated against the allow-list in `src/filter_safety.rs`; unsafe sources such as `movie=` are rejected.
+
+`transcode(..., hwaccel => true)` is opt-in. If no suitable hardware encoder can be opened, pg_ffmpeg logs `WARNING "pg_ffmpeg: HW encoder {name} unavailable, falling back to software"` and continues with the software encoder.
+
+`extract_audio` uses stream copy only when `codec`, `bitrate`, `sample_rate`, `channels`, and `filter` are all `NULL` and the requested output container accepts the source codec. With `format => NULL`, the auto-pick table is:
+
+- `aac -> adts`
+- `mp3 -> mp3`
+- `opus -> ogg`
+- `vorbis -> ogg`
+- `flac -> flac`
+- `pcm_s16le -> wav`
+
+`trim(..., precise => false)` seeks to the nearest keyframe at or before `start_time`, stream-copies packets until `end_time`, and rewrites timestamps to start at 0. `trim(..., precise => true)` decodes and re-encodes audio/video with FFmpeg `trim` / `atrim` filters for frame accuracy.
+
+When `trim(..., precise => true)` cannot re-open the source codec as an encoder in the current FFmpeg build, it falls back to `libx264` for video and `aac` for audio. Subtitle and data streams are dropped in precise mode; fast mode preserves them.
+
+`extract_frames` is bounded by `max_frames`. It never truncates silently: if a `(max_frames + 1)`th row would be emitted, the function raises an error. `keyframes_only => true` ignores `interval` and emits one row per keyframe in decode order.
 
 ## Prerequisites
 
-- PostgreSQL 16–18
+- PostgreSQL 16-18
 - Rust toolchain
 - `cargo install --locked cargo-pgrx`
 - FFmpeg development libraries:
@@ -35,7 +58,7 @@ cargo pgrx init --pg16=$(which pg_config)  # adjust for your PG version
 cargo pgrx install --release
 ```
 
-Additional libraries if you plan to build postgres from source.
+Additional libraries if you plan to build PostgreSQL from source:
 
 ```bash
 # Debian/Ubuntu
@@ -48,25 +71,66 @@ apt-get install build-essential libreadline-dev zlib1g-dev flex bison \
 ```sql
 CREATE EXTENSION pg_ffmpeg;
 
--- Get media metadata
-SELECT ffmpeg.media_info(pg_read_binary_file('/path/to/video.mp4'));
+-- Rich metadata, including chapters/tags/disposition
+SELECT ffmpeg.media_info(pg_read_binary_file('/path/to/video.mkv'));
 
--- Extract a thumbnail at 5 seconds (PNG by default)
-SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), seconds => 5.0);
+-- Remux when no transcoding parameters are supplied
+SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.ts'), format => 'matroska');
 
--- Extract a thumbnail as JPEG
-SELECT ffmpeg.thumbnail(pg_read_binary_file('/path/to/video.mp4'), format => 'mjpeg');
+-- Video + audio transcode with filters
+SELECT ffmpeg.transcode(
+  pg_read_binary_file('/path/to/video.mp4'),
+  format => 'matroska',
+  filter => 'scale=-2:720',
+  codec => 'libx264',
+  preset => 'medium',
+  crf => 23,
+  audio_codec => 'aac',
+  audio_filter => 'volume=0.8'
+);
 
--- Remux to MKV
-SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), format => 'matroska');
+-- Extract audio without forcing MP3 when stream copy is possible
+SELECT ffmpeg.extract_audio(pg_read_binary_file('/path/to/input.mp4'));
 
--- Transcode with a filter (e.g. scale to 720p)
-SELECT ffmpeg.transcode(pg_read_binary_file('/path/to/video.mp4'), filter => 'scale=-1:720');
+-- Re-encode extracted audio explicitly
+SELECT ffmpeg.extract_audio(
+  pg_read_binary_file('/path/to/input.mp4'),
+  format => 'wav',
+  codec => 'pcm_s16le'
+);
 
--- Extract audio as MP3
-SELECT ffmpeg.extract_audio(pg_read_binary_file('/path/to/video.mp4'), format => 'mp3');
+-- Fast keyframe-aligned trim
+SELECT ffmpeg.trim(
+  pg_read_binary_file('/path/to/video.ts'),
+  start_time => 12.5,
+  end_time => 18.0
+);
 
--- Split a remote video into HLS segments (6s default)
+-- Frame-accurate trim with re-encode
+SELECT ffmpeg.trim(
+  pg_read_binary_file('/path/to/video.ts'),
+  start_time => 12.5,
+  end_time => 18.0,
+  precise => true
+);
+
+-- Extract frames every 0.5s
+SELECT *
+FROM ffmpeg.extract_frames(
+  pg_read_binary_file('/path/to/video.mp4'),
+  interval => 0.5,
+  format => 'jpeg',
+  max_frames => 20
+);
+
+-- Extract only keyframes
+SELECT *
+FROM ffmpeg.extract_frames(
+  pg_read_binary_file('/path/to/video.mp4'),
+  keyframes_only => true
+);
+
+-- Split a remote video into HLS segments
 SELECT ffmpeg.hls('https://example.com/video.mp4', segment_duration => 6);
 ```
 

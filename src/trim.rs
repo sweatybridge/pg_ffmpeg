@@ -5,7 +5,8 @@ use crate::pipeline;
 
 use ffmpeg_next::codec;
 use ffmpeg_next::media::Type;
-use ffmpeg_next::Rational;
+use ffmpeg_next::util::mathematics::rescale;
+use ffmpeg_next::{Rational, Rescale};
 
 #[pg_extern]
 fn trim(
@@ -39,12 +40,20 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
     let mut ictx = MemInput::open(&data);
     let out_format = default_output_format(ictx.format().name());
     let trim_duration = end_time.map(|end| end - start_time);
+    let absolute_end_us =
+        end_time.map(|end| (end * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64);
 
     let anchor_stream_index = ictx
         .streams()
         .best(Type::Video)
         .or_else(|| ictx.streams().best(Type::Audio))
         .map(|stream| stream.index());
+    let anchor_is_video = ictx.streams().best(Type::Video).is_some();
+
+    if start_time > 0.0 {
+        let target_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+        let _ = ictx.seek(target_ts, ..target_ts + 1);
+    }
 
     let mut octx = MemOutput::open(&out_format);
     let mut stream_mapping = vec![None::<usize>; ictx.streams().count()];
@@ -63,9 +72,8 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
         output_time_bases[index] = octx.stream(index).unwrap().time_base();
     }
 
-    let mut skipped_anchor_duration = 0.0f64;
     let mut copied_anchor_duration = 0.0f64;
-    let mut started = start_time <= 0.0;
+    let mut actual_start_us = None::<i64>;
 
     for (stream, mut packet) in ictx.packets() {
         let input_index = stream.index();
@@ -79,22 +87,41 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
         } else {
             None
         };
+        let packet_time_us = packet
+            .pts()
+            .or_else(|| packet.dts())
+            .map(|timestamp| timestamp.rescale(stream.time_base(), rescale::TIME_BASE));
 
-        if !started {
+        if actual_start_us.is_none() {
             if !is_anchor {
                 continue;
             }
-            let duration = packet_duration_seconds.unwrap_or(0.0);
-            if skipped_anchor_duration + duration < start_time {
-                skipped_anchor_duration += duration;
+            if anchor_is_video && !packet.is_key() {
                 continue;
             }
-            started = true;
+            let Some(start_us) = packet_time_us else {
+                continue;
+            };
+            actual_start_us = Some(start_us);
+        }
+        let start_us = actual_start_us.unwrap();
+
+        if packet_time_us.is_some_and(|timestamp| timestamp < start_us) {
+            continue;
         }
 
         if is_anchor {
-            if let Some(limit) = trim_duration {
-                if copied_anchor_duration >= limit {
+            if let Some(end_us) = absolute_end_us {
+                if packet_time_us.is_some_and(|timestamp| timestamp >= end_us) {
+                    break;
+                }
+            } else if let Some(limit) = trim_duration {
+                let elapsed = packet_time_us
+                    .map(|timestamp| {
+                        (timestamp - start_us) as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)
+                    })
+                    .unwrap_or(copied_anchor_duration);
+                if elapsed >= limit {
                     break;
                 }
             }
@@ -103,7 +130,7 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
         let input_time_base = input_time_bases[input_index];
         let output_time_base = output_time_bases[output_index];
         packet.set_stream(output_index);
-        packet.rescale_ts(input_time_base, output_time_base);
+        rebase_packet_timestamps(&mut packet, input_time_base, output_time_base, start_us);
         packet.set_position(-1);
         packet
             .write_interleaved(&mut octx)
@@ -117,6 +144,26 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trim trailer: {e}"));
     octx.into_data()
+}
+
+fn rebase_packet_timestamps(
+    packet: &mut ffmpeg_next::Packet,
+    input_time_base: Rational,
+    output_time_base: Rational,
+    start_us: i64,
+) {
+    let rebase_timestamp = |timestamp: i64| {
+        let rebased_us = timestamp.rescale(input_time_base, rescale::TIME_BASE) - start_us;
+        rebased_us
+            .max(0)
+            .rescale(rescale::TIME_BASE, output_time_base)
+    };
+
+    packet.set_pts(packet.pts().map(rebase_timestamp));
+    packet.set_dts(packet.dts().map(rebase_timestamp));
+    if packet.duration() > 0 {
+        packet.set_duration(packet.duration().rescale(input_time_base, output_time_base));
+    }
 }
 
 fn precise_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
@@ -181,6 +228,8 @@ fn precise_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8
 fn default_output_format(input_format: &str) -> String {
     match input_format {
         "png_pipe" | "ppm_pipe" => "image2pipe".to_owned(),
+        "matroska,webm" => "matroska".to_owned(),
+        "mov,mp4,m4a,3gp,3g2,mj2" => "mp4".to_owned(),
         _ => input_format.to_owned(),
     }
 }
@@ -426,20 +475,47 @@ fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::mem_io::MemInput;
-    use crate::test_utils::{generate_test_video_bytes, generate_test_video_with_audio_bytes};
+    use crate::test_utils::{
+        generate_test_matroska_video_with_gop_bytes, generate_test_video_bytes,
+        generate_test_video_with_audio_bytes,
+    };
     use ffmpeg_next::util::frame::{audio::Audio as AudioFrame, video::Video as VideoFrame};
     use ffmpeg_next::Rescale;
 
     #[pg_test]
     fn test_trim_fast_keyframe() {
-        let data = generate_test_video_bytes(64, 64, 10, 4);
-        let result = trim(data, 1.0, Some(2.5), false);
-        assert!(!result.is_empty(), "trim output should not be empty");
-
-        let frame_count = decoded_video_frame_count(&result);
+        let data = generate_test_matroska_video_with_gop_bytes(64, 64, 10, 4, 10);
+        let fast = trim(data.clone(), 1.5, Some(2.2), false);
+        let precise = trim(data, 1.5, Some(2.2), true);
+        assert!(!fast.is_empty(), "trim output should not be empty");
+        let fast_frame_count = decoded_video_frame_count(&fast);
+        let precise_frame_count = decoded_video_frame_count(&precise);
         assert!(
-            (14..=16).contains(&frame_count),
-            "fast trim should keep about 15 frames, got {frame_count}"
+            fast_frame_count > precise_frame_count,
+            "fast trim should start from an earlier keyframe-aligned point than precise trim, got fast={fast_frame_count}, precise={precise_frame_count}"
+        );
+        let first_packet_time = first_packet_timestamp_seconds(&fast, Type::Video)
+            .expect("expected a video packet timestamp");
+        assert!(
+            first_packet_time.abs() <= 0.1,
+            "fast trim should rebase timestamps to start at 0, got {first_packet_time}"
+        );
+    }
+
+    #[pg_test]
+    fn test_trim_fast_uses_absolute_end_timestamp() {
+        let data = generate_test_matroska_video_with_gop_bytes(64, 64, 10, 4, 10);
+        let fast = trim(data.clone(), 1.5, Some(2.2), false);
+        let precise = trim(data, 1.5, Some(2.2), true);
+
+        let fast_duration =
+            decoded_video_duration_seconds(&fast).expect("expected fast-trim video output");
+        let precise_duration =
+            decoded_video_duration_seconds(&precise).expect("expected precise-trim video output");
+
+        assert!(
+            fast_duration > precise_duration + 0.2,
+            "fast trim should preserve media from the prior keyframe through the caller's absolute end_time: fast={fast_duration}, precise={precise_duration}"
         );
     }
 
@@ -521,6 +597,22 @@ mod tests {
             frame_count += 1;
         }
         frame_count
+    }
+
+    fn first_packet_timestamp_seconds(data: &[u8], medium: Type) -> Option<f64> {
+        let mut input = MemInput::open(data);
+        let stream_index = input.streams().best(medium)?.index();
+
+        for (stream, packet) in input.packets() {
+            if stream.index() != stream_index {
+                continue;
+            }
+
+            let timestamp = packet.pts().or_else(|| packet.dts())?;
+            return Some(timestamp_to_seconds(timestamp, stream.time_base()));
+        }
+
+        None
     }
 
     fn decoded_video_duration_seconds(data: &[u8]) -> Option<f64> {

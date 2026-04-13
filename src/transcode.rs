@@ -243,6 +243,8 @@ pub(crate) fn transcode(
 fn default_output_format(input_format: &str) -> String {
     match input_format {
         "png_pipe" | "ppm_pipe" => "image2pipe".to_owned(),
+        "matroska,webm" => "matroska".to_owned(),
+        "mov,mp4,m4a,3gp,3g2,mj2" => "mp4".to_owned(),
         _ => input_format.to_owned(),
     }
 }

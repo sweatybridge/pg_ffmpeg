@@ -299,9 +299,26 @@ pub fn hw_device_for(codec: &Codec) -> Option<HwDeviceRef> {
 /// Log a `WARNING` that HW acceleration is unavailable and we're falling
 /// back to software. Callers use this right before opening the software
 /// encoder so operators see a single, greppable phrase in logs.
-pub fn warn_hw_fallback(codec_name: &str) {
-    pgrx::warning!(
-        "pg_ffmpeg: HW encoder for {} unavailable, falling back to software",
+pub(crate) fn hw_fallback_warning(codec_name: &str) -> String {
+    format!(
+        "pg_ffmpeg: HW encoder {} unavailable, falling back to software",
         codec_name
-    );
+    )
+}
+
+pub fn warn_hw_fallback(codec_name: &str) {
+    pgrx::warning!("{}", hw_fallback_warning(codec_name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hw_fallback_warning_message_matches_plan() {
+        assert_eq!(
+            hw_fallback_warning("mpeg2video"),
+            "pg_ffmpeg: HW encoder mpeg2video unavailable, falling back to software"
+        );
+    }
 }
