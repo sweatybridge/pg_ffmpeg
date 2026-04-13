@@ -127,17 +127,10 @@ fn alloc_audio_frame(
 ) -> AudioFrame {
     let mut frame = AudioFrame::new(format, samples, channel_layout);
     frame.set_rate(rate);
-    set_audio_frame_channels(&mut frame, channel_layout);
     for plane in 0..frame.planes() {
         frame.data_mut(plane).fill(0);
     }
     frame
-}
-
-#[allow(unexpected_cfgs)]
-fn set_audio_frame_channels(frame: &mut AudioFrame, channel_layout: ffmpeg_next::ChannelLayout) {
-    #[cfg(not(feature = "ffmpeg_7_0"))]
-    frame.set_channels(channel_layout.channels() as u16);
 }
 
 fn generate_test_video_bytes_with_gop_and_muxer(
@@ -343,7 +336,6 @@ pub fn generate_test_video_with_audio_bytes(
         .expect("failed to create audio encoder");
     audio_encoder.set_rate(sample_rate);
     audio_encoder.set_channel_layout(channel_layout);
-    audio_encoder.set_channels(channel_layout.channels());
     audio_encoder.set_format(sample_format);
     audio_encoder.set_bit_rate(128_000);
     audio_encoder.set_time_base((1, sample_rate));
@@ -489,7 +481,6 @@ pub fn generate_test_aac_adts_bytes(duration_secs: i32) -> Vec<u8> {
         .expect("failed to create audio encoder");
     audio_encoder.set_rate(sample_rate);
     audio_encoder.set_channel_layout(channel_layout);
-    audio_encoder.set_channels(channel_layout.channels());
     audio_encoder.set_format(sample_format);
     audio_encoder.set_bit_rate(128_000);
     audio_encoder.set_time_base((1, sample_rate));

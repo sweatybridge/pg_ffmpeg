@@ -36,6 +36,7 @@ struct VideoTranscodePipeline {
     encoder_time_base: Rational,
     filter_time_base: Rational,
     graph: filter::Graph,
+    filter_finished: bool,
 }
 
 struct AudioTranscodePipeline {
@@ -46,6 +47,7 @@ struct AudioTranscodePipeline {
     graph: filter::Graph,
     next_decoded_pts: i64,
     next_encoded_pts: i64,
+    filter_finished: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -331,6 +333,7 @@ impl VideoTranscodePipeline {
             encoder_time_base,
             filter_time_base: filter_tb,
             graph,
+            filter_finished: false,
         }
     }
 
@@ -339,12 +342,18 @@ impl VideoTranscodePipeline {
     }
 
     fn send_packet_to_decoder(&mut self, packet: &Packet) {
+        if self.filter_finished {
+            return;
+        }
         self.decoder
             .send_packet(packet)
             .unwrap_or_else(|e| error!("decode error: {e}"));
     }
 
     fn send_eof_to_decoder(&mut self) {
+        if self.filter_finished {
+            return;
+        }
         let _ = self.decoder.send_eof();
     }
 
@@ -355,14 +364,20 @@ impl VideoTranscodePipeline {
     ) {
         let mut decoded = frame::Video::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
+            if self.filter_finished {
+                continue;
+            }
             let timestamp = decoded.timestamp();
             decoded.set_pts(timestamp);
-            self.graph
-                .get("in")
-                .unwrap()
-                .source()
-                .add(&decoded)
-                .unwrap_or_else(|e| error!("filter source error: {e}"));
+            let mut source = self.graph.get("in").unwrap();
+            match source.source().add(&decoded) {
+                Ok(()) => {}
+                Err(ffmpeg_next::Error::Eof) => {
+                    self.filter_finished = true;
+                    continue;
+                }
+                Err(e) => error!("filter source error: {e}"),
+            }
             self.receive_and_process_filtered_frames(octx, ost_time_base);
         }
     }
@@ -473,6 +488,7 @@ impl AudioTranscodePipeline {
             graph,
             next_decoded_pts: 0,
             next_encoded_pts: 0,
+            filter_finished: false,
         }
     }
 
@@ -481,12 +497,18 @@ impl AudioTranscodePipeline {
     }
 
     fn send_packet_to_decoder(&mut self, packet: &Packet) {
+        if self.filter_finished {
+            return;
+        }
         self.decoder
             .send_packet(packet)
             .unwrap_or_else(|e| error!("audio decode error: {e}"));
     }
 
     fn send_eof_to_decoder(&mut self) {
+        if self.filter_finished {
+            return;
+        }
         let _ = self.decoder.send_eof();
     }
 
@@ -497,6 +519,9 @@ impl AudioTranscodePipeline {
     ) {
         let mut decoded = frame::Audio::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
+            if self.filter_finished {
+                continue;
+            }
             let frame_time_base = audio_frame_time_base(&self.decoder);
             let timestamp = decoded
                 .timestamp()
@@ -505,12 +530,15 @@ impl AudioTranscodePipeline {
             let timestamp = timestamp.max(self.next_decoded_pts);
             decoded.set_pts(Some(timestamp));
             self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
-            self.graph
-                .get("in")
-                .unwrap()
-                .source()
-                .add(&decoded)
-                .unwrap_or_else(|e| error!("audio filter source error: {e}"));
+            let mut source = self.graph.get("in").unwrap();
+            match source.source().add(&decoded) {
+                Ok(()) => {}
+                Err(ffmpeg_next::Error::Eof) => {
+                    self.filter_finished = true;
+                    continue;
+                }
+                Err(e) => error!("audio filter source error: {e}"),
+            }
             self.receive_and_process_filtered_frames(octx, ost_time_base);
         }
     }
@@ -822,7 +850,6 @@ fn open_audio_encoder(
         .unwrap_or_else(|e| error!("failed to create audio encoder: {e}"));
     encoder.set_rate(sample_rate as i32);
     encoder.set_channel_layout(channel_layout);
-    encoder.set_channels(channel_layout.channels());
     encoder.set_format(sample_format);
     encoder.set_time_base(encoder_time_base);
 
