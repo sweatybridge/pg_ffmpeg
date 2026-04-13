@@ -40,6 +40,8 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
     let mut ictx = MemInput::open(&data);
     let out_format = default_output_format(ictx.format().name());
     let trim_duration = end_time.map(|end| end - start_time);
+    let absolute_end_us =
+        end_time.map(|end| (end * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64);
 
     let anchor_stream_index = ictx
         .streams()
@@ -109,7 +111,11 @@ fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
         }
 
         if is_anchor {
-            if let Some(limit) = trim_duration {
+            if let Some(end_us) = absolute_end_us {
+                if packet_time_us.is_some_and(|timestamp| timestamp >= end_us) {
+                    break;
+                }
+            } else if let Some(limit) = trim_duration {
                 let elapsed = packet_time_us
                     .map(|timestamp| {
                         (timestamp - start_us) as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)
@@ -493,6 +499,23 @@ mod tests {
         assert!(
             first_packet_time.abs() <= 0.1,
             "fast trim should rebase timestamps to start at 0, got {first_packet_time}"
+        );
+    }
+
+    #[pg_test]
+    fn test_trim_fast_uses_absolute_end_timestamp() {
+        let data = generate_test_matroska_video_with_gop_bytes(64, 64, 10, 4, 10);
+        let fast = trim(data.clone(), 1.5, Some(2.2), false);
+        let precise = trim(data, 1.5, Some(2.2), true);
+
+        let fast_duration =
+            decoded_video_duration_seconds(&fast).expect("expected fast-trim video output");
+        let precise_duration =
+            decoded_video_duration_seconds(&precise).expect("expected precise-trim video output");
+
+        assert!(
+            fast_duration > precise_duration + 0.2,
+            "fast trim should preserve media from the prior keyframe through the caller's absolute end_time: fast={fast_duration}, precise={precise_duration}"
         );
     }
 
