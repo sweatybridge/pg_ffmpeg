@@ -533,7 +533,6 @@ fn open_encoder(
         .unwrap_or_else(|e| error!("failed to create audio encoder: {e}"));
     encoder.set_rate(sample_rate as i32);
     encoder.set_channel_layout(channel_layout);
-    encoder.set_channels(channel_layout.channels());
     encoder.set_format(sample_format);
     encoder.set_time_base(encoder_time_base);
 
@@ -697,17 +696,10 @@ fn alloc_audio_frame(
 ) -> frame::Audio {
     let mut frame = frame::Audio::new(format, samples, channel_layout);
     frame.set_rate(rate);
-    set_audio_frame_channels(&mut frame, channel_layout);
     for plane in 0..frame.planes() {
         frame.data_mut(plane).fill(0);
     }
     frame
-}
-
-#[allow(unexpected_cfgs)]
-fn set_audio_frame_channels(frame: &mut frame::Audio, channel_layout: ChannelLayout) {
-    #[cfg(not(feature = "ffmpeg_7_0"))]
-    frame.set_channels(channel_layout.channels() as u16);
 }
 
 fn decoder_channel_layout(decoder: &ffmpeg_next::decoder::Audio) -> ChannelLayout {
