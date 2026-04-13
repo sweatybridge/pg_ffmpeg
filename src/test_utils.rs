@@ -140,20 +140,21 @@ fn set_audio_frame_channels(frame: &mut AudioFrame, channel_layout: ffmpeg_next:
     frame.set_channels(channel_layout.channels() as u16);
 }
 
-/// Generate a minimal MPEG-TS video (video stream only) in memory.
-///
-/// All-intra encoding: every frame is a keyframe so seeks land exactly
-/// on the requested timestamp. This matches the old per-file helper's
-/// behavior in `thumbnail.rs` (the stricter of the two existing
-/// flavors).
-pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_secs: i32) -> Vec<u8> {
+fn generate_test_video_bytes_with_gop_and_muxer(
+    width: u32,
+    height: u32,
+    fps: i32,
+    duration_secs: i32,
+    gop: u32,
+    muxer: &str,
+) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 
     let total_frames = fps * duration_secs;
     let enc_codec =
         ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
 
-    let mut octx = MemOutput::open("mpegts");
+    let mut octx = MemOutput::open(muxer);
 
     let mut stream = octx.add_stream(enc_codec).expect("failed to add stream");
     stream.set_time_base((1, fps));
@@ -164,7 +165,7 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
     encoder.set_height(height);
     encoder.set_format(Pixel::YUV420P);
     encoder.set_bit_rate(400_000);
-    encoder.set_gop(1);
+    encoder.set_gop(gop);
     encoder.set_max_b_frames(0);
     encoder.set_frame_rate(Some((fps, 1)));
     encoder.set_time_base((1, fps));
@@ -212,6 +213,55 @@ pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_sec
 
     octx.write_trailer().expect("failed to write trailer");
     octx.into_data()
+}
+
+/// Generate a minimal MPEG-TS video (video stream only) in memory.
+///
+/// All-intra encoding: every frame is a keyframe so seeks land exactly
+/// on the requested timestamp. This matches the old per-file helper's
+/// behavior in `thumbnail.rs` (the stricter of the two existing
+/// flavors).
+pub fn generate_test_video_bytes(width: u32, height: u32, fps: i32, duration_secs: i32) -> Vec<u8> {
+    generate_test_video_bytes_with_gop_and_muxer(width, height, fps, duration_secs, 1, "mpegts")
+}
+
+/// Generate a minimal MPEG-TS video with a configurable GOP so tests
+/// can exercise keyframe-seeking behavior on inter-frame content.
+pub fn generate_test_video_with_gop_bytes(
+    width: u32,
+    height: u32,
+    fps: i32,
+    duration_secs: i32,
+    gop: u32,
+) -> Vec<u8> {
+    generate_test_video_bytes_with_gop_and_muxer(
+        width,
+        height,
+        fps,
+        duration_secs,
+        gop.max(1),
+        "mpegts",
+    )
+}
+
+/// Generate a minimal Matroska video with a configurable GOP so tests
+/// can verify keyframe-oriented behavior without MPEG-TS timestamp
+/// quirks dominating the assertions.
+pub fn generate_test_matroska_video_with_gop_bytes(
+    width: u32,
+    height: u32,
+    fps: i32,
+    duration_secs: i32,
+    gop: u32,
+) -> Vec<u8> {
+    generate_test_video_bytes_with_gop_and_muxer(
+        width,
+        height,
+        fps,
+        duration_secs,
+        gop.max(1),
+        "matroska",
+    )
 }
 
 /// Generate a minimal MPEG-TS asset with one video stream and one MP2
