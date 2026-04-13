@@ -11,6 +11,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    container: debian:trixie
     strategy:
       fail-fast: false
       matrix:
@@ -18,46 +19,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Setup pgrx
+        uses: ./.github/actions/setup-pgrx
         with:
-          components: clippy, rustfmt
-          cache-key: pg${{ matrix.pg_version }}
-          cache-directories: /home/runner/.pgrx
+          pg_version: ${{ matrix.pg_version }}
+
+      - name: Install rustfmt and clippy
+        run: |
+          . "$HOME/.cargo/env"
+          rustup component add rustfmt clippy
+
+      - name: Check FFmpeg version
+        run: |
+          test "$(pkg-config --modversion libavcodec | cut -d. -f1)" = "61"
+          test "$(pkg-config --modversion libavformat | cut -d. -f1)" = "61"
+          test "$(pkg-config --modversion libavutil | cut -d. -f1)" = "59"
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config \
-            libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
-            libreadline-dev
-
-      - name: Install cargo-pgrx
-        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
-
-      - name: Initialize pgrx
-        run: |
-          set +e
-          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
-          if [ $? -ne 0 ]; then
-            cargo pgrx init --pg${{ matrix.pg_version }} download
-          fi
+          . "$HOME/.cargo/env"
+          cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --features pg${{ matrix.pg_version }} --no-default-features -- -D warnings
+        run: |
+          . "$HOME/.cargo/env"
+          cargo clippy --features pg${{ matrix.pg_version }} --no-default-features -- -D warnings
 
       - name: Test
-        run: cargo pgrx test "pg${{ matrix.pg_version }}"
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx test "pg${{ matrix.pg_version }}"
 
       - name: Bench
-        run: cargo pgrx bench "pg${{ matrix.pg_version }}"
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx bench "pg${{ matrix.pg_version }}"
 
   # HW-encoder smoke tests (Task F5). Opt-in job that only runs when
   # a self-hosted runner with a GPU is available. It is never required
@@ -86,6 +82,12 @@ jobs:
             libswscale-dev libswresample-dev \
             libavfilter-dev libavdevice-dev \
             libreadline-dev
+
+      - name: Check FFmpeg version
+        run: |
+          test "$(pkg-config --modversion libavcodec | cut -d. -f1)" = "61"
+          test "$(pkg-config --modversion libavformat | cut -d. -f1)" = "61"
+          test "$(pkg-config --modversion libavutil | cut -d. -f1)" = "59"
 
       - name: Install cargo-pgrx
         run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
