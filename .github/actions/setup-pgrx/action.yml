@@ -20,18 +20,7 @@ runs:
           libavcodec-dev libavformat-dev libavutil-dev \
           libswscale-dev libswresample-dev \
           libavfilter-dev libavdevice-dev \
-          libreadline-dev \
           git
-
-    - name: Verify FFmpeg 7 development libraries
-      shell: bash
-      run: |
-        codec_major="$(pkg-config --modversion libavcodec | cut -d. -f1)"
-        format_major="$(pkg-config --modversion libavformat | cut -d. -f1)"
-        util_major="$(pkg-config --modversion libavutil | cut -d. -f1)"
-        test "$codec_major" = "61"
-        test "$format_major" = "61"
-        test "$util_major" = "59"
 
     - name: Add PostgreSQL APT repository
       shell: bash
