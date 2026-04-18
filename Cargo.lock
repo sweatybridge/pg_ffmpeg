@@ -1123,8 +1123,8 @@ dependencies = [
 
 [[package]]
 name = "pgrx-bench"
-version = "0.17.0"
-source = "git+https://github.com/pgcentralfoundation/pgrx.git#59058a1a0ab0447413cb836eb63d5b5dbebf9762"
+version = "0.18.0"
+source = "git+https://github.com/pgcentralfoundation/pgrx.git?tag=v0.18.0#0486b47e9280127c8f7426ba1e1de260450dfd32"
 dependencies = [
  "criterion",
  "oorandom",

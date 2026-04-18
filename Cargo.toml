@@ -22,7 +22,7 @@ hwaccel_tests = []
 [dependencies]
 ffmpeg-next = "8"
 pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git", tag = "v0.18.0" }
-pgrx-bench = { git = "https://github.com/pgcentralfoundation/pgrx.git", optional = true }
+pgrx-bench = { git = "https://github.com/pgcentralfoundation/pgrx.git", tag = "v0.18.0", optional = true }
 serde_json = "1"
 tempfile = { version = "3", optional = true }
 
