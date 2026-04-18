@@ -529,7 +529,7 @@ pub fn generate_test_aac_adts_bytes(duration_secs: i32) -> Vec<u8> {
             audio_packet.set_stream(0);
             audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
             audio_packet
-                .write_interleaved(&mut *octx)
+                .write_interleaved(&mut octx)
                 .expect("failed to write audio packet");
         }
         next_audio_pts += samples_per_frame;
@@ -540,7 +540,7 @@ pub fn generate_test_aac_adts_bytes(duration_secs: i32) -> Vec<u8> {
         audio_packet.set_stream(0);
         audio_packet.rescale_ts((1, audio_sample_rate as i32), audio_out_time_base);
         audio_packet
-            .write_interleaved(&mut *octx)
+            .write_interleaved(&mut octx)
             .expect("failed to flush audio packet");
     }
 
