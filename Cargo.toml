@@ -4,11 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "lib"]
-
-[[bin]]
-name = "pgrx_embed_pg_ffmpeg"
-path = "./src/bin/pgrx_embed.rs"
+crate-type = ["cdylib"]
 
 [features]
 default = ["pg16"]
@@ -16,7 +12,7 @@ pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = ["tempfile"]
-pg_bench = ["tempfile", "pgrx-bench"]
+pg_bench = ["tempfile", "dep:pgrx-bench"]
 # Compile-time flag that enables tests requiring a real GPU-backed
 # hardware encoder. Default `cargo pgrx test` runs never exercise HW
 # encoders (only the software-fallback path); the HW tests run in a
@@ -25,13 +21,13 @@ hwaccel_tests = []
 
 [dependencies]
 ffmpeg-next = "8"
-pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
+pgrx = { git = "https://github.com/pgcentralfoundation/pgrx.git", tag = "v0.18.0" }
 pgrx-bench = { git = "https://github.com/pgcentralfoundation/pgrx.git", optional = true }
 serde_json = "1"
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
-pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx.git" }
+pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx.git", tag = "v0.18.0" }
 tempfile = "3"
 
 [profile.dev]
