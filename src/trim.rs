@@ -9,7 +9,7 @@ use ffmpeg_next::util::mathematics::rescale;
 use ffmpeg_next::{Rational, Rescale};
 
 #[pg_extern]
-fn trim(
+pub(crate) fn trim(
     data: Vec<u8>,
     start_time: default!(f64, 0.0),
     end_time: default!(Option<f64>, "NULL"),
