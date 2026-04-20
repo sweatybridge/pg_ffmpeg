@@ -6,6 +6,7 @@ mod codec_lookup;
 mod extract_audio;
 mod extract_frames;
 mod filter_safety;
+mod frame_encoder;
 mod hls;
 mod hwaccel;
 mod limits;

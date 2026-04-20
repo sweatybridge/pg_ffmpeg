@@ -10,7 +10,7 @@ use ffmpeg_next::codec;
 use ffmpeg_next::filter;
 use ffmpeg_next::format::{self, Pixel, Sample};
 use ffmpeg_next::media::Type;
-use ffmpeg_next::{frame, ChannelLayout, Dictionary, Packet, Rational, Rescale};
+use ffmpeg_next::{frame, ChannelLayout, Dictionary, Packet, Rational};
 
 use std::collections::HashMap;
 
@@ -39,21 +39,10 @@ struct VideoTranscodePipeline {
     filter_finished: bool,
 }
 
-struct AudioTranscodePipeline {
-    ost_index: usize,
-    decoder: ffmpeg_next::decoder::Audio,
-    encoder: ffmpeg_next::encoder::Audio,
-    encoder_time_base: Rational,
-    graph: filter::Graph,
-    next_decoded_pts: i64,
-    next_encoded_pts: i64,
-    filter_finished: bool,
-}
-
 #[allow(clippy::too_many_arguments)]
 #[pg_extern]
 pub(crate) fn transcode(
-    data: Vec<u8>,
+    data: &[u8],
     format: default!(Option<&str>, "NULL"),
     filter: default!(Option<&str>, "NULL"),
     codec: default!(Option<&str>, "NULL"),
@@ -85,7 +74,7 @@ pub(crate) fn transcode(
         filter_safety::validate_filter_spec(spec).unwrap_or_else(|e| error!("{e}"));
     }
 
-    let mut ictx = MemInput::open(&data);
+    let mut ictx = MemInput::open(data);
     let input_format = ictx.format().name().to_owned();
     let default_format = default_output_format(&input_format);
     let out_format = format.unwrap_or(&default_format);
@@ -107,7 +96,7 @@ pub(crate) fn transcode(
     let mut stream_mapping: Vec<isize> = vec![-1; ictx.streams().count()];
     let mut ist_time_bases = vec![Rational(0, 0); ictx.streams().count()];
     let mut video_pipelines: HashMap<usize, VideoTranscodePipeline> = HashMap::new();
-    let mut audio_pipelines: HashMap<usize, AudioTranscodePipeline> = HashMap::new();
+    let mut audio_pipelines: HashMap<usize, pipeline::AudioPipeline> = HashMap::new();
     let mut ost_index: usize = 0;
     let mut saw_video = false;
     let mut saw_audio = false;
@@ -152,8 +141,7 @@ pub(crate) fn transcode(
                 if audio_passthrough {
                     stream_mapping[ist_index] = pipeline::copy_stream(&ist, &mut octx) as isize;
                 } else {
-                    let pipe =
-                        AudioTranscodePipeline::new(&ist, &mut octx, ost_index, &audio_config);
+                    let pipe = build_audio_pipeline(&ist, &mut octx, ost_index, &audio_config);
                     stream_mapping[ist_index] = ost_index as isize;
                     audio_pipelines.insert(ist_index, pipe);
                     ost_index += 1;
@@ -432,180 +420,52 @@ impl VideoTranscodePipeline {
     }
 }
 
-impl AudioTranscodePipeline {
-    fn new(
-        ist: &ffmpeg_next::format::stream::Stream,
-        octx: &mut ffmpeg_next::format::context::Output,
-        ost_index: usize,
-        config: &AudioTranscodeConfig<'_>,
-    ) -> Self {
-        let decoder_ctx = codec::context::Context::from_parameters(ist.parameters())
-            .unwrap_or_else(|e| error!("failed to create audio decoder context: {e}"));
-        let mut decoder = decoder_ctx
-            .decoder()
-            .audio()
-            .unwrap_or_else(|e| error!("failed to open audio decoder: {e}"));
-        decoder
-            .set_parameters(ist.parameters())
-            .unwrap_or_else(|e| error!("failed to set audio decoder parameters: {e}"));
+fn build_audio_pipeline(
+    ist: &ffmpeg_next::format::stream::Stream,
+    octx: &mut ffmpeg_next::format::context::Output,
+    ost_index: usize,
+    config: &AudioTranscodeConfig<'_>,
+) -> pipeline::AudioPipeline {
+    let decoder_ctx = codec::context::Context::from_parameters(ist.parameters())
+        .unwrap_or_else(|e| error!("failed to create audio decoder context: {e}"));
+    let mut decoder = decoder_ctx
+        .decoder()
+        .audio()
+        .unwrap_or_else(|e| error!("failed to open audio decoder: {e}"));
+    decoder
+        .set_parameters(ist.parameters())
+        .unwrap_or_else(|e| error!("failed to set audio decoder parameters: {e}"));
 
-        let (selected_codec, codec_label) = resolve_audio_encoder(config.codec_name, decoder.id());
-        let audio_props = selected_codec
-            .audio()
-            .unwrap_or_else(|_| error!("selected encoder is not audio-capable"));
-        let sample_rate = resolve_audio_sample_rate(&decoder, &audio_props);
-        let channel_layout = resolve_audio_channel_layout(&decoder, &audio_props);
-        let sample_format = resolve_audio_sample_format(&decoder, &audio_props);
+    let (selected_codec, codec_label) = resolve_audio_encoder(config.codec_name, decoder.id());
+    let audio_props = selected_codec
+        .audio()
+        .unwrap_or_else(|_| error!("selected encoder is not audio-capable"));
+    let sample_rate = resolve_audio_sample_rate(&decoder, &audio_props);
+    let channel_layout = resolve_audio_channel_layout(&decoder, &audio_props);
+    let sample_format = resolve_audio_sample_format(&decoder, &audio_props);
 
-        let encoder = open_audio_encoder(
-            octx,
-            &decoder,
-            selected_codec,
-            &codec_label,
-            sample_rate,
-            channel_layout,
-            sample_format,
-            Rational::new(1, sample_rate as i32),
-            config,
-        );
-        let encoder_time_base = encoder.time_base();
-        let graph = build_audio_filter_graph(&decoder, &encoder, config.filter_spec);
+    let encoder = open_audio_encoder(
+        octx,
+        &decoder,
+        selected_codec,
+        &codec_label,
+        sample_rate,
+        channel_layout,
+        sample_format,
+        Rational::new(1, sample_rate as i32),
+        config,
+    );
 
-        let mut ost = octx
-            .add_stream(selected_codec)
-            .unwrap_or_else(|e| error!("failed to add audio output stream: {e}"));
-        ost.set_time_base(encoder_time_base);
-        ost.set_parameters(&encoder);
-        unsafe {
-            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
-        }
-
-        Self {
-            ost_index,
-            decoder,
-            encoder,
-            encoder_time_base,
-            graph,
-            next_decoded_pts: 0,
-            next_encoded_pts: 0,
-            filter_finished: false,
-        }
+    let mut ost = octx
+        .add_stream(selected_codec)
+        .unwrap_or_else(|e| error!("failed to add audio output stream: {e}"));
+    ost.set_time_base(encoder.time_base());
+    ost.set_parameters(&encoder);
+    unsafe {
+        (*ost.parameters().as_mut_ptr()).codec_tag = 0;
     }
 
-    fn decoder_time_base(&self) -> Rational {
-        self.decoder.time_base()
-    }
-
-    fn send_packet_to_decoder(&mut self, packet: &Packet) {
-        if self.filter_finished {
-            return;
-        }
-        self.decoder
-            .send_packet(packet)
-            .unwrap_or_else(|e| error!("audio decode error: {e}"));
-    }
-
-    fn send_eof_to_decoder(&mut self) {
-        if self.filter_finished {
-            return;
-        }
-        let _ = self.decoder.send_eof();
-    }
-
-    fn receive_and_process_decoded_frames(
-        &mut self,
-        octx: &mut ffmpeg_next::format::context::Output,
-        ost_time_base: Rational,
-    ) {
-        let mut decoded = frame::Audio::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
-            if self.filter_finished {
-                continue;
-            }
-            let frame_time_base = audio_frame_time_base(&self.decoder);
-            let timestamp = decoded
-                .timestamp()
-                .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
-                .unwrap_or(self.next_decoded_pts);
-            let timestamp = timestamp.max(self.next_decoded_pts);
-            decoded.set_pts(Some(timestamp));
-            self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
-            let mut source = self.graph.get("in").unwrap();
-            match source.source().add(&decoded) {
-                Ok(()) => {}
-                Err(ffmpeg_next::Error::Eof) => {
-                    self.filter_finished = true;
-                    continue;
-                }
-                Err(e) => error!("audio filter source error: {e}"),
-            }
-            self.receive_and_process_filtered_frames(octx, ost_time_base);
-        }
-    }
-
-    fn receive_and_process_filtered_frames(
-        &mut self,
-        octx: &mut ffmpeg_next::format::context::Output,
-        ost_time_base: Rational,
-    ) {
-        let mut filtered = frame::Audio::empty();
-        while self
-            .graph
-            .get("out")
-            .unwrap()
-            .sink()
-            .frame(&mut filtered)
-            .is_ok()
-        {
-            let timestamp = filtered.timestamp().unwrap_or(self.next_encoded_pts);
-            let timestamp = timestamp.max(self.next_encoded_pts);
-            filtered.set_pts(Some(timestamp));
-            self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
-            self.encoder.send_frame(&filtered).unwrap_or_else(|e| {
-                error!(
-                    "audio encode error: {e} (frame: pts={:?} samples={} rate={} channels={} layout=0x{:x} format={:?}; encoder: frame_size={} rate={} channels={} layout=0x{:x} format={:?} time_base={}/{})",
-                    filtered.timestamp(),
-                    filtered.samples(),
-                    filtered.rate(),
-                    filtered.channels(),
-                    filtered.channel_layout().bits(),
-                    filtered.format(),
-                    self.encoder.frame_size(),
-                    self.encoder.rate(),
-                    self.encoder.channels(),
-                    self.encoder.channel_layout().bits(),
-                    self.encoder.format(),
-                    self.encoder_time_base.numerator(),
-                    self.encoder_time_base.denominator(),
-                )
-            });
-            self.receive_and_process_encoded_packets(octx, ost_time_base);
-        }
-    }
-
-    fn flush_filter(&mut self) {
-        let _ = self.graph.get("in").unwrap().source().flush();
-    }
-
-    fn send_eof_to_encoder(&mut self) {
-        let _ = self.encoder.send_eof();
-    }
-
-    fn receive_and_process_encoded_packets(
-        &mut self,
-        octx: &mut ffmpeg_next::format::context::Output,
-        ost_time_base: Rational,
-    ) {
-        let mut encoded = Packet::empty();
-        while self.encoder.receive_packet(&mut encoded).is_ok() {
-            encoded.set_stream(self.ost_index);
-            encoded.rescale_ts(self.encoder_time_base, ost_time_base);
-            encoded.set_position(-1);
-            encoded
-                .write_interleaved(octx)
-                .unwrap_or_else(|e| error!("failed to write audio packet: {e}"));
-        }
-    }
+    pipeline::AudioPipeline::new(decoder, encoder, config.filter_spec, ost_index)
 }
 
 fn resolved_video_output(graph: &mut filter::Graph) -> (u32, u32, Pixel, Rational) {
@@ -691,12 +551,8 @@ fn resolve_video_encoder(
             codec_lookup::find_encoder(name, CodecKind::Video).unwrap_or_else(|e| error!("{e}"));
         (codec, name.to_owned())
     } else {
-        let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
-            error!(
-                "pg_ffmpeg: no video encoder found for source codec {:?}",
-                source_id
-            )
-        });
+        let codec = codec_lookup::find_encoder_by_id(source_id, CodecKind::Video)
+            .unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     }
 }
@@ -710,12 +566,8 @@ fn resolve_audio_encoder(
             codec_lookup::find_encoder(name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     } else {
-        let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
-            error!(
-                "pg_ffmpeg: no audio encoder found for source codec {:?}",
-                source_id
-            )
-        });
+        let codec = codec_lookup::find_encoder_by_id(source_id, CodecKind::Audio)
+            .unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     }
 }
@@ -874,60 +726,6 @@ fn open_audio_encoder(
     })
 }
 
-fn build_audio_filter_graph(
-    decoder: &ffmpeg_next::decoder::Audio,
-    encoder: &ffmpeg_next::encoder::Audio,
-    spec: &str,
-) -> filter::Graph {
-    let mut graph = filter::Graph::new();
-    let decoder_layout = decoder_channel_layout(decoder);
-    let decoder_time_base = decoder.time_base();
-    let args = format!(
-        "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
-        decoder_time_base.numerator(),
-        decoder_time_base.denominator(),
-        decoder.rate(),
-        decoder.format().name(),
-        decoder_layout.bits(),
-    );
-    graph
-        .add(&filter::find("abuffer").unwrap(), "in", &args)
-        .unwrap_or_else(|e| error!("failed to add abuffer source: {e}"));
-    graph
-        .add(&filter::find("abuffersink").unwrap(), "out", "")
-        .unwrap_or_else(|e| error!("failed to add abuffer sink: {e}"));
-    {
-        let mut out = graph.get("out").unwrap();
-        out.set_sample_rate(encoder.rate());
-        out.set_channel_layout(encoder.channel_layout());
-        out.set_sample_format(encoder.format());
-    }
-    graph
-        .output("in", 0)
-        .unwrap()
-        .input("out", 0)
-        .unwrap()
-        .parse(spec)
-        .unwrap_or_else(|e| error!("failed to parse audio filter '{}': {e}", spec));
-    graph
-        .validate()
-        .unwrap_or_else(|e| error!("failed to validate audio filter graph: {e}"));
-    if let Some(codec) = encoder.codec() {
-        if encoder.frame_size() > 0
-            && !codec
-                .capabilities()
-                .contains(ffmpeg_next::codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
-        {
-            graph
-                .get("out")
-                .unwrap()
-                .sink()
-                .set_frame_size(encoder.frame_size());
-        }
-    }
-    graph
-}
-
 fn resolve_audio_sample_rate(
     decoder: &ffmpeg_next::decoder::Audio,
     codec: &ffmpeg_next::codec::audio::Audio,
@@ -951,30 +749,18 @@ fn resolve_audio_channel_layout(
     decoder: &ffmpeg_next::decoder::Audio,
     codec: &ffmpeg_next::codec::audio::Audio,
 ) -> ChannelLayout {
-    let decoder_layout = decoder_channel_layout(decoder);
     let decoder_channels = decoder.channels() as i32;
+    let fallback = if decoder.channel_layout().bits() != 0 {
+        decoder.channel_layout()
+    } else if decoder.channels() > 0 {
+        ChannelLayout::default(decoder_channels)
+    } else {
+        ChannelLayout::STEREO
+    };
     codec
         .channel_layouts()
         .map(|layouts| layouts.best(decoder_channels))
-        .unwrap_or(decoder_layout)
-}
-
-fn decoder_channel_layout(decoder: &ffmpeg_next::decoder::Audio) -> ChannelLayout {
-    if decoder.channel_layout().bits() != 0 {
-        decoder.channel_layout()
-    } else if decoder.channels() > 0 {
-        ChannelLayout::default(decoder.channels() as i32)
-    } else {
-        ChannelLayout::STEREO
-    }
-}
-
-fn audio_frame_time_base(decoder: &ffmpeg_next::decoder::Audio) -> Rational {
-    if decoder.rate() > 0 {
-        Rational::new(1, decoder.rate() as i32)
-    } else {
-        decoder.time_base()
-    }
+        .unwrap_or(fallback)
 }
 
 fn resolve_audio_sample_format(
@@ -1007,7 +793,7 @@ mod tests {
     fn test_transcode_default_format() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            data.clone(),
+            &data,
             None,
             None,
             None,
@@ -1030,7 +816,7 @@ mod tests {
     fn test_transcode_to_different_format() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             Some("matroska"),
             None,
             None,
@@ -1055,7 +841,8 @@ mod tests {
 
         ffmpeg_next::init().unwrap();
 
-        let enc_codec = ffmpeg_next::encoder::find(codec::Id::PNG).expect("PNG encoder not found");
+        let enc_codec = codec_lookup::find_encoder_by_id(codec::Id::PNG, CodecKind::Video)
+            .expect("PNG encoder not found");
         let mut octx = MemOutput::open("image2pipe");
         let mut stream = octx.add_stream(enc_codec).expect("failed to add stream");
         stream.set_time_base((1, 1));
@@ -1097,7 +884,7 @@ mod tests {
         assert!(!png_data.is_empty());
 
         let result = transcode(
-            png_data,
+            &png_data,
             None,
             Some("crop=32:32:0:0"),
             None,
@@ -1127,7 +914,7 @@ mod tests {
     fn test_transcode_with_scale_filter() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             None,
             Some("scale=32:32"),
             None,
@@ -1157,7 +944,7 @@ mod tests {
     fn test_transcode_with_codec_selection() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             Some("matroska"),
             None,
             Some("libx264"),
@@ -1186,7 +973,7 @@ mod tests {
     fn test_transcode_with_crf_and_preset() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             Some("matroska"),
             None,
             Some("libx264"),
@@ -1205,7 +992,7 @@ mod tests {
     fn test_transcode_audio_filter_volume() {
         let data = generate_test_video_with_audio_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             Some("matroska"),
             None,
             None,
@@ -1227,7 +1014,7 @@ mod tests {
     fn test_transcode_audio_codec_change() {
         let data = generate_test_video_with_audio_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             Some("matroska"),
             None,
             None,
@@ -1253,7 +1040,7 @@ mod tests {
     fn test_transcode_hwaccel_fallback() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            data,
+            &data,
             Some("mpegts"),
             None,
             Some("mpeg2video"),
@@ -1280,7 +1067,7 @@ mod tests {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = std::panic::catch_unwind(|| {
             transcode(
-                data,
+                &data,
                 None,
                 Some("movie=/etc/passwd"),
                 None,
@@ -1309,7 +1096,7 @@ mod benches {
         let data = sample_video_bytes();
         b.iter(move || {
             black_box(super::transcode(
-                data.clone(),
+                &data,
                 Some("matroska"),
                 None,
                 None,
@@ -1329,7 +1116,7 @@ mod benches {
         let data = sample_video_bytes();
         b.iter(move || {
             black_box(super::transcode(
-                data.clone(),
+                &data,
                 None,
                 Some("scale=320:240"),
                 None,

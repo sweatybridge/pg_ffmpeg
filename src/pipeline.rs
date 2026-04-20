@@ -28,7 +28,7 @@
 use ffmpeg_next::codec;
 use ffmpeg_next::filter;
 use ffmpeg_next::util::frame::video::Video;
-use ffmpeg_next::{frame, picture, Packet, Rational};
+use ffmpeg_next::{frame, picture, Packet, Rational, Rescale};
 
 use crate::codec_lookup;
 
@@ -88,15 +88,8 @@ impl VideoPipeline {
         // Resolve the encoder via the uniform codec-lookup path so that
         // decode-only codecs surface the F7 error contract.
         let codec_id = decoder.id();
-        let enc_codec = codec_lookup::find_decoder(codec_id)
-            .ok()
-            .and_then(|_| {
-                // When the codec id has an encoder of the same family
-                // we prefer that; otherwise fall through to
-                // `codec::encoder::find`.
-                codec::encoder::find(codec_id)
-            })
-            .unwrap_or_else(|| pgrx::error!("no encoder found for codec {:?}", codec_id));
+        let enc_codec = codec_lookup::find_encoder_by_id(codec_id, codec_lookup::CodecKind::Video)
+            .unwrap_or_else(|e| pgrx::error!("{e}"));
         let enc_ctx = codec::context::Context::new_with_codec(enc_codec);
         let mut video_enc = enc_ctx
             .encoder()
@@ -293,34 +286,42 @@ fn video_filter_input_time_base(decoder: &ffmpeg_next::decoder::Video) -> Ration
 }
 
 // -----------------------------------------------------------------------------
-// AudioPipeline (F1): audio-stream twin of VideoPipeline. Currently
-// there is no M-F caller that needs this; the skeleton is here so
-// Milestone 1's enhanced `extract_audio` and `transcode` can flesh it
-// out without re-opening the API shape discussion.
+// AudioPipeline (F1): audio-stream twin of VideoPipeline.
+//
+// Shared between `transcode` and `extract_audio`. Keeping the pump loop
+// in one place means both paths inherit the same PTS normalization
+// (ffmpeg decoders can omit timestamps on the first frame) and the same
+// frame-move discipline — frames are never cloned between pipeline
+// stages; the same frame buffer is reused for each decode→filter→encode
+// step and mutated in place.
 // -----------------------------------------------------------------------------
 
-/// Assemble an `abuffer → spec → abuffersink` filter graph for a
-/// single audio decoder.
+/// Assemble an `abuffer → spec → abuffersink` filter graph wired for a
+/// specific decoder and encoder pair.
+///
+/// The sink is constrained to the encoder's sample rate / channel
+/// layout / sample format so the filter graph itself performs any
+/// needed resampling; callers don't need a separate `swresample`
+/// context unless they're deliberately bypassing the filter path.
+///
+/// When the encoder requires a fixed frame size (i.e. it does not
+/// advertise `Capabilities::VARIABLE_FRAME_SIZE`) the sink is told to
+/// chunk output frames to that size.
 pub fn build_audio_filter_graph(
     decoder: &ffmpeg_next::decoder::Audio,
+    encoder: &ffmpeg_next::encoder::Audio,
     spec: &str,
 ) -> filter::Graph {
     let mut graph = filter::Graph::new();
-    // Channel layout may be zero for some PCM streams — fall back to a
-    // sensible default so abuffer doesn't reject the args string.
-    let layout_mask = if decoder.channel_layout().bits() != 0 {
-        decoder.channel_layout().bits()
-    } else {
-        ffmpeg_next::ChannelLayout::STEREO.bits()
-    };
-    let sample_fmt_int = Into::<ffmpeg_next::sys::AVSampleFormat>::into(decoder.format()) as i32;
+    let decoder_layout = decoder_channel_layout(decoder);
+    let decoder_time_base = decoder.time_base();
     let args = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
-        decoder.time_base().numerator(),
-        decoder.time_base().denominator(),
+        decoder_time_base.numerator(),
+        decoder_time_base.denominator(),
         decoder.rate(),
-        sample_fmt_int,
-        layout_mask,
+        decoder.format().name(),
+        decoder_layout.bits(),
     );
     graph
         .add(&filter::find("abuffer").unwrap(), "in", &args)
@@ -328,6 +329,12 @@ pub fn build_audio_filter_graph(
     graph
         .add(&filter::find("abuffersink").unwrap(), "out", "")
         .unwrap_or_else(|e| pgrx::error!("failed to add abuffer sink: {e}"));
+    {
+        let mut out = graph.get("out").unwrap();
+        out.set_sample_rate(encoder.rate());
+        out.set_channel_layout(encoder.channel_layout());
+        out.set_sample_format(encoder.format());
+    }
     graph
         .output("in", 0)
         .unwrap()
@@ -338,7 +345,205 @@ pub fn build_audio_filter_graph(
     graph
         .validate()
         .unwrap_or_else(|e| pgrx::error!("failed to validate audio filter graph: {e}"));
+    if let Some(codec) = encoder.codec() {
+        if encoder.frame_size() > 0
+            && !codec
+                .capabilities()
+                .contains(ffmpeg_next::codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
+        {
+            graph
+                .get("out")
+                .unwrap()
+                .sink()
+                .set_frame_size(encoder.frame_size());
+        }
+    }
     graph
+}
+
+/// Decode → filter → encode pipeline for a single audio stream.
+///
+/// Takes ownership of a pre-built decoder and encoder, wires an
+/// `abuffer → spec → abuffersink` graph constrained to the encoder's
+/// output format, and exposes the same pump API as `VideoPipeline`.
+///
+/// Frames are never cloned: `decoded` and `filtered` are reused across
+/// iterations and mutated in place so pts normalization does not cost
+/// an allocation per sample block.
+pub struct AudioPipeline {
+    ost_index: usize,
+    decoder: ffmpeg_next::decoder::Audio,
+    encoder: ffmpeg_next::encoder::Audio,
+    encoder_time_base: Rational,
+    graph: filter::Graph,
+    next_decoded_pts: i64,
+    next_encoded_pts: i64,
+    filter_finished: bool,
+}
+
+impl AudioPipeline {
+    pub fn new(
+        decoder: ffmpeg_next::decoder::Audio,
+        encoder: ffmpeg_next::encoder::Audio,
+        filter_spec: &str,
+        ost_index: usize,
+    ) -> Self {
+        let encoder_time_base = encoder.time_base();
+        let graph = build_audio_filter_graph(&decoder, &encoder, filter_spec);
+        Self {
+            ost_index,
+            decoder,
+            encoder,
+            encoder_time_base,
+            graph,
+            next_decoded_pts: 0,
+            next_encoded_pts: 0,
+            filter_finished: false,
+        }
+    }
+
+    pub fn decoder_time_base(&self) -> Rational {
+        self.decoder.time_base()
+    }
+
+    pub fn encoder(&self) -> &ffmpeg_next::encoder::Audio {
+        &self.encoder
+    }
+
+    pub fn encoder_time_base(&self) -> Rational {
+        self.encoder_time_base
+    }
+
+    pub fn send_packet_to_decoder(&mut self, packet: &Packet) {
+        if self.filter_finished {
+            return;
+        }
+        self.decoder
+            .send_packet(packet)
+            .unwrap_or_else(|e| pgrx::error!("audio decode error: {e}"));
+    }
+
+    pub fn send_eof_to_decoder(&mut self) {
+        if self.filter_finished {
+            return;
+        }
+        let _ = self.decoder.send_eof();
+    }
+
+    pub fn receive_and_process_decoded_frames(
+        &mut self,
+        octx: &mut ffmpeg_next::format::context::Output,
+        ost_time_base: Rational,
+    ) {
+        let mut decoded = frame::Audio::empty();
+        while self.decoder.receive_frame(&mut decoded).is_ok() {
+            if self.filter_finished {
+                continue;
+            }
+            let frame_time_base = audio_frame_time_base(&self.decoder);
+            let timestamp = decoded
+                .timestamp()
+                .map(|pts| pts.rescale(self.decoder.time_base(), frame_time_base))
+                .unwrap_or(self.next_decoded_pts)
+                .max(self.next_decoded_pts);
+            decoded.set_pts(Some(timestamp));
+            self.next_decoded_pts = timestamp.saturating_add(decoded.samples() as i64);
+            let mut source = self.graph.get("in").unwrap();
+            match source.source().add(&decoded) {
+                Ok(()) => {}
+                Err(ffmpeg_next::Error::Eof) => {
+                    self.filter_finished = true;
+                    continue;
+                }
+                Err(e) => pgrx::error!("audio filter source error: {e}"),
+            }
+            self.receive_and_process_filtered_frames(octx, ost_time_base);
+        }
+    }
+
+    pub fn receive_and_process_filtered_frames(
+        &mut self,
+        octx: &mut ffmpeg_next::format::context::Output,
+        ost_time_base: Rational,
+    ) {
+        let mut filtered = frame::Audio::empty();
+        while self
+            .graph
+            .get("out")
+            .unwrap()
+            .sink()
+            .frame(&mut filtered)
+            .is_ok()
+        {
+            let timestamp = filtered
+                .timestamp()
+                .unwrap_or(self.next_encoded_pts)
+                .max(self.next_encoded_pts);
+            filtered.set_pts(Some(timestamp));
+            self.next_encoded_pts = timestamp.saturating_add(filtered.samples() as i64);
+            self.encoder.send_frame(&filtered).unwrap_or_else(|e| {
+                pgrx::error!(
+                    "audio encode error: {e} (frame: pts={:?} samples={} rate={} channels={} layout=0x{:x} format={:?}; encoder: frame_size={} rate={} channels={} layout=0x{:x} format={:?} time_base={}/{})",
+                    filtered.timestamp(),
+                    filtered.samples(),
+                    filtered.rate(),
+                    filtered.channels(),
+                    filtered.channel_layout().bits(),
+                    filtered.format(),
+                    self.encoder.frame_size(),
+                    self.encoder.rate(),
+                    self.encoder.channels(),
+                    self.encoder.channel_layout().bits(),
+                    self.encoder.format(),
+                    self.encoder_time_base.numerator(),
+                    self.encoder_time_base.denominator(),
+                )
+            });
+            self.receive_and_process_encoded_packets(octx, ost_time_base);
+        }
+    }
+
+    pub fn flush_filter(&mut self) {
+        let _ = self.graph.get("in").unwrap().source().flush();
+    }
+
+    pub fn send_eof_to_encoder(&mut self) {
+        let _ = self.encoder.send_eof();
+    }
+
+    pub fn receive_and_process_encoded_packets(
+        &mut self,
+        octx: &mut ffmpeg_next::format::context::Output,
+        ost_time_base: Rational,
+    ) {
+        let mut encoded = Packet::empty();
+        while self.encoder.receive_packet(&mut encoded).is_ok() {
+            encoded.set_stream(self.ost_index);
+            encoded.rescale_ts(self.encoder_time_base, ost_time_base);
+            encoded.set_position(-1);
+            encoded
+                .write_interleaved(octx)
+                .unwrap_or_else(|e| pgrx::error!("failed to write audio packet: {e}"));
+        }
+    }
+}
+
+fn decoder_channel_layout(decoder: &ffmpeg_next::decoder::Audio) -> ffmpeg_next::ChannelLayout {
+    if decoder.channel_layout().bits() != 0 {
+        decoder.channel_layout()
+    } else if decoder.channels() > 0 {
+        ffmpeg_next::ChannelLayout::default(decoder.channels() as i32)
+    } else {
+        ffmpeg_next::ChannelLayout::STEREO
+    }
+}
+
+fn audio_frame_time_base(decoder: &ffmpeg_next::decoder::Audio) -> Rational {
+    if decoder.rate() > 0 {
+        Rational::new(1, decoder.rate() as i32)
+    } else {
+        decoder.time_base()
+    }
 }
 
 /// Copy a single input stream's parameters into a new output stream.

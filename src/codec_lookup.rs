@@ -161,6 +161,35 @@ pub fn find_decoder(id: CodecId) -> Result<Codec, CodecError> {
     })
 }
 
+/// Look up an encoder by codec id, enforcing the expected kind.
+///
+/// Used by callers that resolve a codec from an input stream (e.g.
+/// trim's "re-encode with the source codec" path). Produces the same
+/// `EncoderNotFound` / `WrongKind` error contract as [`find_encoder`]
+/// so decode-only builds surface the F7 message instead of a late
+/// mid-stream FFmpeg error.
+pub fn find_encoder_by_id(id: CodecId, kind: CodecKind) -> Result<Codec, CodecError> {
+    let Some(codec) = codec::encoder::find(id) else {
+        return Err(CodecError::EncoderNotFound {
+            name: format!("{:?}", id).to_lowercase(),
+            kind,
+        });
+    };
+    let actual = CodecKind::from_medium(codec.medium()).ok_or_else(|| CodecError::WrongKind {
+        name: format!("{:?}", id).to_lowercase(),
+        actual: kind,
+        expected: kind,
+    })?;
+    if actual != kind {
+        return Err(CodecError::WrongKind {
+            name: format!("{:?}", id).to_lowercase(),
+            actual,
+            expected: kind,
+        });
+    }
+    Ok(codec)
+}
+
 /// Look up a muxer / container format by short name.
 ///
 /// Note: `ffmpeg_next::format::output::find` exists in some versions of the

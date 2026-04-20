@@ -10,6 +10,7 @@
 # supported escape hatch.
 disallowed-methods = [
     { path = "ffmpeg_next::codec::encoder::find_by_name", reason = "use crate::codec_lookup::find_encoder" },
+    { path = "ffmpeg_next::codec::encoder::find", reason = "use crate::codec_lookup::find_encoder_by_id" },
     { path = "ffmpeg_next::codec::decoder::find", reason = "use crate::codec_lookup::find_decoder" },
     # `format::output::find` is not exposed by every ffmpeg-next version
     # we support; allow-invalid lets older versions still lint cleanly.
