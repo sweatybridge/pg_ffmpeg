@@ -1334,10 +1334,9 @@ mod tests {
 
     #[pg_test]
     fn test_filter_complex_amix() {
-        let a = generate_test_aac_adts_bytes(1);
-        let b = generate_test_aac_adts_bytes(1);
+        let audio = generate_test_aac_adts_bytes(1);
         let result = filter_complex_slices(
-            &[a.as_slice(), b.as_slice()],
+            &[audio.as_slice(), audio.as_slice()],
             "[i0:a][i1:a]amix=inputs=2[aout]",
             "matroska",
             None,
