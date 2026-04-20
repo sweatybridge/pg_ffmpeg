@@ -2,21 +2,28 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
+mod animation;
 mod codec_lookup;
+mod concat;
+mod encode;
 mod extract_audio;
 mod extract_frames;
+mod filter_complex;
 mod filter_safety;
 mod hls;
 mod hwaccel;
 mod limits;
 mod media_info;
 pub mod mem_io;
+mod overlay;
 mod pipeline;
+mod subtitles;
 #[cfg(any(test, feature = "pg_test"))]
 mod test_utils;
 mod thumbnail;
 mod transcode;
 mod trim;
+mod waveform;
 
 /// Postgres `_PG_init` entrypoint. Postgres calls this once per backend
 /// when the shared library is first loaded. We use it to register the
