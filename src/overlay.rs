@@ -10,7 +10,7 @@ use crate::pipeline;
 use ffmpeg_next::codec;
 use ffmpeg_next::format::{self, Pixel};
 use ffmpeg_next::media::Type;
-use ffmpeg_next::{frame, picture, Packet, Rational, Rescale};
+use ffmpeg_next::{frame, picture, Error as FfmpegError, Packet, Rational, Rescale};
 
 #[pg_extern]
 fn overlay(
@@ -89,46 +89,34 @@ pub(crate) fn overlay_slices(
     let output_time_bases: Vec<Rational> =
         octx.streams().map(|stream| stream.time_base()).collect();
 
-    for (stream, mut packet) in bg.packets() {
-        if stream.index() == bg_video_stream {
-            packet.rescale_ts(stream.time_base(), bg_decoder.time_base());
-            bg_decoder
-                .send_packet(&packet)
-                .unwrap_or_else(|e| error!("background decode error: {e}"));
-            receive_and_push_video(&mut bg_decoder, &mut graph, 0);
-            let video_time_base = output_time_bases[video.ost_index];
-            drain_overlay_output(&mut graph, &mut video, &mut octx, video_time_base);
-        } else if Some(stream.index()) == bg_audio_stream {
-            if let Some(ost) = audio_out_index {
-                let mut packet = packet;
-                packet.set_stream(ost);
-                packet.rescale_ts(stream.time_base(), output_time_bases[ost]);
-                packet.set_position(-1);
-                packet
-                    .write_interleaved(&mut octx)
-                    .unwrap_or_else(|e| error!("failed to write background audio packet: {e}"));
-            }
+    let mut background_active = true;
+    let mut foreground_active = true;
+    while background_active || foreground_active {
+        if background_active {
+            background_active = process_next_background_packet(
+                &mut bg,
+                bg_video_stream,
+                &mut bg_decoder,
+                bg_audio_stream,
+                audio_out_index,
+                &mut graph,
+                &mut video,
+                &mut octx,
+                &output_time_bases,
+            );
+        }
+        if foreground_active {
+            foreground_active = process_next_foreground_packet(
+                &mut fg,
+                fg_video_stream,
+                &mut fg_decoder,
+                &mut graph,
+                &mut video,
+                &mut octx,
+                &output_time_bases,
+            );
         }
     }
-    let _ = bg_decoder.send_eof();
-    receive_and_push_video(&mut bg_decoder, &mut graph, 0);
-    graph.flush_input(0);
-
-    for (stream, mut packet) in fg.packets() {
-        if stream.index() != fg_video_stream {
-            continue;
-        }
-        packet.rescale_ts(stream.time_base(), fg_decoder.time_base());
-        fg_decoder
-            .send_packet(&packet)
-            .unwrap_or_else(|e| error!("foreground decode error: {e}"));
-        receive_and_push_video(&mut fg_decoder, &mut graph, 1);
-        let video_time_base = output_time_bases[video.ost_index];
-        drain_overlay_output(&mut graph, &mut video, &mut octx, video_time_base);
-    }
-    let _ = fg_decoder.send_eof();
-    receive_and_push_video(&mut fg_decoder, &mut graph, 1);
-    graph.flush_input(1);
 
     let video_time_base = output_time_bases[video.ost_index];
     drain_overlay_output(&mut graph, &mut video, &mut octx, video_time_base);
@@ -147,6 +135,105 @@ fn overlay_filter_spec(x: i32, y: i32, start_time: f64, end_time: Option<f64>) -
         ),
         None => {
             format!("[bg][fg]overlay={x}:{y}:enable='gte(t,{start_time:.6})':eof_action=pass[vout]")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_next_background_packet(
+    bg: &mut MemInput<'_>,
+    video_stream: usize,
+    decoder: &mut ffmpeg_next::decoder::Video,
+    audio_stream: Option<usize>,
+    audio_out_index: Option<usize>,
+    graph: &mut pipeline::MultiInputGraph,
+    video: &mut OverlayVideoOutput,
+    octx: &mut ffmpeg_next::format::context::Output,
+    output_time_bases: &[Rational],
+) -> bool {
+    loop {
+        let mut packet = Packet::empty();
+        match packet.read(bg) {
+            Ok(()) => {
+                let stream_index = packet.stream();
+                let stream_time_base = bg
+                    .stream(stream_index)
+                    .unwrap_or_else(|| error!("pg_ffmpeg: packet references missing stream"))
+                    .time_base();
+                if stream_index == video_stream {
+                    packet.rescale_ts(stream_time_base, decoder.time_base());
+                    decoder
+                        .send_packet(&packet)
+                        .unwrap_or_else(|e| error!("background decode error: {e}"));
+                    receive_and_push_video(decoder, graph, 0);
+                    let video_time_base = output_time_bases[video.ost_index];
+                    drain_overlay_output(graph, video, octx, video_time_base);
+                    return true;
+                }
+                if Some(stream_index) == audio_stream {
+                    if let Some(ost) = audio_out_index {
+                        packet.set_stream(ost);
+                        packet.rescale_ts(stream_time_base, output_time_bases[ost]);
+                        packet.set_position(-1);
+                        packet.write_interleaved(octx).unwrap_or_else(|e| {
+                            error!("failed to write background audio packet: {e}")
+                        });
+                    }
+                    return true;
+                }
+            }
+            Err(FfmpegError::Eof) => {
+                let _ = decoder.send_eof();
+                receive_and_push_video(decoder, graph, 0);
+                graph.flush_input(0);
+                let video_time_base = output_time_bases[video.ost_index];
+                drain_overlay_output(graph, video, octx, video_time_base);
+                return false;
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn process_next_foreground_packet(
+    fg: &mut MemInput<'_>,
+    video_stream: usize,
+    decoder: &mut ffmpeg_next::decoder::Video,
+    graph: &mut pipeline::MultiInputGraph,
+    video: &mut OverlayVideoOutput,
+    octx: &mut ffmpeg_next::format::context::Output,
+    output_time_bases: &[Rational],
+) -> bool {
+    loop {
+        let mut packet = Packet::empty();
+        match packet.read(fg) {
+            Ok(()) => {
+                let stream_index = packet.stream();
+                if stream_index != video_stream {
+                    continue;
+                }
+                let stream_time_base = fg
+                    .stream(stream_index)
+                    .unwrap_or_else(|| error!("pg_ffmpeg: packet references missing stream"))
+                    .time_base();
+                packet.rescale_ts(stream_time_base, decoder.time_base());
+                decoder
+                    .send_packet(&packet)
+                    .unwrap_or_else(|e| error!("foreground decode error: {e}"));
+                receive_and_push_video(decoder, graph, 1);
+                let video_time_base = output_time_bases[video.ost_index];
+                drain_overlay_output(graph, video, octx, video_time_base);
+                return true;
+            }
+            Err(FfmpegError::Eof) => {
+                let _ = decoder.send_eof();
+                receive_and_push_video(decoder, graph, 1);
+                graph.flush_input(1);
+                let video_time_base = output_time_bases[video.ost_index];
+                drain_overlay_output(graph, video, octx, video_time_base);
+                return false;
+            }
+            Err(_) => {}
         }
     }
 }

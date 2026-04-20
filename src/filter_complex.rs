@@ -11,7 +11,7 @@ use crate::pipeline::{InputKind, MultiInputGraph};
 use ffmpeg_next::codec::{self, Id as CodecId};
 use ffmpeg_next::format::{self, Pixel, Sample};
 use ffmpeg_next::media::Type;
-use ffmpeg_next::{frame, picture, ChannelLayout, Packet, Rational, Rescale};
+use ffmpeg_next::{frame, picture, ChannelLayout, Error as FfmpegError, Packet, Rational, Rescale};
 
 const INTERNAL_PREFIX: &str = "pgffmpeg_";
 
@@ -306,8 +306,7 @@ fn rewrite_filter_graph_for_inputs(
             has_aout = true;
         }
 
-        if label.starts_with('i') {
-            let input_ref = parse_input_label(label, input_count)?;
+        if let Some(input_ref) = parse_input_label_if_reserved(label, input_count)? {
             if let Some(used) = used_inputs.get_mut(input_ref.index) {
                 *used = true;
             }
@@ -341,6 +340,32 @@ fn rewrite_filter_graph_for_inputs(
         has_vout,
         has_aout,
     })
+}
+
+fn parse_input_label_if_reserved(
+    label: &str,
+    input_count: usize,
+) -> Result<Option<InputRef>, GraphRewriteError> {
+    if !looks_like_reserved_input_label(label) {
+        return Ok(None);
+    }
+    parse_input_label(label, input_count).map(Some)
+}
+
+fn looks_like_reserved_input_label(label: &str) -> bool {
+    let Some(rest) = label.strip_prefix('i') else {
+        return false;
+    };
+    let Some(first) = rest.bytes().next() else {
+        return false;
+    };
+    if first.is_ascii_digit() || first == b'-' || first == b':' {
+        return true;
+    }
+    if let Some((index_part, kind_part)) = rest.split_once(':') {
+        return index_part.len() == 1 && kind_part.len() == 1;
+    }
+    false
 }
 
 fn parse_input_label(label: &str, input_count: usize) -> Result<InputRef, GraphRewriteError> {
@@ -717,29 +742,52 @@ fn process_all_inputs(
     octx: &mut ffmpeg_next::format::context::Output,
     output_time_bases: &[Rational],
 ) {
-    for state in states {
-        {
-            let InputState {
-                ictx,
-                video_stream,
-                audio_stream,
-                video_decoder,
-                audio_decoder,
-                video_graph_input,
-                audio_graph_input,
-                next_decoded_audio_pts,
-            } = state;
+    if states.is_empty() {
+        return;
+    }
 
-            for (stream, mut packet) in ictx.packets() {
-                if Some(stream.index()) == *video_stream {
-                    let decoder = video_decoder
-                        .as_mut()
-                        .unwrap_or_else(|| error!("pg_ffmpeg: missing video decoder"));
-                    packet.rescale_ts(stream.time_base(), decoder.time_base());
-                    decoder
-                        .send_packet(&packet)
-                        .unwrap_or_else(|e| error!("video decode error: {e}"));
-                    receive_video_frames(decoder, *video_graph_input, graph);
+    let mut active = vec![true; states.len()];
+    let mut active_count = active.len();
+    let mut index = 0usize;
+
+    while active_count > 0 {
+        if active[index]
+            && !process_next_input_packet(
+                &mut states[index],
+                graph,
+                video_pipeline,
+                audio_pipeline,
+                octx,
+                output_time_bases,
+            )
+        {
+            active[index] = false;
+            active_count -= 1;
+        }
+        index = (index + 1) % states.len();
+    }
+}
+
+fn process_next_input_packet(
+    state: &mut InputState<'_>,
+    graph: &mut MultiInputGraph,
+    video_pipeline: &mut Option<VideoOutputPipeline>,
+    audio_pipeline: &mut Option<AudioOutputPipeline>,
+    octx: &mut ffmpeg_next::format::context::Output,
+    output_time_bases: &[Rational],
+) -> bool {
+    loop {
+        let mut packet = Packet::empty();
+        match packet.read(&mut state.ictx) {
+            Ok(()) => {
+                let stream_index = packet.stream();
+                let stream_time_base = state
+                    .ictx
+                    .stream(stream_index)
+                    .unwrap_or_else(|| error!("pg_ffmpeg: packet references missing stream"))
+                    .time_base();
+                if Some(stream_index) == state.video_stream {
+                    process_video_packet(state, packet, stream_time_base, graph);
                     drain_outputs(
                         graph,
                         video_pipeline,
@@ -747,24 +795,10 @@ fn process_all_inputs(
                         octx,
                         output_time_bases,
                     );
-                } else if Some(stream.index()) == *audio_stream {
-                    let decoder = audio_decoder
-                        .as_mut()
-                        .unwrap_or_else(|| error!("pg_ffmpeg: missing audio decoder"));
-                    normalize_audio_packet_duration(
-                        &mut packet,
-                        stream.time_base(),
-                        decoder.time_base(),
-                    );
-                    decoder
-                        .send_packet(&packet)
-                        .unwrap_or_else(|e| error!("audio decode error: {e}"));
-                    receive_audio_frames(
-                        decoder,
-                        next_decoded_audio_pts,
-                        *audio_graph_input,
-                        graph,
-                    );
+                    return true;
+                }
+                if Some(stream_index) == state.audio_stream {
+                    process_audio_packet(state, packet, stream_time_base, graph);
                     drain_outputs(
                         graph,
                         video_pipeline,
@@ -772,19 +806,62 @@ fn process_all_inputs(
                         octx,
                         output_time_bases,
                     );
+                    return true;
                 }
             }
+            Err(FfmpegError::Eof) => {
+                flush_state(state, graph);
+                drain_outputs(
+                    graph,
+                    video_pipeline,
+                    audio_pipeline,
+                    octx,
+                    output_time_bases,
+                );
+                return false;
+            }
+            Err(_) => {}
         }
-
-        flush_state(state, graph);
-        drain_outputs(
-            graph,
-            video_pipeline,
-            audio_pipeline,
-            octx,
-            output_time_bases,
-        );
     }
+}
+
+fn process_video_packet(
+    state: &mut InputState<'_>,
+    mut packet: Packet,
+    stream_time_base: Rational,
+    graph: &mut MultiInputGraph,
+) {
+    let decoder = state
+        .video_decoder
+        .as_mut()
+        .unwrap_or_else(|| error!("pg_ffmpeg: missing video decoder"));
+    packet.rescale_ts(stream_time_base, decoder.time_base());
+    decoder
+        .send_packet(&packet)
+        .unwrap_or_else(|e| error!("video decode error: {e}"));
+    receive_video_frames(decoder, state.video_graph_input, graph);
+}
+
+fn process_audio_packet(
+    state: &mut InputState<'_>,
+    mut packet: Packet,
+    stream_time_base: Rational,
+    graph: &mut MultiInputGraph,
+) {
+    let decoder = state
+        .audio_decoder
+        .as_mut()
+        .unwrap_or_else(|| error!("pg_ffmpeg: missing audio decoder"));
+    normalize_audio_packet_duration(&mut packet, stream_time_base, decoder.time_base());
+    decoder
+        .send_packet(&packet)
+        .unwrap_or_else(|e| error!("audio decode error: {e}"));
+    receive_audio_frames(
+        decoder,
+        &mut state.next_decoded_audio_pts,
+        state.audio_graph_input,
+        graph,
+    );
 }
 
 fn flush_state(state: &mut InputState<'_>, graph: &mut MultiInputGraph) {
@@ -1144,6 +1221,20 @@ mod parser_tests {
         )
         .unwrap();
         assert!(graph.graph.starts_with("[pgffmpeg_i0_v]split"));
+        assert_eq!(
+            graph.refs,
+            vec![InputRef {
+                index: 0,
+                kind: StreamKind::Video
+            }]
+        );
+    }
+
+    #[test]
+    fn test_filter_complex_keeps_intermediate_labels_starting_with_i() {
+        let graph = rewrite("[i0:v]split[intro][idtmp];[intro][idtmp]hstack[vout]", 1).unwrap();
+        assert!(graph.graph.contains("[intro]"));
+        assert!(graph.graph.contains("[idtmp]"));
         assert_eq!(
             graph.refs,
             vec![InputRef {

@@ -319,51 +319,65 @@ fn verify_compatible(input_index: usize, expected: &[StreamSignature], input: &M
             );
         }
 
-        match actual.medium {
-            Type::Video => {
-                if actual.width != expected.width || actual.height != expected.height {
-                    error!(
-                        "pg_ffmpeg: concat input {} stream {} dimensions {}x{} do not match input 1 dimensions {}x{}",
-                        input_index + 1,
-                        stream_index,
-                        actual.width,
-                        actual.height,
-                        expected.width,
-                        expected.height
-                    );
-                }
-            }
-            Type::Audio => {
-                if actual.sample_rate != expected.sample_rate {
-                    error!(
-                        "pg_ffmpeg: concat input {} stream {} sample_rate {} does not match input 1 sample_rate {}",
-                        input_index + 1,
-                        stream_index,
-                        actual.sample_rate,
-                        expected.sample_rate
-                    );
-                }
-                if actual.channels != expected.channels {
-                    error!(
-                        "pg_ffmpeg: concat input {} stream {} channels {} do not match input 1 channels {}",
-                        input_index + 1,
-                        stream_index,
-                        actual.channels,
-                        expected.channels
-                    );
-                }
-                if actual.sample_format != expected.sample_format {
-                    error!(
-                        "pg_ffmpeg: concat input {} stream {} sample format {} does not match input 1 sample format {}",
-                        input_index + 1,
-                        stream_index,
-                        actual.sample_format,
-                        expected.sample_format
-                    );
-                }
-            }
-            _ => {}
+        if actual.medium == Type::Video {
+            verify_video_compatible(input_index, stream_index, expected, actual);
+        } else if actual.medium == Type::Audio {
+            verify_audio_compatible(input_index, stream_index, expected, actual);
         }
+    }
+}
+
+fn verify_video_compatible(
+    input_index: usize,
+    stream_index: usize,
+    expected: &StreamSignature,
+    actual: &StreamSignature,
+) {
+    if actual.width != expected.width || actual.height != expected.height {
+        error!(
+            "pg_ffmpeg: concat input {} stream {} dimensions {}x{} do not match input 1 dimensions {}x{}",
+            input_index + 1,
+            stream_index,
+            actual.width,
+            actual.height,
+            expected.width,
+            expected.height
+        );
+    }
+}
+
+fn verify_audio_compatible(
+    input_index: usize,
+    stream_index: usize,
+    expected: &StreamSignature,
+    actual: &StreamSignature,
+) {
+    if actual.sample_rate != expected.sample_rate {
+        error!(
+            "pg_ffmpeg: concat input {} stream {} sample_rate {} does not match input 1 sample_rate {}",
+            input_index + 1,
+            stream_index,
+            actual.sample_rate,
+            expected.sample_rate
+        );
+    }
+    if actual.channels != expected.channels {
+        error!(
+            "pg_ffmpeg: concat input {} stream {} channels {} do not match input 1 channels {}",
+            input_index + 1,
+            stream_index,
+            actual.channels,
+            expected.channels
+        );
+    }
+    if actual.sample_format != expected.sample_format {
+        error!(
+            "pg_ffmpeg: concat input {} stream {} sample format {} does not match input 1 sample format {}",
+            input_index + 1,
+            stream_index,
+            actual.sample_format,
+            expected.sample_format
+        );
     }
 }
 
