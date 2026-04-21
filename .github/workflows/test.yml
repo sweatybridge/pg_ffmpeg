@@ -35,7 +35,7 @@ jobs:
           sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential pkg-config ffmpeg \
+            build-essential pkg-config \
             libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libswresample-dev \
@@ -86,7 +86,7 @@ jobs:
           sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential pkg-config ffmpeg \
+            build-essential pkg-config \
             libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libswresample-dev \
