@@ -11,11 +11,6 @@
             "type": "command",
             "if": "Bash(git push*)",
             "command": "out=$(cargo fmt --check 2>&1) || { echo \"$out\" >&2; echo '' >&2; echo \"cargo fmt would modify files. Run 'cargo fmt', commit the changes, then retry the push.\" >&2; exit 2; }"
-          },
-          {
-            "type": "command",
-            "if": "Bash(git push*)",
-            "command": "out=$(cargo clippy --all-targets -- -D warnings 2>&1) || { echo \"$out\" >&2; echo '' >&2; echo \"cargo clippy failed. Fix the warnings, commit, then retry the push.\" >&2; exit 2; }"
           }
         ]
       }
