@@ -58,16 +58,6 @@ When `trim(..., precise => true)` cannot re-open the source codec as an encoder 
 - PostgreSQL 16-18
 - Rust toolchain
 - `cargo install --locked cargo-pgrx`
-- PostgreSQL 18 from the upstream PGDG APT repository:
-
-```bash
-# Ubuntu
-apt-get update
-apt-get install -y postgresql-common curl ca-certificates
-/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
-apt-get install -y postgresql-18 postgresql-server-dev-18
-```
-
 - FFmpeg development libraries:
 
 ```bash
@@ -82,7 +72,7 @@ apt-get install libavcodec-dev libavdevice-dev libavfilter-dev \
 ## Build & Install
 
 ```bash
-cargo pgrx init --pg18=/usr/lib/postgresql/18/bin/pg_config  # adjust for your PG version
+cargo pgrx init --pg18=$(which pg_config)  # adjust for your PG version
 cargo pgrx install --release
 ```
 
