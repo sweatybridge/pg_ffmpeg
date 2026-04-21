@@ -793,17 +793,7 @@ mod tests {
     fn test_transcode_default_format() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
         let result = transcode(
-            &data,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
+            &data, None, None, None, None, None, None, None, None, None, false,
         );
         assert!(!result.is_empty());
 

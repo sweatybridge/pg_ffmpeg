@@ -624,7 +624,15 @@ mod tests {
     fn test_extract_audio_reencode_to_wav_pcm() {
         // MP2 source explicitly re-encoded to PCM audio in a WAV container.
         let data = generate_test_video_with_audio_bytes(64, 64, 10, 1);
-        let result = extract_audio(&data, Some("wav"), Some("pcm_s16le"), None, None, None, None);
+        let result = extract_audio(
+            &data,
+            Some("wav"),
+            Some("pcm_s16le"),
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(!result.is_empty());
 
         let probe = MemInput::open(&result);
