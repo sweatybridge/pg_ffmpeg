@@ -10,7 +10,7 @@ use ffmpeg_next::codec;
 use ffmpeg_next::filter;
 use ffmpeg_next::format::{self, Pixel, Sample};
 use ffmpeg_next::media::Type;
-use ffmpeg_next::{frame, ChannelLayout, Dictionary, Packet, Rational};
+use ffmpeg_next::{frame, ChannelLayout, Dictionary, Packet, Rational, Rescale};
 
 use std::collections::HashMap;
 

@@ -266,6 +266,7 @@ fn reencode_audio(
             encoder,
             encoder_time_base,
             resampler,
+            fifo: AudioFifo::new(out_sample_format, out_channel_layout.channels() as u16),
             next_encoded_pts: 0,
         };
 
@@ -320,6 +321,7 @@ struct ResamplePipeline {
     encoder: ffmpeg_next::encoder::Audio,
     encoder_time_base: Rational,
     resampler: software::resampling::Context,
+    fifo: AudioFifo,
     next_encoded_pts: i64,
 }
 
@@ -337,9 +339,10 @@ impl ResamplePipeline {
     ) {
         let mut decoded = frame::Audio::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
+            let frame_samples = self.encoder.frame_size().max(1) as usize;
             let mut converted = alloc_audio_frame(
                 self.encoder.format(),
-                decoded.samples(),
+                decoded.samples().max(frame_samples),
                 self.encoder.channel_layout(),
                 self.encoder.rate(),
             );
@@ -351,6 +354,27 @@ impl ResamplePipeline {
                 continue;
             }
 
+            self.fifo.write_frame(&converted);
+            self.drain_fifo(octx, ost_time_base, false);
+        }
+    }
+
+    fn drain_fifo(
+        &mut self,
+        octx: &mut ffmpeg_next::format::context::Output,
+        ost_time_base: Rational,
+        finish: bool,
+    ) {
+        let frame_samples = self.encoder.frame_size().max(1) as usize;
+        while self.fifo.size() >= frame_samples || (finish && self.fifo.size() > 0) {
+            let read_samples = self.fifo.size().min(frame_samples);
+            let mut converted = alloc_audio_frame(
+                self.encoder.format(),
+                frame_samples,
+                self.encoder.channel_layout(),
+                self.encoder.rate(),
+            );
+            self.fifo.read_frame(&mut converted, read_samples);
             converted.set_pts(Some(self.next_encoded_pts));
             self.next_encoded_pts = self
                 .next_encoded_pts
@@ -396,22 +420,75 @@ impl ResamplePipeline {
                 Err(e) => error!("audio resample flush error: {e}"),
             };
             if converted.samples() > 0 {
-                converted.set_pts(Some(self.next_encoded_pts));
-                self.next_encoded_pts = self
-                    .next_encoded_pts
-                    .saturating_add(converted.samples() as i64);
-                self.encoder
-                    .send_frame(&converted)
-                    .unwrap_or_else(|e| error!("audio encode error: {e}"));
-                self.process_encoded_packets(octx, ost_time_base);
+                self.fifo.write_frame(&converted);
+                self.drain_fifo(octx, ost_time_base, false);
             }
             if delay.is_none() {
                 break;
             }
         }
 
+        self.drain_fifo(octx, ost_time_base, true);
         let _ = self.encoder.send_eof();
         self.process_encoded_packets(octx, ost_time_base);
+    }
+}
+
+struct AudioFifo {
+    ptr: *mut ffmpeg_next::sys::AVAudioFifo,
+}
+
+impl AudioFifo {
+    fn new(format: Sample, channels: u16) -> Self {
+        let sample_fmt: ffmpeg_next::sys::AVSampleFormat = format.into();
+        let ptr = unsafe { ffmpeg_next::sys::av_audio_fifo_alloc(sample_fmt, channels.into(), 1) };
+        if ptr.is_null() {
+            error!("failed to allocate audio fifo");
+        }
+        Self { ptr }
+    }
+
+    fn size(&self) -> usize {
+        unsafe { ffmpeg_next::sys::av_audio_fifo_size(self.ptr).max(0) as usize }
+    }
+
+    fn write_frame(&mut self, frame: &frame::Audio) {
+        if frame.samples() == 0 {
+            return;
+        }
+        let data = unsafe { (*frame.as_ptr()).extended_data as *const *mut std::ffi::c_void };
+        let written = unsafe {
+            ffmpeg_next::sys::av_audio_fifo_write(self.ptr, data, frame.samples() as i32)
+        };
+        if written < 0 {
+            error!(
+                "audio fifo write error: {}",
+                ffmpeg_next::Error::from(written)
+            );
+        }
+        if written as usize != frame.samples() {
+            error!("audio fifo write error: short write");
+        }
+    }
+
+    fn read_frame(&mut self, frame: &mut frame::Audio, samples: usize) {
+        if samples == 0 {
+            return;
+        }
+        let data = unsafe { (*frame.as_mut_ptr()).extended_data as *const *mut std::ffi::c_void };
+        let read = unsafe { ffmpeg_next::sys::av_audio_fifo_read(self.ptr, data, samples as i32) };
+        if read < 0 {
+            error!("audio fifo read error: {}", ffmpeg_next::Error::from(read));
+        }
+        if read as usize != samples {
+            error!("audio fifo read error: short read");
+        }
+    }
+}
+
+impl Drop for AudioFifo {
+    fn drop(&mut self) {
+        unsafe { ffmpeg_next::sys::av_audio_fifo_free(self.ptr) };
     }
 }
 

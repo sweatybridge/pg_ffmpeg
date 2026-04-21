@@ -72,7 +72,7 @@ apt-get install libavcodec-dev libavdevice-dev libavfilter-dev \
 ## Build & Install
 
 ```bash
-cargo pgrx init --pg16=$(which pg_config)  # adjust for your PG version
+cargo pgrx init --pg18=$(which pg_config)  # adjust for your PG version
 cargo pgrx install --release
 ```
 
