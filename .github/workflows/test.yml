@@ -54,10 +54,51 @@ jobs:
           fi
 
       - name: Clippy
-        run: cargo clippy --features pg${{ matrix.pg_version }} --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --features pg${{ matrix.pg_version }} --no-default-features -- -D warnings
 
       - name: Test
         run: cargo pgrx test "pg${{ matrix.pg_version }}"
+
+  bench:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [16, 17, 18]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-key: pg${{ matrix.pg_version }}-bench-ffmpeg8
+          cache-directories: /home/runner/.pgrx
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libavfilter-dev libavdevice-dev \
+            libreadline-dev
+
+      - name: Install cargo-pgrx
+        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
+
+      - name: Initialize pgrx
+        run: |
+          set +e
+          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
+          if [ $? -ne 0 ]; then
+            cargo pgrx init --pg${{ matrix.pg_version }} download
+          fi
 
       - name: Bench
         run: cargo pgrx bench "pg${{ matrix.pg_version }}"

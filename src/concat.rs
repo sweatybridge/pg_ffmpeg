@@ -120,8 +120,6 @@ fn concat_chunks(chunks: Vec<Box<[u8]>>) -> Vec<u8> {
                 muxer = Some(new_muxer);
             }
         }
-        drop(input);
-        drop(chunk);
     }
 
     muxer
@@ -290,6 +288,14 @@ fn stream_signatures(input: &MemInput<'_>, input_index: usize) -> Vec<StreamSign
 
 fn verify_compatible(input_index: usize, expected: &[StreamSignature], input: &MemInput<'_>) {
     let actual = stream_signatures(input, input_index);
+    verify_compatible_signatures(input_index, expected, &actual);
+}
+
+fn verify_compatible_signatures(
+    input_index: usize,
+    expected: &[StreamSignature],
+    actual: &[StreamSignature],
+) {
     if actual.len() != expected.len() {
         error!(
             "pg_ffmpeg: concat input {} has {} streams, expected {} from input 1",
@@ -300,30 +306,39 @@ fn verify_compatible(input_index: usize, expected: &[StreamSignature], input: &M
     }
 
     for (stream_index, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
-        if actual.medium != expected.medium {
-            error!(
-                "pg_ffmpeg: concat input {} stream {} type {:?} does not match input 1 type {:?}",
-                input_index + 1,
-                stream_index,
-                actual.medium,
-                expected.medium
-            );
-        }
-        if actual.codec_id != expected.codec_id {
-            error!(
-                "pg_ffmpeg: concat input {} stream {} codec {:?} does not match input 1 codec {:?}",
-                input_index + 1,
-                stream_index,
-                actual.codec_id,
-                expected.codec_id
-            );
-        }
+        verify_stream_compatible(input_index, stream_index, expected, actual);
+    }
+}
 
-        if actual.medium == Type::Video {
-            verify_video_compatible(input_index, stream_index, expected, actual);
-        } else if actual.medium == Type::Audio {
-            verify_audio_compatible(input_index, stream_index, expected, actual);
-        }
+fn verify_stream_compatible(
+    input_index: usize,
+    stream_index: usize,
+    expected: &StreamSignature,
+    actual: &StreamSignature,
+) {
+    if actual.medium != expected.medium {
+        error!(
+            "pg_ffmpeg: concat input {} stream {} type {:?} does not match input 1 type {:?}",
+            input_index + 1,
+            stream_index,
+            actual.medium,
+            expected.medium
+        );
+    }
+    if actual.codec_id != expected.codec_id {
+        error!(
+            "pg_ffmpeg: concat input {} stream {} codec {:?} does not match input 1 codec {:?}",
+            input_index + 1,
+            stream_index,
+            actual.codec_id,
+            expected.codec_id
+        );
+    }
+
+    if actual.medium == Type::Video {
+        verify_video_compatible(input_index, stream_index, expected, actual);
+    } else if actual.medium == Type::Audio {
+        verify_audio_compatible(input_index, stream_index, expected, actual);
     }
 }
 
@@ -394,6 +409,8 @@ fn default_output_format(input_format: &str) -> String {
 #[pg_schema]
 mod tests {
     use super::*;
+    use ffmpeg_next::codec;
+
     use crate::test_utils::generate_test_video_bytes;
 
     #[pg_test]
@@ -431,6 +448,73 @@ mod tests {
         Spi::run("SET LOCAL pg_ffmpeg.max_aggregate_state_bytes = 4").unwrap();
         let state = Internal::default();
         let _ = ConcatAgg::state(state, vec![1, 2, 3, 4, 5], std::ptr::null_mut());
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "codec")]
+    fn test_concat_codec_mismatch_errors() {
+        let expected = video_signature(codec::Id::MPEG2VIDEO, 64, 64);
+        let actual = video_signature(codec::Id::H264, 64, 64);
+        verify_stream_compatible(1, 0, &expected, &actual);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "sample_rate")]
+    fn test_concat_sample_rate_mismatch_errors() {
+        let expected = audio_signature(44_100, 2, 8);
+        let actual = audio_signature(48_000, 2, 8);
+        verify_stream_compatible(1, 0, &expected, &actual);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "channels")]
+    fn test_concat_channel_mismatch_errors() {
+        let expected = audio_signature(44_100, 2, 8);
+        let actual = audio_signature(44_100, 1, 8);
+        verify_stream_compatible(1, 0, &expected, &actual);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "sample format")]
+    fn test_concat_sample_format_mismatch_errors() {
+        let expected = audio_signature(44_100, 2, 8);
+        let actual = audio_signature(44_100, 2, 1);
+        verify_stream_compatible(1, 0, &expected, &actual);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "has 1 streams, expected 2")]
+    fn test_concat_stream_count_mismatch_errors() {
+        let expected = vec![
+            video_signature(codec::Id::MPEG2VIDEO, 64, 64),
+            audio_signature(44_100, 2, 8),
+        ];
+        let actual = vec![video_signature(codec::Id::MPEG2VIDEO, 64, 64)];
+        verify_compatible_signatures(1, &expected, &actual);
+    }
+
+    fn video_signature(codec_id: codec::Id, width: i32, height: i32) -> StreamSignature {
+        StreamSignature {
+            medium: Type::Video,
+            codec_id,
+            width,
+            height,
+            sample_rate: 0,
+            channels: 0,
+            sample_format: 0,
+        }
+    }
+
+    fn audio_signature(sample_rate: i32, channels: i32, sample_format: i32) -> StreamSignature {
+        StreamSignature {
+            medium: Type::Audio,
+            codec_id: codec::Id::AAC,
+            width: 0,
+            height: 0,
+            sample_rate,
+            channels,
+            sample_format,
+        }
     }
 
     fn decoded_video_frame_count(data: &[u8]) -> usize {

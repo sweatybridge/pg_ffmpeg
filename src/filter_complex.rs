@@ -1,12 +1,10 @@
-#![allow(dead_code)]
-
 use pgrx::prelude::*;
 
 use crate::codec_lookup::{self, CodecKind};
 use crate::filter_safety;
 use crate::limits;
 use crate::mem_io::{MemInput, MemOutput};
-use crate::pipeline::{InputKind, MultiInputGraph};
+use crate::pipeline::MultiInputGraph;
 
 use ffmpeg_next::codec::{self, Id as CodecId};
 use ffmpeg_next::format::{self, Pixel, Sample};
@@ -26,13 +24,6 @@ impl StreamKind {
         match self {
             StreamKind::Video => "v",
             StreamKind::Audio => "a",
-        }
-    }
-
-    fn input_kind(self) -> InputKind {
-        match self {
-            StreamKind::Video => InputKind::Video,
-            StreamKind::Audio => InputKind::Audio,
         }
     }
 }
@@ -112,7 +103,7 @@ fn filter_complex(
     hwaccel: default!(bool, false),
 ) -> Vec<u8> {
     if hwaccel {
-        error!("pg_ffmpeg: filter_complex hwaccel is not implemented yet");
+        pgrx::warning!("pg_ffmpeg: filter_complex hwaccel requested, falling back to software");
     }
 
     let input_count = inputs.len();
@@ -595,8 +586,7 @@ impl VideoOutputPipeline {
         }
     }
 
-    fn send_frame(&mut self, frame: &frame::Video) {
-        let mut frame = frame.clone();
+    fn send_frame(&mut self, mut frame: frame::Video) {
         let pts = frame
             .timestamp()
             .map(|pts| pts.rescale(self.filter_time_base, self.encoder_time_base))
@@ -692,8 +682,7 @@ impl AudioOutputPipeline {
         }
     }
 
-    fn send_frame(&mut self, frame: &frame::Audio) {
-        let mut frame = frame.clone();
+    fn send_frame(&mut self, mut frame: frame::Audio) {
         let pts = frame
             .timestamp()
             .unwrap_or(self.next_pts)
@@ -937,8 +926,9 @@ fn drain_outputs(
     if let Some(video) = video_pipeline.as_mut() {
         let mut filtered = frame::Video::empty();
         while graph.try_recv_video(0, &mut filtered) {
-            video.send_frame(&filtered);
+            video.send_frame(filtered);
             video.receive_packets(octx, output_time_bases[video.ost_index]);
+            filtered = frame::Video::empty();
         }
     }
 
@@ -946,8 +936,9 @@ fn drain_outputs(
         let output_index = if video_pipeline.is_some() { 1 } else { 0 };
         let mut filtered = frame::Audio::empty();
         while graph.try_recv_audio(output_index, &mut filtered) {
-            audio.send_frame(&filtered);
+            audio.send_frame(filtered);
             audio.receive_packets(octx, output_time_bases[audio.ost_index]);
+            filtered = frame::Audio::empty();
         }
     }
 }
@@ -1191,7 +1182,8 @@ fn normalize_audio_packet_duration(packet: &mut Packet, src: Rational, dst: Rati
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[allow(dead_code)]
 mod parser_tests {
     use super::*;
 
@@ -1242,6 +1234,18 @@ mod parser_tests {
     fn test_filter_complex_label_out_of_range() {
         let err = rewrite("[i9:v]null[vout]", 2).unwrap_err();
         assert!(err.contains("references i9"));
+    }
+
+    #[test]
+    fn test_filter_complex_rejects_too_many_inputs() {
+        let err = rewrite("[i100:v]null[vout]", 100).unwrap_err();
+        assert!(err.contains("references i100"));
+    }
+
+    #[test]
+    fn test_filter_complex_input_count_mismatch_errors() {
+        let err = rewrite("[i0:v][i1:v]hstack=inputs=2[vout]", 1).unwrap_err();
+        assert!(err.contains("references i1"));
     }
 
     #[test]

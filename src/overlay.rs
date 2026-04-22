@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use pgrx::prelude::*;
 
 use crate::codec_lookup::{self, CodecKind};
@@ -14,8 +12,8 @@ use ffmpeg_next::{frame, picture, Error as FfmpegError, Packet, Rational, Rescal
 
 #[pg_extern]
 fn overlay(
-    background: Vec<u8>,
-    foreground: Vec<u8>,
+    background: &[u8],
+    foreground: &[u8],
     x: default!(i32, 0),
     y: default!(i32, 0),
     start_time: default!(f64, 0.0),
@@ -25,7 +23,7 @@ fn overlay(
     limits::check_input_size(background.len()).unwrap_or_else(|e| error!("{e}"));
     limits::check_input_size(foreground.len()).unwrap_or_else(|e| error!("{e}"));
 
-    overlay_slices(&background, &foreground, x, y, start_time, end_time)
+    overlay_slices(background, foreground, x, y, start_time, end_time)
 }
 
 pub(crate) fn overlay_slices(
@@ -265,14 +263,7 @@ fn copy_background_audio_stream(
         .streams()
         .best(Type::Audio)
         .unwrap_or_else(|| error!("pg_ffmpeg: no background audio stream found"));
-    let mut out = octx
-        .add_stream(codec::Id::None)
-        .unwrap_or_else(|e| error!("failed to add audio output stream: {e}"));
-    out.set_parameters(audio.parameters());
-    unsafe {
-        (*out.parameters().as_mut_ptr()).codec_tag = 0;
-    }
-    out.index()
+    pipeline::copy_stream(&audio, octx)
 }
 
 struct OverlayVideoOutput {
@@ -329,8 +320,7 @@ impl OverlayVideoOutput {
         }
     }
 
-    fn send_frame(&mut self, frame: &frame::Video) {
-        let mut frame = frame.clone();
+    fn send_frame(&mut self, mut frame: frame::Video) {
         let pts = frame
             .timestamp()
             .map(|pts| pts.rescale(self.filter_time_base, self.encoder_time_base))
@@ -386,8 +376,9 @@ fn drain_overlay_output(
 ) {
     let mut filtered = frame::Video::empty();
     while graph.try_recv_video(0, &mut filtered) {
-        video.send_frame(&filtered);
+        video.send_frame(filtered);
         video.receive_packets(octx, ost_time_base);
+        filtered = frame::Video::empty();
     }
 }
 
@@ -519,5 +510,16 @@ mod tests {
         let probe = MemInput::open(&result);
         assert!(probe.streams().best(Type::Video).is_some());
         assert!(probe.streams().best(Type::Audio).is_some());
+    }
+
+    #[pg_test]
+    fn test_overlay_time_range() {
+        let bg = generate_test_video_bytes(64, 64, 5, 2);
+        let fg = generate_test_video_bytes(32, 32, 5, 2);
+        let result = overlay_slices(&bg, &fg, 0, 0, 0.25, Some(0.75));
+        assert!(!result.is_empty());
+
+        let probe = MemInput::open(&result);
+        assert!(probe.streams().best(Type::Video).is_some());
     }
 }

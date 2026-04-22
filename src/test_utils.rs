@@ -21,6 +21,7 @@ use ffmpeg_next::codec;
 use ffmpeg_next::format::{sample::Type as SampleType, Pixel, Sample};
 use ffmpeg_next::util::frame::{audio::Audio as AudioFrame, video::Video};
 
+use crate::codec_lookup::{self, CodecKind};
 use crate::mem_io::MemOutput;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -144,8 +145,8 @@ fn generate_test_video_bytes_with_gop_and_muxer(
     ffmpeg_next::init().unwrap();
 
     let total_frames = fps * duration_secs;
-    let enc_codec =
-        ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
+    let enc_codec = codec_lookup::find_encoder_by_id(codec::Id::MPEG2VIDEO, CodecKind::Video)
+        .expect("MPEG2VIDEO encoder not found");
 
     let mut octx = MemOutput::open(muxer);
 
@@ -268,9 +269,10 @@ pub fn generate_test_video_with_audio_bytes(
     ffmpeg_next::init().unwrap();
 
     let total_frames = fps * duration_secs;
-    let video_codec =
-        ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
-    let audio_codec = ffmpeg_next::encoder::find(codec::Id::MP2).expect("MP2 encoder not found");
+    let video_codec = codec_lookup::find_encoder_by_id(codec::Id::MPEG2VIDEO, CodecKind::Video)
+        .expect("MPEG2VIDEO encoder not found");
+    let audio_codec = codec_lookup::find_encoder_by_id(codec::Id::MP2, CodecKind::Audio)
+        .expect("MP2 encoder not found");
 
     let mut octx = MemOutput::open("mpegts");
     let global_header = octx
@@ -445,7 +447,8 @@ pub fn generate_test_video_with_audio_bytes(
 pub fn generate_test_aac_adts_bytes(duration_secs: i32) -> Vec<u8> {
     ffmpeg_next::init().unwrap();
 
-    let audio_codec = ffmpeg_next::encoder::find(codec::Id::AAC).expect("AAC encoder not found");
+    let audio_codec = codec_lookup::find_encoder_by_id(codec::Id::AAC, CodecKind::Audio)
+        .expect("AAC encoder not found");
 
     let mut octx = MemOutput::open("adts");
     let global_header = octx
@@ -561,8 +564,8 @@ pub fn generate_test_image_bytes(format: &str, width: u32, height: u32) -> Vec<u
         _ => panic!("unsupported test image format: {}", format),
     };
 
-    let enc_codec =
-        ffmpeg_next::encoder::find(codec_id).expect("image encoder not found in FFmpeg build");
+    let enc_codec = codec_lookup::find_encoder_by_id(codec_id, CodecKind::Video)
+        .expect("image encoder not found in FFmpeg build");
 
     let mut octx = MemOutput::open(muxer);
     let mut stream = octx.add_stream(enc_codec).expect("failed to add stream");

@@ -271,8 +271,11 @@ pub(crate) fn generate_video(
 
     let total_frames = fps * duration_secs;
 
-    let codec =
-        ffmpeg_next::encoder::find(codec::Id::MPEG2VIDEO).expect("MPEG2VIDEO encoder not found");
+    let codec = crate::codec_lookup::find_encoder_by_id(
+        codec::Id::MPEG2VIDEO,
+        crate::codec_lookup::CodecKind::Video,
+    )
+    .expect("MPEG2VIDEO encoder not found");
 
     let mut octx =
         ffmpeg_next::format::output_as(path, "mpegts").expect("failed to create output context");
