@@ -61,7 +61,9 @@ When `trim(..., precise => true)` cannot re-open the source codec as an encoder 
 - FFmpeg development libraries:
 
 ```bash
-# Debian/Ubuntu
+# Debian/Ubuntu (FFmpeg 8 from the ubuntuhandbook1 PPA)
+add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
+apt-get update
 apt-get install libavcodec-dev libavdevice-dev libavfilter-dev \
   libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
   clang libclang-dev pkg-config
@@ -70,7 +72,7 @@ apt-get install libavcodec-dev libavdevice-dev libavfilter-dev \
 ## Build & Install
 
 ```bash
-cargo pgrx init --pg16=$(which pg_config)  # adjust for your PG version
+cargo pgrx init --pg18=$(which pg_config)  # adjust for your PG version
 cargo pgrx install --release
 ```
 

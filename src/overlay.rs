@@ -290,12 +290,8 @@ impl OverlayVideoOutput {
         decoder: &ffmpeg_next::decoder::Video,
     ) -> Self {
         let (width, height, pix_fmt, filter_time_base) = resolved_video_output(graph);
-        let selected_codec = codec::encoder::find(decoder.id()).unwrap_or_else(|| {
-            error!(
-                "pg_ffmpeg: no video encoder found for source codec {:?}",
-                decoder.id()
-            )
-        });
+        let selected_codec = codec_lookup::find_encoder_by_id(decoder.id(), CodecKind::Video)
+            .unwrap_or_else(|e| error!("{e}"));
         let codec_label = selected_codec.name().to_owned();
         let encoder_time_base = if let Some(frame_rate) = decoder.frame_rate() {
             Rational(frame_rate.denominator(), frame_rate.numerator())

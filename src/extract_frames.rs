@@ -5,8 +5,8 @@ use ffmpeg_next::util::frame::video::Video;
 use ffmpeg_next::Rational;
 use pgrx::prelude::*;
 
+use crate::frame_encoder;
 use crate::mem_io::MemInput;
-use crate::thumbnail;
 
 #[pg_extern]
 fn extract_frames(
@@ -157,7 +157,7 @@ fn drain_decoded_frames(
         scaler
             .run(&decoded, &mut rgb_frame)
             .unwrap_or_else(|e| error!("scaling error: {e}"));
-        rows.push((timestamp, thumbnail::encode_frame(&rgb_frame, format)));
+        rows.push((timestamp, frame_encoder::encode_frame(&rgb_frame, format)));
 
         if !keyframes_only {
             advance_threshold_past_timestamp(next_threshold, interval, timestamp);

@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 
+use crate::codec_lookup::{self, CodecKind};
 use crate::mem_io::{MemInput, MemOutput};
 use crate::pipeline;
 
@@ -9,8 +10,8 @@ use ffmpeg_next::util::mathematics::rescale;
 use ffmpeg_next::{Rational, Rescale};
 
 #[pg_extern]
-pub(crate) fn trim(
-    data: Vec<u8>,
+fn trim(
+    data: &[u8],
     start_time: default!(f64, 0.0),
     end_time: default!(Option<f64>, "NULL"),
     precise: default!(bool, false),
@@ -36,8 +37,8 @@ fn validate_trim_args(start_time: f64, end_time: Option<f64>) {
     }
 }
 
-fn fast_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
-    let mut ictx = MemInput::open(&data);
+fn fast_trim(data: &[u8], start_time: f64, end_time: Option<f64>) -> Vec<u8> {
+    let mut ictx = MemInput::open(data);
     let out_format = default_output_format(ictx.format().name());
     let trim_duration = end_time.map(|end| end - start_time);
     let absolute_end_us =
@@ -166,9 +167,9 @@ fn rebase_packet_timestamps(
     }
 }
 
-fn precise_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8> {
+fn precise_trim(data: &[u8], start_time: f64, end_time: Option<f64>) -> Vec<u8> {
     let (out_format, has_video, has_audio, dropped_aux_streams) = {
-        let ictx = MemInput::open(&data);
+        let ictx = MemInput::open(data);
         let out_format = default_output_format(ictx.format().name());
         let has_video = ictx.streams().best(Type::Video).is_some();
         let has_audio = ictx.streams().best(Type::Audio).is_some();
@@ -183,25 +184,26 @@ fn precise_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8
         error!("pg_ffmpeg: trim found no audio or video streams to keep");
     }
 
-    let transcode_input = if dropped_aux_streams > 0 {
+    let transcode_input: std::borrow::Cow<[u8]> = if dropped_aux_streams > 0 {
         pgrx::warning!(
             "pg_ffmpeg: trim(precise=true) dropped {} subtitle/data stream(s); use precise=false to preserve them",
             dropped_aux_streams
         );
-        remux_audio_video_only(&data, &out_format)
+        std::borrow::Cow::Owned(remux_audio_video_only(data, &out_format))
     } else {
-        data
+        std::borrow::Cow::Borrowed(data)
     };
+    let transcode_bytes: &[u8] = transcode_input.as_ref();
 
-    let (video_base_time, audio_base_time) = first_stream_timestamp_bases(&transcode_input);
+    let (video_base_time, audio_base_time) = first_stream_timestamp_bases(transcode_bytes);
     let input_audio_codec_id = {
-        let input = MemInput::open(&transcode_input);
+        let input = MemInput::open(transcode_bytes);
         input
             .streams()
             .best(Type::Audio)
             .map(|stream| stream.parameters().id())
     };
-    let (video_codec, mut audio_codec) = precise_codec_names(&transcode_input);
+    let (video_codec, mut audio_codec) = precise_codec_names(transcode_bytes);
     if out_format == "mpegts" && input_audio_codec_id == Some(codec::Id::MP3) {
         audio_codec = Some("mp2".to_owned());
     }
@@ -211,7 +213,7 @@ fn precise_trim(data: Vec<u8>, start_time: f64, end_time: Option<f64>) -> Vec<u8
         has_audio.then(|| audio_trim_filter(audio_base_time.unwrap_or(0.0), start_time, end_time));
 
     crate::transcode::transcode(
-        transcode_input,
+        transcode_bytes,
         Some(&out_format),
         video_filter.as_deref(),
         video_codec.as_deref(),
@@ -330,15 +332,21 @@ fn precise_codec_names(data: &[u8]) -> (Option<String>, Option<String>) {
 }
 
 fn precise_codec_name(codec_id: codec::Id, medium: Type, fallback: &str) -> String {
-    if let Some(codec) = codec::encoder::find(codec_id) {
+    let (kind, medium_label) = match medium {
+        Type::Video => (CodecKind::Video, "video"),
+        Type::Audio => (CodecKind::Audio, "audio"),
+        _ => return fallback.to_owned(),
+    };
+
+    if let Ok(codec) = codec_lookup::find_encoder_by_id(codec_id, kind) {
         return codec.name().to_owned();
     }
 
-    let medium_label = match medium {
-        Type::Video => "video",
-        Type::Audio => "audio",
-        _ => "stream",
-    };
+    // Source codec has no encoder in this build; verify the hardcoded
+    // fallback is available so we surface the uniform F7 error rather
+    // than letting `transcode()` fail mid-pipeline.
+    codec_lookup::find_encoder(fallback, kind).unwrap_or_else(|e| error!("{e}"));
+
     pgrx::warning!(
         "pg_ffmpeg: trim(precise=true) source {:?} has no encoder in this FFmpeg build; re-encoding {} as {}",
         codec_id,
@@ -485,8 +493,8 @@ mod tests {
     #[pg_test]
     fn test_trim_fast_keyframe() {
         let data = generate_test_matroska_video_with_gop_bytes(64, 64, 10, 4, 10);
-        let fast = trim(data.clone(), 1.5, Some(2.2), false);
-        let precise = trim(data, 1.5, Some(2.2), true);
+        let fast = trim(&data, 1.5, Some(2.2), false);
+        let precise = trim(&data, 1.5, Some(2.2), true);
         assert!(!fast.is_empty(), "trim output should not be empty");
         let fast_frame_count = decoded_video_frame_count(&fast);
         let precise_frame_count = decoded_video_frame_count(&precise);
@@ -505,8 +513,8 @@ mod tests {
     #[pg_test]
     fn test_trim_fast_uses_absolute_end_timestamp() {
         let data = generate_test_matroska_video_with_gop_bytes(64, 64, 10, 4, 10);
-        let fast = trim(data.clone(), 1.5, Some(2.2), false);
-        let precise = trim(data, 1.5, Some(2.2), true);
+        let fast = trim(&data, 1.5, Some(2.2), false);
+        let precise = trim(&data, 1.5, Some(2.2), true);
 
         let fast_duration =
             decoded_video_duration_seconds(&fast).expect("expected fast-trim video output");
@@ -522,7 +530,7 @@ mod tests {
     #[pg_test]
     fn test_trim_precise_reencode() {
         let data = generate_test_video_bytes(64, 64, 10, 4);
-        let result = trim(data, 1.0, Some(2.5), true);
+        let result = trim(&data, 1.0, Some(2.5), true);
         assert!(!result.is_empty(), "trim output should not be empty");
 
         let probe = MemInput::open(&result);
@@ -537,7 +545,7 @@ mod tests {
     #[pg_test]
     fn test_trim_to_end() {
         let data = generate_test_video_bytes(64, 64, 10, 4);
-        let result = trim(data, 1.5, None, true);
+        let result = trim(&data, 1.5, None, true);
         assert!(!result.is_empty(), "trim output should not be empty");
 
         let frame_count = decoded_video_frame_count(&result);
@@ -550,7 +558,7 @@ mod tests {
     #[pg_test]
     fn test_trim_av_sync_precise() {
         let data = generate_test_video_with_audio_bytes(64, 64, 10, 4);
-        let result = trim(data, 1.0, Some(2.8), true);
+        let result = trim(&data, 1.0, Some(2.8), true);
         assert!(!result.is_empty(), "trim output should not be empty");
 
         let video_duration =
@@ -704,12 +712,12 @@ mod benches {
     #[pg_bench(setup = generate_sample_video)]
     fn bench_trim_fast(b: &mut Bencher) {
         let data = sample_video_bytes();
-        b.iter(move || black_box(super::trim(data.clone(), 5.0, Some(15.0), false)));
+        b.iter(move || black_box(super::trim(&data, 5.0, Some(15.0), false)));
     }
 
     #[pg_bench(setup = generate_sample_video)]
     fn bench_trim_precise(b: &mut Bencher) {
         let data = sample_video_bytes();
-        b.iter(move || black_box(super::trim(data.clone(), 5.0, Some(15.0), true)));
+        b.iter(move || black_box(super::trim(&data, 5.0, Some(15.0), true)));
     }
 }

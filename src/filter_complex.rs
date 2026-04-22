@@ -999,12 +999,8 @@ fn resolve_video_encoder(
             codec_lookup::find_encoder(name, CodecKind::Video).unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     } else {
-        let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
-            error!(
-                "pg_ffmpeg: no video encoder found for source codec {:?}",
-                source_id
-            )
-        });
+        let codec = codec_lookup::find_encoder_by_id(source_id, CodecKind::Video)
+            .unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     }
 }
@@ -1018,11 +1014,9 @@ fn resolve_audio_encoder(
             codec_lookup::find_encoder(name, CodecKind::Audio).unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     } else {
-        let codec = codec::encoder::find(source_id).unwrap_or_else(|| {
-            let fallback = codec::encoder::find(CodecId::AAC)
-                .unwrap_or_else(|| error!("pg_ffmpeg: no audio encoder found"));
-            fallback
-        });
+        let codec = codec_lookup::find_encoder_by_id(source_id, CodecKind::Audio)
+            .or_else(|_| codec_lookup::find_encoder_by_id(CodecId::AAC, CodecKind::Audio))
+            .unwrap_or_else(|e| error!("{e}"));
         (codec, codec.name().to_owned())
     }
 }

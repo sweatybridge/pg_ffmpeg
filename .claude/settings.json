@@ -1,5 +1,19 @@
 {
   "env": {
     "CARGO_PGRX_TEST_RUNAS": "postgres"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git push*)",
+            "command": "out=$(cargo fmt --check 2>&1) || { echo \"$out\" >&2; echo '' >&2; echo \"cargo fmt would modify files. Run 'cargo fmt', commit the changes, then retry the push.\" >&2; exit 2; }"
+          }
+        ]
+      }
+    ]
   }
 }

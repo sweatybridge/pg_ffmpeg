@@ -5,8 +5,8 @@ use ffmpeg_next::software::scaling::{context::Context as ScaleContext, flag::Fla
 use ffmpeg_next::util::frame::{audio::Audio, video::Video};
 use pgrx::prelude::*;
 
+use crate::frame_encoder::encode_frame;
 use crate::mem_io::MemInput;
-use crate::thumbnail;
 
 #[pg_extern]
 fn waveform(
@@ -85,7 +85,7 @@ fn render_waveform(data: &[u8], width: u32, height: u32, format: &str, mode: &st
 
     let frame = result_frame.unwrap_or_else(|| error!("no waveform frame could be generated"));
     let rgb_frame = ensure_rgb24(&frame);
-    thumbnail::encode_frame(&rgb_frame, format)
+    encode_frame(&rgb_frame, format)
 }
 
 fn build_waveform_graph(
