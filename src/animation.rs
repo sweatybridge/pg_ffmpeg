@@ -1,6 +1,7 @@
 use pgrx::prelude::*;
 
 use ffmpeg_next::codec;
+use ffmpeg_next::format::Pixel;
 use ffmpeg_next::media::Type;
 use ffmpeg_next::{Packet, Rational, Rescale};
 
@@ -45,11 +46,6 @@ fn encode_animation(
         .unwrap_or_else(|e| error!("failed to open video decoder: {e}"));
     decoder.set_time_base(input.time_base());
 
-    let filter_spec = animation_filter_spec(start_time, duration, width, fps, format);
-    let mut graph = pipeline::build_video_filter_graph(&decoder, &filter_spec);
-    let (out_width, out_height, out_pix_fmt, filter_time_base) =
-        resolved_animation_output(&mut graph);
-
     let (codec_name, muxer) = match format {
         "gif" => ("gif", "gif"),
         "apng" => ("apng", "apng"),
@@ -60,6 +56,13 @@ fn encode_animation(
     let selected_codec = codec_lookup::find_encoder(codec_name, CodecKind::Video)
         .or_else(|_| codec_lookup::find_encoder("libwebp", CodecKind::Video))
         .unwrap_or_else(|e| error!("{e}"));
+    let encoder_pix_fmt = animation_encoder_pixel_format(format, selected_codec);
+
+    let filter_spec =
+        animation_filter_spec(start_time, duration, width, fps, format, encoder_pix_fmt);
+    let mut graph = pipeline::build_video_filter_graph(&decoder, &filter_spec);
+    let (out_width, out_height, out_pix_fmt, filter_time_base) =
+        resolved_animation_output(&mut graph);
 
     let mut octx = MemOutput::open(muxer);
     let encoder_time_base = Rational::new(1, fps);
@@ -104,6 +107,7 @@ fn encode_animation(
 
     let mut packet = Packet::empty();
     let mut decoded = ffmpeg_next::frame::Video::empty();
+    let mut source_finished = false;
     for (stream, packet_in) in ictx.packets() {
         if stream.index() != stream_index {
             continue;
@@ -113,7 +117,8 @@ fn encode_animation(
             .unwrap_or_else(|e| error!("video decode error: {e}"));
         while decoder.receive_frame(&mut decoded).is_ok() {
             if !push_animation_frame(&mut graph, &decoded) {
-                continue;
+                source_finished = true;
+                break;
             }
             drain_animation_filter(
                 &mut graph,
@@ -125,22 +130,27 @@ fn encode_animation(
                 out_time_base,
             );
         }
+        if source_finished {
+            break;
+        }
     }
 
-    let _ = decoder.send_eof();
-    while decoder.receive_frame(&mut decoded).is_ok() {
-        if !push_animation_frame(&mut graph, &decoded) {
-            continue;
+    if !source_finished {
+        let _ = decoder.send_eof();
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            if !push_animation_frame(&mut graph, &decoded) {
+                break;
+            }
+            drain_animation_filter(
+                &mut graph,
+                &mut encoder,
+                &mut packet,
+                &mut octx,
+                filter_time_base,
+                encoder_time_base,
+                out_time_base,
+            );
         }
-        drain_animation_filter(
-            &mut graph,
-            &mut encoder,
-            &mut packet,
-            &mut octx,
-            filter_time_base,
-            encoder_time_base,
-            out_time_base,
-        );
     }
     let _ = graph.get("in").unwrap().source().flush();
     drain_animation_filter(
@@ -175,6 +185,7 @@ fn animation_filter_spec(
     width: Option<i32>,
     fps: i32,
     format: &str,
+    encoder_pix_fmt: Option<Pixel>,
 ) -> String {
     let end_time = start_time + duration;
     let width_expr = width
@@ -186,9 +197,33 @@ fn animation_filter_spec(
     match format {
         "gif" => format!("{prefix},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"),
         "apng" => format!("{prefix},format=rgba"),
-        "webp" => prefix,
+        "webp" => {
+            let pix_fmt = encoder_pix_fmt
+                .and_then(|pix_fmt| pix_fmt.descriptor())
+                .map(|descriptor| descriptor.name())
+                .unwrap_or_else(|| error!("pg_ffmpeg: could not resolve WebP pixel format"));
+            format!("{prefix},format={pix_fmt}")
+        }
         _ => unreachable!(),
     }
+}
+
+fn animation_encoder_pixel_format(format: &str, codec: ffmpeg_next::Codec) -> Option<Pixel> {
+    if format != "webp" {
+        return None;
+    }
+    let video_codec = codec
+        .video()
+        .unwrap_or_else(|_| error!("pg_ffmpeg: selected WebP encoder is not a video encoder"));
+    let Some(formats) = video_codec.formats() else {
+        return Some(Pixel::YUV420P);
+    };
+    let supported = formats.collect::<Vec<_>>();
+    [Pixel::BGRA, Pixel::YUVA420P, Pixel::YUV420P]
+        .into_iter()
+        .find(|candidate| supported.contains(candidate))
+        .or_else(|| supported.first().copied())
+        .or(Some(Pixel::YUV420P))
 }
 
 fn push_animation_frame(
@@ -308,6 +343,14 @@ mod tests {
         let data = generate_test_video_bytes(64, 64, 10, 2);
         let apng = generate_gif(&data, 0.0, 1.0, Some(64), 10, "apng".to_string());
         assert!(apng.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[pg_test]
+    fn test_generate_webp() {
+        let data = generate_test_video_bytes(64, 64, 10, 2);
+        let webp = generate_gif(&data, 0.0, 1.0, Some(64), 10, "webp".to_string());
+        assert!(webp.starts_with(b"RIFF"));
+        assert_eq!(&webp[8..12], b"WEBP");
     }
 
     fn decoded_video_frame_count(data: &[u8]) -> usize {
