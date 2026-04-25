@@ -453,7 +453,7 @@ Add to JSONB output:
 **Gate to advance**: All Milestone 2 functions tested, security review of `filter_complex` complete, CI green.
 **Parallelism**: Tasks 2A–2G can run in parallel after Milestone 1.
 
-### Task 2A: `generate_gif` (`src/gif.rs`)
+### Task 2A: `generate_gif` (`src/animation.rs`)
 
 ```sql
 generate_gif(
@@ -704,7 +704,7 @@ Per review feedback: benches were previously gating, but perf benchmarks are inh
 | `src/trim.rs` | 1 | **New** — two-mode trim |
 | `src/extract_frames.rs` | 1 | **New** — set-returning with max_frames cap |
 | `src/media_info.rs` | 1 | Modify — add chapters/tags/disposition |
-| `src/gif.rs` | 2 | **New** — animated image generation |
+| `src/animation.rs` | 2 | **New** — animated image generation |
 | `src/waveform.rs` | 2 | **New** — audio visualization |
 | `src/subtitles.rs` | 2 | **New** — text subtitle extraction only |
 | `src/overlay.rs` | 2 | **New** — two-input compositing |

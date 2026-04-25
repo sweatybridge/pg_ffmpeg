@@ -168,6 +168,7 @@ impl<'a> Drop for MemInput<'a> {
 pub(crate) struct OutputSink {
     buf: Vec<u8>,
     written: usize,
+    position: usize,
     /// Set to `true` once a write was rejected by the output-size cap.
     /// We surface this at `into_data()` time so the caller can turn it
     /// into a proper Postgres ERROR with the limit message.
@@ -179,6 +180,7 @@ impl OutputSink {
         Self {
             buf: Vec::new(),
             written: 0,
+            position: 0,
             over_limit: false,
         }
     }
@@ -186,7 +188,9 @@ impl OutputSink {
 
 unsafe extern "C" fn write_cb(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
     let sink = &mut *(opaque as *mut OutputSink);
-    let new_total = sink.written.saturating_add(size as usize);
+    let size = size as usize;
+    let new_position = sink.position.saturating_add(size);
+    let new_total = sink.written.max(new_position);
     if limits::check_output_size(new_total).is_err() {
         sink.over_limit = true;
         // Return -ENOMEM (ENOMEM = 12 on Linux/POSIX). FFmpeg's muxers
@@ -194,10 +198,36 @@ unsafe extern "C" fn write_cb(opaque: *mut c_void, data: *const u8, size: c_int)
         // surface the limit error at into_data() time.
         return AVERROR(12);
     }
-    sink.buf
-        .extend_from_slice(std::slice::from_raw_parts(data, size as usize));
+    if sink.buf.len() < new_position {
+        sink.buf.resize(new_position, 0);
+    }
+    sink.buf[sink.position..new_position].copy_from_slice(std::slice::from_raw_parts(data, size));
     sink.written = new_total;
-    size
+    sink.position = new_position;
+    size as c_int
+}
+
+unsafe extern "C" fn output_seek_cb(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
+    let sink = &mut *(opaque as *mut OutputSink);
+    const AVSEEK_SIZE: c_int = 0x10000;
+    if whence == AVSEEK_SIZE {
+        return sink.buf.len() as i64;
+    }
+
+    let base = match whence & 0xff {
+        0 => 0i64,
+        1 => sink.position as i64,
+        2 => sink.buf.len() as i64,
+        _ => return -1,
+    };
+    let Some(position) = base.checked_add(offset) else {
+        return -1;
+    };
+    if position < 0 {
+        return -1;
+    }
+    sink.position = position as usize;
+    position
 }
 
 /// FFmpeg output context that writes to an in-memory buffer.
@@ -226,7 +256,7 @@ impl MemOutput {
                 // Transmute to satisfy newer FFmpeg signature where data is *const u8.
                 #[allow(clippy::missing_transmute_annotations)]
                 Some(std::mem::transmute(write_cb as *const ())),
-                None,
+                Some(output_seek_cb),
             );
             if avio_ctx.is_null() {
                 error!("failed to allocate AVIO context");

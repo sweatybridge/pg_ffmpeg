@@ -15,7 +15,7 @@ All functions are in the `ffmpeg` schema.
 | `trim(data bytea, start_time float8 DEFAULT 0.0, end_time float8 DEFAULT NULL, precise bool DEFAULT false) -> bytea` | Trim media with either keyframe-aligned stream copy or frame-accurate re-encode |
 | `extract_frames(data bytea, interval float8 DEFAULT 1.0, format text DEFAULT 'png', keyframes_only bool DEFAULT false, max_frames int DEFAULT 1000) -> TABLE(timestamp float8, frame bytea)` | Extract bounded frame sets as PNG or JPEG rows |
 | `hls(url text, segment_duration int DEFAULT 6) -> bigint` | Fetch a video via URL, split into HLS segments, and store in `ffmpeg.hls_playlists` / `ffmpeg.hls_segments` |
-| `generate_gif(data bytea, start_time float8 DEFAULT 0.0, duration float8 DEFAULT 5.0, width int DEFAULT NULL, fps int DEFAULT 10, format text DEFAULT 'gif') -> bytea` | Generate GIF, APNG, or WebP preview output from a video frame |
+| `generate_gif(data bytea, start_time float8 DEFAULT 0.0, duration float8 DEFAULT 5.0, width int DEFAULT NULL, fps int DEFAULT 10, format text DEFAULT 'gif') -> bytea` | Generate animated GIF, APNG, or WebP preview output from video |
 | `waveform(data bytea, width int DEFAULT 800, height int DEFAULT 200, format text DEFAULT 'png', mode text DEFAULT 'waveform') -> bytea` | Render audio waveform or spectrum images |
 | `extract_subtitles(data bytea, format text DEFAULT 'srt', stream_index int DEFAULT NULL) -> text` | Extract supported text subtitles as SRT, ASS, or WebVTT |
 | `overlay(background bytea, foreground bytea, x int DEFAULT 0, y int DEFAULT 0, start_time float8 DEFAULT 0.0, end_time float8 DEFAULT NULL) -> bytea` | Overlay one video on another while preserving background audio |
@@ -47,11 +47,19 @@ When `trim(..., precise => true)` cannot re-open the source codec as an encoder 
 
 ## Milestone 2 notes
 
-`filter_complex` accepts only the pg_ffmpeg label contract: inputs must be referenced as `[i0:v]`, `[i0:a]`, `[i1:v]`, and so on, and the graph must produce `[vout]`, `[aout]`, or both. Labels are rewritten internally before FFmpeg sees the graph. Unsafe filters such as `movie` and `amovie` are rejected by the same allow-list used by `transcode`.
+`generate_gif` decodes the requested time range and applies `fps`, Lanczos scaling, and GIF palette generation before encoding. `format => 'gif'` writes a paletted animated GIF; `format => 'apng'` and `format => 'webp'` use the same time-range and frame-rate controls.
+
+`filter_complex` accepts only the pg_ffmpeg label contract: inputs must be referenced as `[i0:v]`, `[i0:a]`, `[i1:v]`, and so on, and the graph must produce `[vout]`, `[aout]`, or both. Labels are rewritten internally before FFmpeg sees the graph. Unsafe filters such as `movie` and `amovie` are rejected by the same allow-list used by `transcode`. `hwaccel => true` is accepted for API consistency and currently falls back to the software path with a warning.
 
 `concat(bytea[])` requires all inputs to expose compatible streams: codec, stream type, video dimensions, audio sample rate, channel count, and sample format must match the first input. `concat_agg` stores each incoming bytea once as aggregate state, enforces `pg_ffmpeg.max_aggregate_state_bytes`, and is not parallel-safe because input order matters. It is O(total_size) in memory; for concatenating many large videos, use an external pipeline.
 
-`encode` validates that every frame decodes to the same dimensions before encoding. For MP4/MOV output, pg_ffmpeg writes fragmented output suitable for the in-memory `MemOutput` sink.
+`encode` validates that every frame decodes to the same dimensions before encoding. It writes normal muxer output for the selected container and reports header or trailer failures as user-visible errors.
+
+## Hardware acceleration
+
+Hardware acceleration is opt-in for functions that expose `hwaccel`. Use it when the server has a supported GPU stack and the workload is dominated by H.264, HEVC, AV1, or VP9 video encoding. pg_ffmpeg probes the linked FFmpeg build and the available device backends lazily inside the current PostgreSQL backend. If no matching hardware encoder or device can be opened, the function logs a `WARNING` and continues with the software encoder.
+
+Leave `hwaccel` at its default `false` for short clips, image-sequence encoding, tests, CPU-only hosts, or deployments where deterministic software output matters more than throughput. Hardware paths can produce different compression decisions from software encoders and depend on driver availability outside PostgreSQL.
 
 ## Prerequisites
 

@@ -1,20 +1,22 @@
 use ffmpeg_next::codec;
+use ffmpeg_next::codec::subtitle::Rect;
 use ffmpeg_next::media::Type;
 use ffmpeg_next::Rational;
 use pgrx::prelude::*;
 
+use crate::codec_lookup;
 use crate::mem_io::MemInput;
 
 #[pg_extern]
 fn extract_subtitles(
-    data: Vec<u8>,
+    data: &[u8],
     format: default!(String, "'srt'"),
     stream_index: default!(Option<i32>, "NULL"),
 ) -> String {
     ffmpeg_next::init().unwrap();
     validate_subtitle_format(&format);
 
-    let mut ictx = MemInput::open(&data);
+    let mut ictx = MemInput::open(data);
     let selected = select_subtitle_stream(&ictx, stream_index);
     ensure_supported_text_subtitle(selected.codec_id);
 
@@ -88,66 +90,102 @@ fn ensure_supported_text_subtitle(codec_id: codec::Id) {
 
 fn collect_subtitle_cues(ictx: &mut MemInput<'_>, selected: SelectedSubtitle) -> Vec<Cue> {
     let mut cues = Vec::new();
-    let mut fallback_start = 0.0f64;
+    let decoder_codec =
+        codec_lookup::find_decoder(selected.codec_id).unwrap_or_else(|e| error!("{e}"));
+    let stream = ictx
+        .stream(selected.index)
+        .unwrap_or_else(|| error!("pg_ffmpeg: subtitle stream disappeared"));
+    let decoder_ctx = codec::context::Context::from_parameters(stream.parameters())
+        .unwrap_or_else(|e| error!("failed to create subtitle decoder context: {e}"));
+    let mut decoder = decoder_ctx
+        .decoder()
+        .open_as(decoder_codec)
+        .and_then(|opened| opened.subtitle())
+        .unwrap_or_else(|e| error!("failed to open subtitle decoder: {e}"));
 
     for (stream, packet) in ictx.packets() {
         if stream.index() != selected.index {
             continue;
         }
 
-        let Some(data) = packet.data() else {
-            continue;
-        };
-        let text = packet_text(selected.codec_id, data);
-        if text.trim().is_empty() {
-            continue;
-        }
-
-        let start = packet
+        let packet_start = packet
             .pts()
             .or_else(|| packet.dts())
             .map(|pts| timestamp_seconds(pts, selected.time_base))
-            .unwrap_or(fallback_start);
-        let duration = timestamp_seconds(packet.duration(), selected.time_base);
-        let end = if duration > 0.0 {
-            start + duration
-        } else {
-            start + 2.0
-        };
-        fallback_start = end;
+            .unwrap_or(0.0);
+        let packet_duration = timestamp_seconds(packet.duration(), selected.time_base);
 
+        let mut subtitle = ffmpeg_next::Subtitle::new();
+        let decoded = decoder
+            .decode(&packet, &mut subtitle)
+            .unwrap_or_else(|e| error!("subtitle decode error: {e}"));
+        if decoded {
+            append_decoded_subtitle_cues(
+                &mut cues,
+                &subtitle,
+                selected.codec_id,
+                packet_start,
+                packet_duration,
+            );
+        }
+        unsafe {
+            ffmpeg_next::sys::avsubtitle_free(subtitle.as_mut_ptr());
+        }
+    }
+
+    cues
+}
+
+fn append_decoded_subtitle_cues(
+    cues: &mut Vec<Cue>,
+    subtitle: &ffmpeg_next::Subtitle,
+    codec_id: codec::Id,
+    packet_start: f64,
+    packet_duration: f64,
+) {
+    let base_start = subtitle
+        .pts()
+        .map(|pts| pts as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE))
+        .unwrap_or(packet_start);
+    let start = base_start + f64::from(subtitle.start()) / 1000.0;
+    let end = if subtitle.end() > subtitle.start() {
+        base_start + f64::from(subtitle.end()) / 1000.0
+    } else if packet_duration > 0.0 {
+        packet_start + packet_duration
+    } else {
+        start
+    };
+
+    for rect in subtitle.rects() {
+        let text = match rect {
+            Rect::Text(text) => normalize_subtitle_text(text.get()),
+            Rect::Ass(ass) => clean_ass_text(ass.get()),
+            Rect::Bitmap(_) => {
+                error!("image-based subtitles require OCR, use extract_frames + external OCR");
+            }
+            Rect::None(_) => String::new(),
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let text = match codec_id {
+            codec::Id::ASS | codec::Id::SSA => clean_ass_text(&text),
+            _ => text,
+        };
         cues.push(Cue {
             start,
             end: end.max(start + 0.001),
             text,
         });
     }
-
-    cues
 }
 
-fn packet_text(codec_id: codec::Id, data: &[u8]) -> String {
-    let payload = match codec_id {
-        codec::Id::MOV_TEXT if data.len() >= 2 => {
-            let len = u16::from_be_bytes([data[0], data[1]]) as usize;
-            if len <= data.len().saturating_sub(2) {
-                &data[2..2 + len]
-            } else {
-                &data[2..]
-            }
-        }
-        _ => data,
-    };
-
-    let text = String::from_utf8_lossy(payload)
-        .trim_matches(char::from(0))
+fn normalize_subtitle_text(text: &str) -> String {
+    text.trim_matches(char::from(0))
         .replace("\r\n", "\n")
-        .replace('\r', "\n");
-
-    match codec_id {
-        codec::Id::ASS | codec::Id::SSA => clean_ass_text(&text),
-        _ => text.trim().to_owned(),
-    }
+        .replace('\r', "\n")
+        .trim()
+        .to_owned()
 }
 
 fn clean_ass_text(text: &str) -> String {
@@ -275,7 +313,7 @@ mod tests {
     #[pg_test]
     fn test_extract_subtitles_srt_to_webvtt() {
         let data = b"1\n00:00:00,000 --> 00:00:01,250\nHello from pg_ffmpeg\n\n".to_vec();
-        let webvtt = extract_subtitles(data, "webvtt".to_string(), None);
+        let webvtt = extract_subtitles(&data, "webvtt".to_string(), None);
 
         assert!(webvtt.starts_with("WEBVTT\n\n"));
         assert!(webvtt.contains("00:00:00.000 --> 00:00:01.250"));
@@ -292,6 +330,6 @@ mod tests {
     #[should_panic(expected = "no subtitle stream in input")]
     fn test_extract_subtitles_no_stream_errors() {
         let data = generate_test_video_bytes(64, 64, 10, 1);
-        extract_subtitles(data, "srt".to_string(), None);
+        extract_subtitles(&data, "srt".to_string(), None);
     }
 }

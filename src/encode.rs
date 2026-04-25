@@ -140,11 +140,8 @@ where
         .unwrap_or_else(|e| error!("encode send_eof error: {e}"));
     receive_packets(&mut encoder, &mut octx, encoder_time_base, out_time_base);
 
-    if let Err(e) = octx.write_trailer() {
-        if !matches!(format, "mp4" | "mov") {
-            error!("failed to write encode trailer: {e}");
-        }
-    }
+    octx.write_trailer()
+        .unwrap_or_else(|e| error!("failed to write encode trailer: {e}"));
     octx.into_data()
 }
 
@@ -318,16 +315,9 @@ fn codec_supports_crf(codec_name: &str) -> bool {
     )
 }
 
-fn write_encode_header(octx: &mut MemOutput, format: &str) {
-    if matches!(format, "mp4" | "mov") {
-        let mut muxer_options = Dictionary::new();
-        muxer_options.set("movflags", "frag_keyframe+empty_moov+default_base_moof");
-        octx.write_header_with(muxer_options)
-            .unwrap_or_else(|e| error!("failed to write encode header: {e}"));
-    } else {
-        octx.write_header()
-            .unwrap_or_else(|e| error!("failed to write encode header: {e}"));
-    }
+fn write_encode_header(octx: &mut MemOutput, _format: &str) {
+    octx.write_header()
+        .unwrap_or_else(|e| error!("failed to write encode header: {e}"));
 }
 
 #[allow(clippy::too_many_arguments)]

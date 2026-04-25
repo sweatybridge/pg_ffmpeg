@@ -10,7 +10,7 @@ use crate::mem_io::MemInput;
 
 #[pg_extern]
 fn waveform(
-    data: Vec<u8>,
+    data: &[u8],
     width: default!(i32, 800),
     height: default!(i32, 200),
     format: default!(String, "'png'"),
@@ -19,7 +19,7 @@ fn waveform(
     ffmpeg_next::init().unwrap();
     validate_waveform_args(width, height, &format, &mode);
 
-    render_waveform(&data, width as u32, height as u32, &format, &mode)
+    render_waveform(data, width as u32, height as u32, &format, &mode)
 }
 
 fn validate_waveform_args(width: i32, height: i32, format: &str, mode: &str) {
@@ -30,8 +30,8 @@ fn validate_waveform_args(width: i32, height: i32, format: &str, mode: &str) {
         error!("pg_ffmpeg: waveform height must be > 0");
     }
     match format {
-        "png" | "jpeg" | "jpg" | "ppm" => {}
-        _ => error!("pg_ffmpeg: waveform format must be png, jpeg, jpg, or ppm"),
+        "png" | "jpeg" | "jpg" => {}
+        _ => error!("pg_ffmpeg: waveform format must be png, jpeg, or jpg"),
     }
     match mode {
         "waveform" | "spectrum" => {}
@@ -84,7 +84,7 @@ fn render_waveform(data: &[u8], width: u32, height: u32, format: &str, mode: &st
     drain_waveform_frames(&mut graph, &mut result_frame);
 
     let frame = result_frame.unwrap_or_else(|| error!("no waveform frame could be generated"));
-    let rgb_frame = ensure_rgb24(&frame);
+    let rgb_frame = ensure_rgb24(frame);
     encode_frame(&rgb_frame, format)
 }
 
@@ -169,9 +169,9 @@ fn drain_waveform_frames(graph: &mut filter::Graph, result_frame: &mut Option<Vi
     }
 }
 
-fn ensure_rgb24(frame: &Video) -> Video {
+fn ensure_rgb24(frame: Video) -> Video {
     if frame.format() == Pixel::RGB24 {
-        return frame.clone();
+        return frame;
     }
 
     let mut rgb = Video::empty();
@@ -186,7 +186,7 @@ fn ensure_rgb24(frame: &Video) -> Video {
     )
     .unwrap_or_else(|e| error!("failed to create waveform RGB converter: {e}"));
     scaler
-        .run(frame, &mut rgb)
+        .run(&frame, &mut rgb)
         .unwrap_or_else(|e| error!("waveform RGB conversion error: {e}"));
     rgb
 }
@@ -202,7 +202,7 @@ mod tests {
     #[pg_test]
     fn test_waveform_png() {
         let data = generate_test_aac_adts_bytes(1);
-        let png = waveform(data, 320, 120, "png".to_string(), "waveform".to_string());
+        let png = waveform(&data, 320, 120, "png".to_string(), "waveform".to_string());
 
         assert!(!png.is_empty(), "waveform image should not be empty");
         assert_eq!(&png[..8], PNG_MAGIC, "waveform output should be a PNG");
@@ -211,7 +211,7 @@ mod tests {
     #[pg_test]
     fn test_spectrum_png() {
         let data = generate_test_aac_adts_bytes(1);
-        let png = waveform(data, 320, 120, "png".to_string(), "spectrum".to_string());
+        let png = waveform(&data, 320, 120, "png".to_string(), "spectrum".to_string());
 
         assert!(!png.is_empty(), "spectrum image should not be empty");
         assert_eq!(&png[..8], PNG_MAGIC, "spectrum output should be a PNG");
