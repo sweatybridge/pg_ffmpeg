@@ -45,10 +45,9 @@ Tightened per review feedback to a small, demonstrable core:
        artifact paths.
      - `cargo pgrx test` — confirms existing extension tests still run.
 2. New crate `pager/` with `Cargo.toml` (`name = "pg_bager"`,
-   `[[bin]] name = "pg_bager"`), deps: `base64` (streaming Kitty/iTerm2
-   payloads), `png` (streaming PNG validation / metadata read), hand-rolled
-   hex decode, no async runtime, no regex crate (manual scan to keep it
-   small).
+   `[[bin]] name = "pg_bager"`), deps: `base64` (Kitty/iTerm2
+   payloads), hand-rolled hex decode, no async runtime, no regex crate
+   (manual scan to keep it small).
 
 ## Invocation and chained pager
 
@@ -113,46 +112,32 @@ Tightened per review feedback to a small, demonstrable core:
     single-column. If the stream is multi-column or ambiguous, switch to
     passthrough mode and send all buffered plus remaining input unchanged to
     the default pager path.
-  - On a match, stream hex pairs through a decoder while the physical row
-    remains within `PG_BAGER_MAX_ROW_BYTES`. If the row or token exceeds that
-    cap, abort the rewrite for that row, flush the original bytes verbatim to
-    the default pager path, and resume passthrough.
-  - Feed hex-decoded bytes incrementally into `png_stream.rs`, which validates
-    the PNG signature and parses enough PNG structure to confirm a complete PNG
-    and read IHDR metadata. Do **not** decode the full raster into pixels in
-    v1; terminal protocols consume the original compressed PNG bytes.
-  - Tee the compressed PNG bytes into a bounded spool owned by the candidate
-    token (memory buffer first; spill to a temp file is acceptable if the
-    implementation wants lower RSS). The spool is capped by
-    `PG_BAGER_MAX_ROW_BYTES`.
-  - When the hex run ends and the streaming PNG parser reports one complete
-    valid PNG, hand off to the layout layer with `(original_token, png_spool,
-    png_metadata)`.
+  - On a match, accumulate hex bytes into a per-token decoder while the
+    physical row remains within `PG_BAGER_MAX_ROW_BYTES`. If the row or token
+    exceeds that cap, abort the rewrite for that row, flush the original bytes
+    verbatim to the default pager path, and resume passthrough.
+  - When the run ends (next non-hex byte) and the decoded prefix matches
+    the PNG magic `89 50 4E 47 0D 0A 1A 0A`, hand off to the layout layer
+    with `(original_token: &str, decoded: Vec<u8>)`.
   - Pass everything else through unchanged.
   - Verify: unit tests fed pre-canned byte streams that include
     >LINE_MAX-byte rows; assert peak resident memory stays bounded.
-- `png_stream.rs` — streaming PNG validation and metadata extraction:
-  - Accept hex-decoded compressed PNG bytes in small chunks from `scan.rs`.
-  - Validate the 8-byte PNG signature, IHDR, chunk lengths/CRCs, and IEND.
-  - Expose width/height from IHDR for sizing decisions.
-  - Reject trailing non-PNG data inside the hex token for v1; fall back to
-    passthrough rather than trying to render partial or concatenated images.
-  - Never allocate an RGBA frame buffer.
 - `encode.rs` — protocol encoders. Signature:
 
   ```rust
-  fn write_png(out: &mut dyn Write, original: &str, png: &mut dyn Read) -> io::Result<()>;
+  fn write(out: &mut dyn Write, original: &str, decoded: &[u8]) -> io::Result<()>;
   ```
 
-  Encoders base64-encode from the compressed PNG stream; they do not receive or
-  require decoded pixel bytes. Once a byte has reached `out` the terminal owns
-  it and we can't roll back, so fallback is only meaningful before any protocol
-  bytes have been emitted. Concretely:
-  - PNG validation or spool-open error before writing protocol bytes → write
-    `original` to `out` instead and return `Ok(())`.
-  - Protocol write failure after the first escape byte → propagate the
-    `io::Error`. The stream is unrecoverable; we don't try to "fix"
-    half-written escape sequences.
+  Encoders **must render the full escape sequence into a temporary
+  `Vec<u8>` first**, then write that buffer to `out` in one shot. Once a
+  byte has reached `out` the terminal owns it and we can't roll back;
+  buffering first means a fallback is only meaningful before any output
+  has been emitted. Concretely:
+  - Encoding error while building the buffer → write `original` to `out`
+    instead and return `Ok(())`.
+  - `out.write_all(&buf)` fails partway → propagate the `io::Error`. The
+    stream is unrecoverable; we don't try to "fix" half-written escape
+    sequences.
 
   - `kitty::write` — emits chunked Kitty graphics frames for PNG payloads
     only. Per the protocol, `m=1` means "more chunks follow" and `m=0`
@@ -165,13 +150,8 @@ Tightened per review feedback to a small, demonstrable core:
       chunk with `m=0` (terminals wait for more data otherwise and the
       image never paints).
     Non-PNG formats are not supported in v1.
-    The encoder base64-encodes from `png` into 4096-byte protocol chunks; it
-    must not build one giant base64 string for large PNGs.
   - `iterm2::write` —
     `\x1b]1337;File=inline=1;size=<n>;preserveAspectRatio=1:<base64>\x07`.
-    iTerm2 requires one OSC payload, so the encoder may need to stream into a
-    bounded temp/spool buffer before the final write; it must not allocate a
-    decoded image buffer.
   - `none::write` — writes `original` verbatim.
 
 - `layout.rs` — single source of truth for *whether* and *how* a recognized
@@ -219,17 +199,14 @@ Tightened per review feedback to a small, demonstrable core:
 - Bounded buffering. The scanner holds at most:
   - the rolling read chunk (e.g. 64 KiB);
   - one in-progress hex token capped by the current physical row cap;
-  - the compressed PNG spool for that token, bounded by roughly half the hex
-    token size;
-  - small streaming PNG decoder/parser state;
+  - decoded bytes for that token, bounded by roughly half the hex token size;
   - in single-column aligned mode, the current partial physical row capped at
     `MAX_ROW_BYTES`.
 - **`MAX_ROW_BYTES` defaults to PostgreSQL's maximum TOAST-able datum size**,
-  not a small constant derived from an image cap. Hex-encoded `bytea` is
-  ~2× the compressed PNG size, plus `\x` prefix, column padding, and borders;
-  the row cap exists only to prevent unbounded physical-row buffering.
-  Override via `PG_BAGER_MAX_ROW_BYTES` only for test or constrained
-  environments.
+  not a small constant derived from the image cap. Hex-encoded `bytea` is
+  ~2× the decoded size, plus `\x` prefix, column padding, and borders; the
+  row cap exists only to prevent unbounded physical-row buffering. Override
+  via `PG_BAGER_MAX_ROW_BYTES` only for test or constrained environments.
 - Single-column aligned rows that exceed `MAX_ROW_BYTES` are passed through
   verbatim to the default pager path (no placeholder rewrite, no inline
   image) so the binary degrades gracefully instead of dropping data.
@@ -239,18 +216,18 @@ Tightened per review feedback to a small, demonstrable core:
 - Flush stdout after every row terminator so psql's progressive output
   stays interactive.
 - Verify: feed a 100k-row result set with one ~100 MiB bytea cell;
-  assert RSS stays under the rolling chunk plus the row/token buffers, the PNG
-  compressed-byte spool, and small decoder state implied by `MAX_ROW_BYTES`,
-  with `MAX_ROW_BYTES` set to the TOAST-size default.
+  assert RSS stays under the rolling chunk plus the row/token buffers and
+  decoded image buffer implied by `MAX_ROW_BYTES`, with `MAX_ROW_BYTES` set to
+  the TOAST-size default.
 
 ## Error handling
 
-- PNG validation/spool-open/encoding setup error before any protocol bytes hit
-  `out` → encoder writes the original token verbatim and returns `Ok(())`.
-  Encoders may stream protocol bytes after validation starts, but a partial
+- Encoding error before any bytes hit `out` → encoder writes the
+  original token verbatim and returns `Ok(())`. Encoders MUST build the
+  full escape in a temporary buffer first (see `encode.rs`); a partial
   escape sequence on stdout cannot be undone.
-- Write failure after protocol output begins → propagate `io::Error` and exit
-  with non-zero status. The stream is unrecoverable.
+- `out.write_all` failure during the final flush → propagate `io::Error`
+  and exit with non-zero status. The stream is unrecoverable.
 - Decode errors (odd-length hex, non-hex character mid-run) → emit
   original bytes; do not abort.
 - Token or row exceeds `MAX_ROW_BYTES` → emit original bytes through the
@@ -269,23 +246,20 @@ Tightened per review feedback to a small, demonstrable core:
 2. Unit: `scan` finds PNG tokens in single-column aligned/unaligned/expanded
    fixtures; ignores non-PNG bytea (`\xdeadbeef`, JPEG/GIF/WebP magic —
    those are passed through verbatim in v1).
-3. Unit: `png_stream` accepts chunked valid PNG bytes, rejects bad signatures,
-   bad CRCs, missing IEND, and trailing bytes, and exposes IHDR width/height
-   without allocating an RGBA frame.
-4. Unit: scanner with a single-row, multi-MiB bytea cell respects
+3. Unit: scanner with a single-row, multi-MiB bytea cell respects
    `MAX_ROW_BYTES` and stays under a memory budget.
-5. Unit/golden: multi-column aligned, unaligned, and expanded fixtures pass
+4. Unit/golden: multi-column aligned, unaligned, and expanded fixtures pass
    through byte-for-byte to the default pager path; no image escape is emitted.
-6. Golden: feed canned single-column psql output + a known PNG; assert exact
+5. Golden: feed canned single-column psql output + a known PNG; assert exact
    stdout bytes for Kitty, iTerm2, and `none`.
-7. Integration (gated on `cargo test --features it`): launch real psql
+6. Integration (gated on `cargo test --features it`): launch real psql
    with `PSQL_PAGER=target/debug/pg_bager` **and**
    `\pset pager always`, run `SELECT thumbnail(...)`, assert the pager
    exits 0 and emits an escape sequence.
-8. Integration: launch a two-column query containing one PNG-shaped bytea and
+7. Integration: launch a two-column query containing one PNG-shaped bytea and
    one scalar column; assert the stream is delivered unchanged to the default
    pager path.
-9. Workspace regression: `cargo pgrx test` continues to pass after the
+8. Workspace regression: `cargo pgrx test` continues to pass after the
    workspace conversion.
 
 ## Docs and packaging
@@ -304,7 +278,7 @@ Tightened per review feedback to a small, demonstrable core:
 1. Workspace + empty pager binary that is a pure passthrough →
    `cargo pgrx test` still green; `psql` runs unchanged with
    `PSQL_PAGER=pg_bager` and `\pset pager always`.
-2. Byte-stream PNG scanner + streaming PNG validator + Kitty encoder → verify: a
+2. Byte-stream PNG scanner + Kitty encoder → verify: a
    single-column `SELECT thumbnail(video)` in Kitty shows the image;
    non-Kitty terminals unchanged.
 3. iTerm2 encoder → verify: same query in iTerm2.
@@ -326,5 +300,5 @@ Tightened per review feedback to a small, demonstrable core:
   TTY handling and a timeout; deferred.
 - Calling back into Postgres to transcode video bytea → PNG via
   `pg_ffmpeg`. Requires libpq or a side channel; revisit after v1.
-- Native (in-process) sixel and non-PNG image decoders.
+- Native (in-process) sixel and image decoders.
 - Windows terminal protocols.
