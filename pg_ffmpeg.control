@@ -2,5 +2,5 @@ comment = 'pg_ffmpeg: FFmpeg media processing functions for PostgreSQL'
 default_version = '@CARGO_VERSION@'
 module_pathname = '$libdir/pg_ffmpeg'
 relocatable = false
-superuser = true
+superuser = false
 schema = 'ffmpeg'
