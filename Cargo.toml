@@ -3,6 +3,9 @@ name = "pg_ffmpeg"
 version = "0.3.1"
 edition = "2021"
 
+[workspace]
+members = ["pager"]
+
 [lib]
 crate-type = ["cdylib"]
 

@@ -2,6 +2,12 @@
 
 A PostgreSQL extension that exposes FFmpeg media processing functions, built with [pgrx](https://github.com/pgcentralfoundation/pgrx).
 
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| [`pg_bager`](pager/README.md) | `psql` pager filter that renders single-column PNG `bytea` output inline in Kitty or iTerm2 |
+
 ## Functions
 
 All functions are in the `ffmpeg` schema.

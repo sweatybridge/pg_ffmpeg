@@ -1090,6 +1090,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg_bager"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "tempfile",
+]
+
+[[package]]
 name = "pg_ffmpeg"
 version = "0.3.1"
 dependencies = [
