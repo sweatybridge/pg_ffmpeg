@@ -1,26 +1,30 @@
 # Implementation plan: `pg_ffmpeg_pager`
 
-A small Rust binary that psql invokes via `PSQL_PAGER`, detects image-shaped
-bytea cells in psql's output stream, and replaces them with terminal graphics
-escapes.
+A small Rust binary that psql invokes via `PSQL_PAGER`. It detects PNG-shaped
+bytea cells in psql's output stream and replaces them with terminal graphics
+escapes for Kitty or iTerm2.
+
+This is a **filter masquerading as a pager**, so the user trades normal pager
+navigation (search, scrollback, less-style keys) for inline images. The plan
+addresses that tradeoff explicitly under "Invocation" and "Chained pager"
+below.
 
 ## Scope (v1)
 
-- Input: psql's already-formatted text on stdin (aligned, unaligned, and
-  `expanded` formats).
-- Detection: bytea hex literals for PNG/JPEG/GIF/WebP. Magic bytes (after
-  hex-decoding the cell content; `??` marks variable bytes the scanner
-  ignores):
-  - PNG: `89 50 4E 47 0D 0A 1A 0A`
-  - JPEG: `FF D8 FF`
-  - GIF: `47 49 46 38 (37|39) 61` (`GIF87a` / `GIF89a`)
-  - WebP: `52 49 46 46 ?? ?? ?? ?? 57 45 42 50` (`RIFF <4-byte size> WEBP`)
-- Output: pass text through unchanged, but replace recognized bytea cells with
-  inline-image escapes for the active terminal protocol.
-- Terminals: Kitty graphics protocol, iTerm2 inline images, Sixel; fallback =
-  identity passthrough.
-- No DB connection, no ffmpeg calls in v1. Calling into `pg_ffmpeg` for
-  non-image bytea (video frames → PNG) is explicitly out of scope; noted as v2.
+Tightened per review feedback to a small, demonstrable core:
+
+- **Format**: PNG `bytea` only. JPEG/GIF/WebP are deferred to v2 because
+  Kitty's inline graphics protocol expects PNG (`f=100`) or raw pixel buffers
+  (`f=24`/`f=32`); supporting other compressed formats requires a transcode
+  step we don't want in v1.
+- **Terminals**: Kitty graphics protocol and iTerm2 inline images. Sixel and
+  auto-detection are deferred (see "Out of scope").
+- **Input**: psql's already-formatted text (aligned, unaligned, expanded
+  display mode). No DB connection; no ffmpeg calls.
+- **Invocation**: requires forced pager mode. Without `\pset pager always`
+  (or `psql -P pager=always`) psql only spawns the pager when output exceeds
+  the terminal height, so small thumbnail queries never reach this binary.
+  v1 docs and integration tests must set this explicitly.
 
 ## Crate layout
 
@@ -29,117 +33,182 @@ escapes.
      package is implicitly a workspace member when `[package]` and
      `[workspace]` share the same manifest, so it does not need to be listed.
      Existing `cdylib` build stays intact.
-   - Verify: `cargo build -p pg_ffmpeg` and `cargo build -p pg_ffmpeg_pager`
-     both succeed.
+   - Verify (must all pass):
+     - `cargo build -p pg_ffmpeg`
+     - `cargo build -p pg_ffmpeg_pager`
+     - `cargo pgrx package` — confirms the extension still installs
+       correctly under pgrx; the workspace must not break the cdylib's
+       artifact paths.
+     - `cargo pgrx test` — confirms existing extension tests still run.
 2. New crate `pager/` with `Cargo.toml` (`name = "pg_ffmpeg_pager"`,
-   `[[bin]] name = "pg_ffmpeg_pager"`), deps: `base16ct` (or hand-rolled hex),
-   `atty`, `base64` (iTerm2/Kitty payloads), `terminfo` or env sniffing, no
-   async runtime.
+   `[[bin]] name = "pg_ffmpeg_pager"`), deps: `base64` (Kitty/iTerm2
+   payloads), hand-rolled hex decode, no async runtime, no regex crate
+   (manual scan to keep it small).
+
+## Invocation and chained pager
+
+- Document in `pager/README.md`:
+  - `export PSQL_PAGER=pg_ffmpeg_pager`
+  - `\pset pager always` in psql, or `psql -P pager=always`.
+  - This binary does not provide pager navigation. To preserve scrollback,
+    set `PG_FFMPEG_PAGER_INNER=less` (or any pager command). When set, the
+    binary spawns the inner pager and writes the (already image-rewritten)
+    text to its stdin instead of stdout. Default is unset → write to
+    stdout.
+- Verify: integration test runs psql with both `PSQL_PAGER` and
+  `\pset pager always` and confirms the binary is invoked.
 
 ## Module breakdown (`pager/src/`)
 
-- `main.rs` — argv/env wiring, opens stdin/stdout, dispatches to `stream::run`.
-- `term.rs` — detect protocol:
-  - Kitty: `TERM == "xterm-kitty"` or `KITTY_WINDOW_ID` set or
-    `TERM_PROGRAM == "WezTerm"`.
-  - iTerm2: `TERM_PROGRAM == "iTerm.app"`.
-  - Sixel: query `\x1b[c` on the controlling tty, parse Device Attributes for
-    `;4;`. Skip the query if stdout is not a tty.
-  - Fallback: `Protocol::None`.
-  - Override via `PG_FFMPEG_PAGER_PROTOCOL=kitty|iterm2|sixel|none`.
+- `main.rs` — argv/env wiring, opens stdin/stdout (or stdin → inner pager
+  stdin), dispatches to `stream::run`.
+- `term.rs` — detect protocol, env-driven only in v1:
+  - `PG_FFMPEG_PAGER_PROTOCOL=kitty|iterm2|none` — explicit override.
+  - Otherwise:
+    - Kitty: `TERM == "xterm-kitty"` or `KITTY_WINDOW_ID` set or
+      `TERM_PROGRAM == "WezTerm"`.
+    - iTerm2: `TERM_PROGRAM == "iTerm.app"`.
+    - Fallback: `Protocol::None`.
+  - **No TTY probing in v1.** Device-Attributes queries on the controlling
+    tty require raw mode, a timeout, and careful interaction with
+    concurrent terminal input — out of scope for the first cut. Sixel users
+    must opt in via the env var (and the v2 milestone will add an encoder).
   - Verify: unit tests with env-var fixtures.
-- `scan.rs` — line-oriented scanner that finds bytea hex tokens. Logic:
-  - Read input line by line (`BufReader`).
-  - Scan for psql's hex bytea token in the input stream: the literal
-    sequence `\x` (single backslash, lowercase `x`) followed by a run of
-    `[0-9A-Fa-f]` of length ≥ 16 (enough hex for any of the magics above).
-    In a Rust regex literal this is written `r"\\x[0-9A-Fa-f]{16,}"`; the
-    double backslash is the regex escape, not part of the input.
-  - Decode the first N bytes, sniff magic, classify as
-    `Png|Jpeg|Gif|Webp|Other`.
-  - For matches, emit: original line up to token start → image escape with
-    full decoded bytes → newline → original line continuation. (Most psql
-    formats put one cell per line section; aligned format may need
-    column-width preservation — see "Layout" below.)
-  - Verify: golden tests with captured psql outputs (aligned, unaligned,
-    and expanded display mode on/off).
-- `encode.rs` — protocol encoders, each takes `&[u8]` and writes to
-  `&mut dyn Write`:
-  - `kitty::write` — chunked `\x1b_Gf=100,a=T,m=1;<base64>\x1b\\` frames per
-    the Kitty graphics protocol; payloads ≤ 4096 bytes per chunk.
-  - `iterm2::write` — `\x1b]1337;File=inline=1;size=<n>;preserveAspectRatio=1:<base64>\x07`.
-  - `sixel::write` — convert PNG/JPEG/etc. to sixel. Avoid pulling a heavy
-    decoder in v1: shell out to `img2sixel` if available; if not, downgrade
-    to passthrough and log once to stderr. (Document this as a known
-    limitation; native sixel encoder is a v2 item.)
-  - `none::write` — write the original hex unchanged.
-- `layout.rs` — small helpers to keep psql's table grid intact:
-  - For `aligned` output, replace the matched hex token with a fixed-width
-    placeholder (e.g. `[img]` padded to original token width) on the table
-    line, then emit the inline-image escape on its own line *after* the row
-    terminator. This keeps column borders aligned even on terminals that
-    render images out-of-band.
-  - For `expanded` (`\x`) output, no width constraint — emit the image
+- `scan.rs` — **byte-stream scanner with bounded lookahead**. The previous
+  line-based design was wrong: psql emits a `bytea` value as one very long
+  physical line, so reading whole lines defeats `MAX_BYTES`. Instead:
+  - Read fixed-size chunks (e.g. 64 KiB) from stdin into a rolling buffer.
+  - Search for the literal start sequence `\x` (single backslash, lowercase
+    `x`) followed by `[0-9A-Fa-f]`. In a Rust regex literal that pattern is
+    written `r"\\x[0-9A-Fa-f]{16,}"`; the doubled backslash is the regex
+    escape, not part of the input bytes.
+  - On a match, accumulate hex bytes into a per-token decoder up to
+    `PG_FFMPEG_PAGER_MAX_BYTES` (default 4 MiB). If the run exceeds the
+    cap, abort the rewrite for that token, flush the original bytes
+    verbatim, and resume scanning past the run.
+  - When the run ends (next non-hex byte) and the decoded prefix matches
+    the PNG magic `89 50 4E 47 0D 0A 1A 0A`, hand off to the layout layer
+    with `(original_token: &str, decoded: Vec<u8>)`.
+  - Pass everything else through unchanged.
+  - Verify: unit tests fed pre-canned byte streams that include
+    >LINE_MAX-byte rows; assert peak resident memory stays bounded.
+- `encode.rs` — protocol encoders. Signature:
+
+  ```rust
+  fn write(out: &mut dyn Write, original: &str, decoded: &[u8]) -> io::Result<()>;
+  ```
+
+  Encoders own the decision to fall back to `original` on any internal
+  error so callers don't have to re-buffer.
+
+  - `kitty::write` — emits chunked `\x1b_Gf=100,a=T,m=1;<base64>\x1b\\`
+    frames; chunk payloads ≤ 4096 base64 bytes per the Kitty protocol.
+    Only invoked for PNG payloads; non-PNG formats are not supported in
+    v1.
+  - `iterm2::write` —
+    `\x1b]1337;File=inline=1;size=<n>;preserveAspectRatio=1:<base64>\x07`.
+  - `none::write` — writes `original` verbatim.
+
+- `layout.rs` — single source of truth for *how* a recognized cell is
+  rewritten. The scanner only identifies tokens; layout decides the
+  emission shape. This reconciles the scanner/layout split flagged in
+  review.
+  - For `aligned` output, replace the matched hex token in-place with a
+    fixed-width placeholder (e.g. `[img]` padded to the original token
+    width) so column borders stay aligned. Buffer the row up to its
+    terminator (`\n`), flush it, then emit the image-protocol escape
+    sequence on the following line(s).
+  - For `unaligned` output, replace the token with `[img]` and emit the
+    image escape immediately after the row's record separator.
+  - For `expanded` display mode, no width constraint — emit the image
     directly after the value line.
-  - Verify: snapshot tests against `psql -A`, default aligned, and `\x`
-    outputs.
+  - Detecting which mode we're in: heuristic on the first ~32 lines (look
+    for the `-[ RECORD N ]-` header for expanded, presence of `|` and
+    border `+-+` rows for aligned, otherwise unaligned). Document the
+    heuristic; misclassification only affects whitespace, never
+    correctness.
+  - Verify: snapshot tests against captured `psql -A`, default aligned,
+    and `\x` (expanded) outputs.
 - `config.rs` — env-driven knobs:
-  - `PG_FFMPEG_PAGER_MAX_BYTES` (default 4 MiB) — skip cells larger than this.
-  - `PG_FFMPEG_PAGER_MAX_PIXELS_W/H` — pass through to Kitty/iTerm2 for
-    sizing.
+  - `PG_FFMPEG_PAGER_MAX_BYTES` (default 4 MiB).
+  - `PG_FFMPEG_PAGER_MAX_PIXELS_W/H` — passed to Kitty/iTerm2 for sizing.
   - `PG_FFMPEG_PAGER_DISABLE=1` — full passthrough.
+  - `PG_FFMPEG_PAGER_INNER` — chained pager command (see "Invocation").
 
 ## Streaming and back-pressure
 
-- Single-threaded `BufReader`/`BufWriter` loop, line buffered.
-- Never buffer the whole input. The only buffering is per matched hex token
-  (bounded by `MAX_BYTES`).
-- Flush stdout after each line so psql's progressive output stays interactive.
-- Verify: feed a 100k-row result set; pager memory stays flat.
+- Chunked byte-stream loop, **not** line-buffered.
+- Bounded buffering: scanner holds at most one in-progress hex token
+  (capped at `MAX_BYTES`) plus the rolling read chunk plus the current
+  partial row (capped at a separate `MAX_ROW_BYTES`, default 1 MiB) for
+  the aligned-layout placeholder rewrite.
+- Flush stdout after every row terminator so psql's progressive output
+  stays interactive.
+- Verify: feed a 100k-row result set with one ~100 MiB bytea cell; assert
+  RSS stays under (chunk + MAX_BYTES + MAX_ROW_BYTES) plus a small
+  constant.
 
 ## Error handling
 
-- All terminal-protocol write failures → fall back to writing the original
-  hex for that cell, continue.
-- Decode errors → passthrough that token.
-- Never panic on malformed hex; log to stderr at most once per run.
+- Encoder write failures → encoder writes the original token verbatim and
+  returns `Ok(())` so the stream continues.
+- Decode errors (odd-length hex, non-hex character mid-run) → emit
+  original bytes; do not abort.
+- Token exceeds `MAX_BYTES` → emit original bytes; log to stderr at most
+  once per run.
+- Never panic on malformed input.
 
 ## Tests
 
-1. Unit: `term::detect` across env permutations.
-2. Unit: `scan` finds tokens in aligned/unaligned/`\x` fixtures; ignores
-   non-image bytea (e.g. random `\xdeadbeef`).
-3. Golden: feed canned psql output + a known PNG; assert exact stdout bytes
-   for Kitty, iTerm2, none. Sixel test gated on `img2sixel` being on PATH.
-4. Integration (optional, gated on `cargo test --features it`): start a real
-   psql with `PSQL_PAGER=target/debug/pg_ffmpeg_pager`, run
-   `SELECT thumbnail(...)`, assert the pager exits 0 and emits an escape
-   sequence.
+1. Unit: `term::detect` across env permutations (Kitty / iTerm2 / WezTerm
+   / explicit override / fallback).
+2. Unit: `scan` finds PNG tokens in aligned/unaligned/expanded fixtures;
+   ignores non-PNG bytea (`\xdeadbeef`, JPEG/GIF/WebP magic — those are
+   passed through verbatim in v1).
+3. Unit: scanner with a single-row, multi-MiB bytea cell respects
+   `MAX_BYTES` and stays under a memory budget.
+4. Golden: feed canned psql output + a known PNG; assert exact stdout
+   bytes for Kitty, iTerm2, and `none`.
+5. Integration (gated on `cargo test --features it`): launch real psql
+   with `PSQL_PAGER=target/debug/pg_ffmpeg_pager` **and**
+   `\pset pager always`, run `SELECT thumbnail(...)`, assert the pager
+   exits 0 and emits an escape sequence.
+6. Workspace regression: `cargo pgrx test` continues to pass after the
+   workspace conversion.
 
 ## Docs and packaging
 
-- `pager/README.md`: install, `export PSQL_PAGER=pg_ffmpeg_pager`, env knobs,
-  supported terminals, known limitations.
+- `pager/README.md`: install, both `PSQL_PAGER` *and* `\pset pager always`
+  required, env knobs, supported terminals (Kitty, iTerm2 in v1),
+  known limitations (no pager navigation unless `PG_FFMPEG_PAGER_INNER`
+  is set, PNG only in v1).
 - Add a row to top-level `README.md` linking to the pager.
 - `cargo install --path pager` works standalone.
 
 ## Milestones / verify gates
 
-1. Workspace + empty pager binary that is a pure passthrough → verify: `psql`
-   runs unchanged with `PSQL_PAGER=pg_ffmpeg_pager`.
-2. `term::detect` + Kitty encoder + PNG sniff → verify: a
-   `SELECT thumbnail(video)` in Kitty shows the image; other terminals
-   unchanged.
-3. JPEG/GIF/WebP sniff + iTerm2 encoder → verify: same query in iTerm2.
-4. Aligned-format layout preservation → verify: borders stay aligned in
-   `psql` default mode.
-5. Sixel via `img2sixel` shellout + size/disable knobs → verify: works in
-   xterm with sixel build.
+1. Workspace + empty pager binary that is a pure passthrough →
+   `cargo pgrx test` still green; `psql` runs unchanged with
+   `PSQL_PAGER=pg_ffmpeg_pager` and `\pset pager always`.
+2. Byte-stream PNG scanner + Kitty encoder → verify: a
+   `SELECT thumbnail(video)` in Kitty shows the image; non-Kitty
+   terminals unchanged.
+3. iTerm2 encoder → verify: same query in iTerm2.
+4. Aligned-mode layout preservation → verify: borders stay aligned in
+   default psql mode.
+5. `PG_FFMPEG_PAGER_INNER` chaining → verify: piping through `less`
+   preserves scrollback while still rendering the image inline at
+   first paint.
 6. Docs, tests, `cargo install` story → ship.
 
 ## Out of scope (call out, don't build)
 
-- Calling back into Postgres to transcode video bytea → PNG. Requires either
-  embedding libpq or a separate side-channel; revisit once v1 lands.
-- Native sixel encoder.
+- JPEG / GIF / WebP rendering. Requires a transcode-to-PNG step (or
+  decoder for raw RGB(A) Kitty frames) we don't want in v1.
+- Sixel encoder.
+- Sixel/automatic terminal probing via Device Attributes — needs raw-mode
+  TTY handling and a timeout; deferred.
+- Calling back into Postgres to transcode video bytea → PNG via
+  `pg_ffmpeg`. Requires libpq or a side channel; revisit after v1.
+- Native (in-process) sixel and image decoders.
 - Windows terminal protocols.
