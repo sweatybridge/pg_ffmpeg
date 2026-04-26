@@ -1,4 +1,4 @@
-# Implementation plan: `pg_ffmpeg_pager`
+# Implementation plan: `pg_bager`
 
 A small Rust binary that psql invokes via `PSQL_PAGER`. It detects PNG-shaped
 bytea cells in psql's output stream and replaces them with terminal graphics
@@ -19,8 +19,12 @@ Tightened per review feedback to a small, demonstrable core:
   step we don't want in v1.
 - **Terminals**: Kitty graphics protocol and iTerm2 inline images. Sixel and
   auto-detection are deferred (see "Out of scope").
-- **Input**: psql's already-formatted text (aligned, unaligned, expanded
-  display mode). No DB connection; no ffmpeg calls.
+- **Input**: psql's already-formatted text for **single-column result rows**
+  only (aligned, unaligned, expanded display mode). No DB connection; no
+  ffmpeg calls.
+- **Multi-column output**: pass through unchanged to the default pager path.
+  v1 must not attempt to preserve or rewrite arbitrary multi-column psql
+  layouts.
 - **Invocation**: requires forced pager mode. Without `\pset pager always`
   (or `psql -P pager=always`) psql only spawns the pager when output exceeds
   the terminal height, so small thumbnail queries never reach this binary.
@@ -35,26 +39,30 @@ Tightened per review feedback to a small, demonstrable core:
      Existing `cdylib` build stays intact.
    - Verify (must all pass):
      - `cargo build -p pg_ffmpeg`
-     - `cargo build -p pg_ffmpeg_pager`
+     - `cargo build -p pg_bager`
      - `cargo pgrx package` — confirms the extension still installs
        correctly under pgrx; the workspace must not break the cdylib's
        artifact paths.
      - `cargo pgrx test` — confirms existing extension tests still run.
-2. New crate `pager/` with `Cargo.toml` (`name = "pg_ffmpeg_pager"`,
-   `[[bin]] name = "pg_ffmpeg_pager"`), deps: `base64` (Kitty/iTerm2
+2. New crate `pager/` with `Cargo.toml` (`name = "pg_bager"`,
+   `[[bin]] name = "pg_bager"`), deps: `base64` (Kitty/iTerm2
    payloads), hand-rolled hex decode, no async runtime, no regex crate
    (manual scan to keep it small).
 
 ## Invocation and chained pager
 
 - Document in `pager/README.md`:
-  - `export PSQL_PAGER=pg_ffmpeg_pager`
+  - `export PSQL_PAGER=pg_bager`
   - `\pset pager always` in psql, or `psql -P pager=always`.
-  - This binary does not provide pager navigation. The default behavior
-    writes directly to the terminal, which gives correct image rendering
-    but no scrollback / search.
-  - Optional: set `PG_FFMPEG_PAGER_INNER` to a pager command to chain
-    output. **Caveats**:
+  - This binary does not provide pager navigation. For eligible single-column
+    image output, the default behavior writes directly to the terminal, which
+    gives correct image rendering but no scrollback / search.
+  - Passthrough cases (multi-column output, disabled mode, unsupported
+    formats, oversized rows) use the default pager path: `PG_BAGER_INNER` if
+    set, otherwise `$PAGER`, falling back to `less -R`, then `cat` if no pager
+    executable is available.
+  - Optional: set `PG_BAGER_INNER` to a pager command to chain output for all
+    cases. **Caveats**:
     - Most pagers strip or display-as-text terminal control sequences by
       default. `less` requires `-R` ("output raw control characters") to
       forward common SGR escapes, but `-R` does **not** guarantee that
@@ -62,14 +70,17 @@ Tightened per review feedback to a small, demonstrable core:
       sequences pass through correctly, and `less` repaints the screen
       on scroll which destroys already-rendered images.
     - A known-good v1 invocation for plain text only:
-      `PG_FFMPEG_PAGER_INNER='less -R'`. Inline images may render on
+      `PG_BAGER_INNER='less -R'`. Inline images may render on
       first paint and disappear on scroll; this is a `less` limitation,
       not a bug in this binary.
-    - `PG_FFMPEG_PAGER_INNER='cat'` is the no-op chain (rarely useful).
-    - For reliable inline images, leave `PG_FFMPEG_PAGER_INNER` unset.
+    - `PG_BAGER_INNER='cat'` is the no-op chain (rarely useful).
+    - For reliable inline images in single-column output, leave
+      `PG_BAGER_INNER` unset.
+  - Multi-column output always uses the default pager path and receives the
+    original, unmodified stream.
 - Verify: integration test runs psql with both `PSQL_PAGER` and
   `\pset pager always` and confirms the binary is invoked. A second
-  test exercises `PG_FFMPEG_PAGER_INNER='less -R'` and asserts that the
+  test exercises `PG_BAGER_INNER='less -R'` and asserts that the
   inner process receives the rewritten stream — it does **not** assert
   that images survive scrolling in `less`, since they don't.
 
@@ -78,7 +89,7 @@ Tightened per review feedback to a small, demonstrable core:
 - `main.rs` — argv/env wiring, opens stdin/stdout (or stdin → inner pager
   stdin), dispatches to `stream::run`.
 - `term.rs` — detect protocol, env-driven only in v1:
-  - `PG_FFMPEG_PAGER_PROTOCOL=kitty|iterm2|none` — explicit override.
+  - `PG_BAGER_PROTOCOL=kitty|iterm2|none` — explicit override.
   - Otherwise:
     - Kitty: `TERM == "xterm-kitty"` or `KITTY_WINDOW_ID` set or
       `TERM_PROGRAM == "WezTerm"`.
@@ -97,8 +108,12 @@ Tightened per review feedback to a small, demonstrable core:
     `x`) followed by `[0-9A-Fa-f]`. In a Rust regex literal that pattern is
     written `r"\\x[0-9A-Fa-f]{16,}"`; the doubled backslash is the regex
     escape, not part of the input bytes.
+  - Before rewriting any token, the layout layer must classify the result as
+    single-column. If the stream is multi-column or ambiguous, switch to
+    passthrough mode and send all buffered plus remaining input unchanged to
+    the default pager path.
   - On a match, accumulate hex bytes into a per-token decoder up to
-    `PG_FFMPEG_PAGER_MAX_BYTES` (default 4 MiB). If the run exceeds the
+    `PG_BAGER_MAX_BYTES` (default 4 MiB). If the run exceeds the
     cap, abort the rewrite for that token, flush the original bytes
     verbatim, and resume scanning past the run.
   - When the run ends (next non-hex byte) and the decoded prefix matches
@@ -139,35 +154,44 @@ Tightened per review feedback to a small, demonstrable core:
     `\x1b]1337;File=inline=1;size=<n>;preserveAspectRatio=1:<base64>\x07`.
   - `none::write` — writes `original` verbatim.
 
-- `layout.rs` — single source of truth for *how* a recognized cell is
-  rewritten. The scanner only identifies tokens; layout decides the
-  emission shape. This reconciles the scanner/layout split flagged in
-  review.
-  - For `aligned` output, replace the matched hex token in-place with a
-    fixed-width placeholder (e.g. `[img]` padded to the original token
-    width) so column borders stay aligned. Buffer the row up to its
-    terminator (`\n`), flush it, then emit the image-protocol escape
-    sequence on the following line(s).
-  - For `unaligned` output, replace the token with `[img]` and emit the
-    image escape immediately after the row's record separator.
-  - For `expanded` display mode, no width constraint — emit the image
-    directly after the value line.
-  - Detecting which mode we're in: heuristic on the first ~32 lines (look
-    for the `-[ RECORD N ]-` header for expanded, presence of `|` and
-    border `+-+` rows for aligned, otherwise unaligned). Document the
-    heuristic; misclassification only affects whitespace, never
-    correctness.
-  - Verify: snapshot tests against captured `psql -A`, default aligned,
-    and `\x` (expanded) outputs.
+- `layout.rs` — single source of truth for *whether* and *how* a recognized
+  cell is rewritten. The scanner only identifies tokens; layout decides the
+  emission shape and owns single-column detection.
+  - v1 rewrite eligibility: exactly one result column. Multi-column output,
+    footer-only output, or ambiguous format detection must pass through
+    unchanged to the default pager path.
+  - Single-column `aligned` output: replace the matched hex token in-place
+    with a fixed-width placeholder (e.g. `[img]` padded to the original token
+    width) so the one-column border stays aligned. Buffer the row up to its
+    terminator (`\n`), flush it, then emit the image-protocol escape sequence
+    on the following line(s).
+  - Single-column `unaligned` output: replace the token with `[img]` and emit
+    the image escape immediately after the row's record separator.
+  - Single-column `expanded` display mode: no width constraint — emit the
+    image directly after the value line.
+  - Detecting single-column mode:
+    - aligned: parse the header separator and data rows; more than one cell
+      delimiter (`|`) in a row means multi-column passthrough;
+    - unaligned: no field separator in the data row means single-column; one
+      or more separators means multi-column passthrough;
+    - expanded: one field/value line per record means single-column; multiple
+      field/value lines per record means multi-column passthrough.
+    Detection should happen from the initial buffered prelude plus the first
+    candidate data row. Misclassification must prefer passthrough.
+  - Verify: snapshot tests against captured single-column `psql -A`, default
+    aligned, and `\x` (expanded) outputs, plus multi-column fixtures that
+    assert byte-for-byte passthrough.
 - `config.rs` — env-driven knobs:
-  - `PG_FFMPEG_PAGER_MAX_BYTES` (default 4 MiB) — decoded image cap.
-  - `PG_FFMPEG_PAGER_MAX_ROW_BYTES` (default `2 * MAX_BYTES + 64 KiB`)
-    — physical-row buffer cap for aligned-mode placeholder rewrite.
-  - `PG_FFMPEG_PAGER_MAX_PIXELS_W/H` — passed to Kitty/iTerm2 for
-    sizing.
-  - `PG_FFMPEG_PAGER_DISABLE=1` — full passthrough.
-  - `PG_FFMPEG_PAGER_INNER` — chained pager command (see "Invocation
-    and chained pager" for caveats).
+  - `PG_BAGER_MAX_BYTES` (default 4 MiB) — decoded image cap.
+  - `PG_BAGER_MAX_ROW_BYTES` defaults to PostgreSQL's maximum TOAST-able datum
+    size (the implementation should define this as a named constant matching
+    PostgreSQL's documented maximum field size, approximately 1 GiB). This is
+    the physical row buffer cap for single-column placeholder rewrite; rows
+    beyond it pass through unchanged.
+  - `PG_BAGER_MAX_PIXELS_W/H` — passed to Kitty/iTerm2 for sizing.
+  - `PG_BAGER_DISABLE=1` — full passthrough.
+  - `PG_BAGER_INNER` — chained/default pager command override (see
+    "Invocation and chained pager" for caveats).
 
 ## Streaming and back-pressure
 
@@ -176,23 +200,24 @@ Tightened per review feedback to a small, demonstrable core:
   - the rolling read chunk (e.g. 64 KiB);
   - one in-progress hex token capped at `MAX_BYTES` (decoded), which is
     `2 * MAX_BYTES` of hex text;
-  - in aligned mode, the current partial physical row capped at
+  - in single-column aligned mode, the current partial physical row capped at
     `MAX_ROW_BYTES`.
-- **`MAX_ROW_BYTES` must be derived from `MAX_BYTES`**, not set to a
-  small constant. Hex-encoded `bytea` is ~2× the decoded size, plus
-  `\x` prefix, column padding, and borders. A naive 1 MiB row cap would
-  refuse a perfectly valid 4 MiB PNG (≈8 MiB of hex). Default formula:
-  `MAX_ROW_BYTES = 2 * MAX_BYTES + 64 KiB` (overhead headroom). Override
-  via `PG_FFMPEG_PAGER_MAX_ROW_BYTES` for users who set
-  `MAX_BYTES` low but still want huge rows passed through.
-- Aligned-mode rows that exceed `MAX_ROW_BYTES` are passed through
-  verbatim (no placeholder rewrite, no inline image) so the binary
-  degrades gracefully instead of dropping data.
+- **`MAX_ROW_BYTES` defaults to PostgreSQL's maximum TOAST-able datum size**,
+  not a small constant derived from the image cap. Hex-encoded `bytea` is
+  ~2× the decoded size, plus `\x` prefix, column padding, and borders; the
+  row cap exists only to prevent unbounded physical-row buffering. Override
+  via `PG_BAGER_MAX_ROW_BYTES` only for test or constrained environments.
+- Single-column aligned rows that exceed `MAX_ROW_BYTES` are passed through
+  verbatim to the default pager path (no placeholder rewrite, no inline
+  image) so the binary degrades gracefully instead of dropping data.
+- Multi-column output is never rewritten. Once detected, flush any buffered
+  bytes unchanged to the default pager path and stream the remainder without
+  scanning for image replacements.
 - Flush stdout after every row terminator so psql's progressive output
   stays interactive.
 - Verify: feed a 100k-row result set with one ~100 MiB bytea cell;
   assert RSS stays under (chunk + 2·MAX_BYTES + MAX_ROW_BYTES) plus a
-  small constant.
+  small constant, with `MAX_ROW_BYTES` set to the TOAST-size default.
 
 ## Error handling
 
@@ -206,8 +231,10 @@ Tightened per review feedback to a small, demonstrable core:
   original bytes; do not abort.
 - Token exceeds `MAX_BYTES` → emit original bytes; log to stderr at most
   once per run.
-- Aligned-mode row exceeds `MAX_ROW_BYTES` → fall back to passthrough for
-  that row (no placeholder rewrite, no inline image); log once. See
+- Multi-column or ambiguous output → pass the whole stream through unchanged
+  to the default pager path; log once in debug/verbose mode only.
+- Single-column aligned row exceeds `MAX_ROW_BYTES` → fall back to passthrough
+  for that row (no placeholder rewrite, no inline image); log once. See
   "Streaming and back-pressure" for the cap derivation.
 - Never panic on malformed input.
 
@@ -215,25 +242,31 @@ Tightened per review feedback to a small, demonstrable core:
 
 1. Unit: `term::detect` across env permutations (Kitty / iTerm2 / WezTerm
    / explicit override / fallback).
-2. Unit: `scan` finds PNG tokens in aligned/unaligned/expanded fixtures;
-   ignores non-PNG bytea (`\xdeadbeef`, JPEG/GIF/WebP magic — those are
-   passed through verbatim in v1).
+2. Unit: `scan` finds PNG tokens in single-column aligned/unaligned/expanded
+   fixtures; ignores non-PNG bytea (`\xdeadbeef`, JPEG/GIF/WebP magic —
+   those are passed through verbatim in v1).
 3. Unit: scanner with a single-row, multi-MiB bytea cell respects
    `MAX_BYTES` and stays under a memory budget.
-4. Golden: feed canned psql output + a known PNG; assert exact stdout
-   bytes for Kitty, iTerm2, and `none`.
-5. Integration (gated on `cargo test --features it`): launch real psql
-   with `PSQL_PAGER=target/debug/pg_ffmpeg_pager` **and**
+4. Unit/golden: multi-column aligned, unaligned, and expanded fixtures pass
+   through byte-for-byte to the default pager path; no image escape is emitted.
+5. Golden: feed canned single-column psql output + a known PNG; assert exact
+   stdout bytes for Kitty, iTerm2, and `none`.
+6. Integration (gated on `cargo test --features it`): launch real psql
+   with `PSQL_PAGER=target/debug/pg_bager` **and**
    `\pset pager always`, run `SELECT thumbnail(...)`, assert the pager
    exits 0 and emits an escape sequence.
-6. Workspace regression: `cargo pgrx test` continues to pass after the
+7. Integration: launch a two-column query containing one PNG-shaped bytea and
+   one scalar column; assert the stream is delivered unchanged to the default
+   pager path.
+8. Workspace regression: `cargo pgrx test` continues to pass after the
    workspace conversion.
 
 ## Docs and packaging
 
 - `pager/README.md`: install, both `PSQL_PAGER` *and* `\pset pager always`
   required, env knobs, supported terminals (Kitty, iTerm2 in v1),
-  known limitations (no scrollback by default; `PG_FFMPEG_PAGER_INNER`
+  known limitations (single-column rows only; multi-column output passes
+  through to the default pager path; no scrollback by default; `PG_BAGER_INNER`
   exists but does not reliably preserve images through pagers like
   `less`; PNG only in v1).
 - Add a row to top-level `README.md` linking to the pager.
@@ -243,14 +276,15 @@ Tightened per review feedback to a small, demonstrable core:
 
 1. Workspace + empty pager binary that is a pure passthrough →
    `cargo pgrx test` still green; `psql` runs unchanged with
-   `PSQL_PAGER=pg_ffmpeg_pager` and `\pset pager always`.
+   `PSQL_PAGER=pg_bager` and `\pset pager always`.
 2. Byte-stream PNG scanner + Kitty encoder → verify: a
-   `SELECT thumbnail(video)` in Kitty shows the image; non-Kitty
-   terminals unchanged.
+   single-column `SELECT thumbnail(video)` in Kitty shows the image;
+   non-Kitty terminals unchanged.
 3. iTerm2 encoder → verify: same query in iTerm2.
-4. Aligned-mode layout preservation → verify: borders stay aligned in
-   default psql mode.
-5. `PG_FFMPEG_PAGER_INNER='less -R'` chaining → verify: the rewritten
+4. Single-column layout preservation → verify: borders stay aligned in
+   default psql mode, and multi-column queries pass through unchanged to the
+   default pager path.
+5. `PG_BAGER_INNER='less -R'` chaining → verify: the rewritten
    stream reaches `less`'s stdin and text scrollback works. Inline
    images surviving scroll is **not** a v1 acceptance criterion (see
    "Invocation and chained pager" caveats).
