@@ -56,7 +56,7 @@ jobs:
           Section: database
           Priority: optional
           Architecture: ${ARCH}
-          Depends: postgresql-${PG_VERSION}, libavcodec-dev | libavcodec60 | libavcodec58, libavformat-dev | libavformat60 | libavformat58, libavutil-dev | libavutil58 | libavutil56
+          Depends: postgresql-${PG_VERSION}, libavcodec-dev | libavcodec60 | libavcodec58, libavformat-dev | libavformat60 | libavformat58, libavutil-dev | libavutil58 | libavutil56, libswscale-dev | libswscale7 | libswscale5, libswresample-dev | libswresample4 | libswresample3, libavfilter-dev | libavfilter9 | libavfilter7, libavdevice-dev | libavdevice60 | libavdevice58
           Maintainer: pg_ffmpeg contributors
           Description: FFmpeg media processing functions for PostgreSQL
            pg_ffmpeg provides PostgreSQL functions for media processing
