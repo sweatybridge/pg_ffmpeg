@@ -8,8 +8,13 @@ escapes.
 
 - Input: psql's already-formatted text on stdin (aligned, unaligned, and
   `expanded` formats).
-- Detection: bytea hex literals (`\x89504e47...`, `\xffd8ff...`,
-  `\x47494638...`, `\x52494646....57454250`) for PNG/JPEG/GIF/WebP.
+- Detection: bytea hex literals for PNG/JPEG/GIF/WebP. Magic bytes (after
+  hex-decoding the cell content; `??` marks variable bytes the scanner
+  ignores):
+  - PNG: `89 50 4E 47 0D 0A 1A 0A`
+  - JPEG: `FF D8 FF`
+  - GIF: `47 49 46 38 (37|39) 61` (`GIF87a` / `GIF89a`)
+  - WebP: `52 49 46 46 ?? ?? ?? ?? 57 45 42 50` (`RIFF <4-byte size> WEBP`)
 - Output: pass text through unchanged, but replace recognized bytea cells with
   inline-image escapes for the active terminal protocol.
 - Terminals: Kitty graphics protocol, iTerm2 inline images, Sixel; fallback =
@@ -20,8 +25,10 @@ escapes.
 ## Crate layout
 
 1. Convert repo root to a Cargo workspace.
-   - Add `[workspace] members = [".", "pager"]` to `Cargo.toml` (keeps the
-     existing `cdylib` intact).
+   - Add `[workspace] members = ["pager"]` to the root `Cargo.toml`. The root
+     package is implicitly a workspace member when `[package]` and
+     `[workspace]` share the same manifest, so it does not need to be listed.
+     Existing `cdylib` build stays intact.
    - Verify: `cargo build -p pg_ffmpeg` and `cargo build -p pg_ffmpeg_pager`
      both succeed.
 2. New crate `pager/` with `Cargo.toml` (`name = "pg_ffmpeg_pager"`,
@@ -43,8 +50,11 @@ escapes.
   - Verify: unit tests with env-var fixtures.
 - `scan.rs` — line-oriented scanner that finds bytea hex tokens. Logic:
   - Read input line by line (`BufReader`).
-  - Regex/manual scan for `\\x[0-9A-Fa-f]+` runs of length ≥ 16 (enough for
-    any magic).
+  - Scan for psql's hex bytea token in the input stream: the literal
+    sequence `\x` (single backslash, lowercase `x`) followed by a run of
+    `[0-9A-Fa-f]` of length ≥ 16 (enough hex for any of the magics above).
+    In a Rust regex literal this is written `r"\\x[0-9A-Fa-f]{16,}"`; the
+    double backslash is the regex escape, not part of the input.
   - Decode the first N bytes, sniff magic, classify as
     `Png|Jpeg|Gif|Webp|Other`.
   - For matches, emit: original line up to token start → image escape with
@@ -52,7 +62,7 @@ escapes.
     formats put one cell per line section; aligned format may need
     column-width preservation — see "Layout" below.)
   - Verify: golden tests with captured psql outputs (aligned, unaligned,
-    expanded, `\x` on/off).
+    and expanded display mode on/off).
 - `encode.rs` — protocol encoders, each takes `&[u8]` and writes to
   `&mut dyn Write`:
   - `kitty::write` — chunked `\x1b_Gf=100,a=T,m=1;<base64>\x1b\\` frames per
