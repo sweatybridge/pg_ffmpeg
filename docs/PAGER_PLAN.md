@@ -11,7 +11,7 @@ below.
 
 ## Scope (v1)
 
-Tightened per review feedback to a small, demonstrable core:
+Small, demonstrable core:
 
 - **Format**: PNG `bytea` only. JPEG/GIF/WebP are deferred to v2 because
   Kitty's inline graphics protocol expects PNG (`f=100`) or raw pixel buffers
@@ -100,9 +100,9 @@ Tightened per review feedback to a small, demonstrable core:
     concurrent terminal input — out of scope for the first cut. Sixel users
     must opt in via the env var (and the v2 milestone will add an encoder).
   - Verify: unit tests with env-var fixtures.
-- `scan.rs` — **byte-stream scanner with bounded lookahead**. The previous
-  line-based design was wrong: psql emits a `bytea` value as one very long
-  physical line, so reading whole lines defeats bounded memory. Instead:
+- `scan.rs` — **byte-stream scanner with bounded lookahead**. psql emits a
+  `bytea` value as one very long physical line, so reading whole lines defeats
+  bounded memory. Instead:
   - Read fixed-size chunks (e.g. 64 KiB) from stdin into a rolling buffer.
   - Search for the literal start sequence `\x` (single backslash, lowercase
     `x`) followed by `[0-9A-Fa-f]`. In a Rust regex literal that pattern is
@@ -203,7 +203,7 @@ Tightened per review feedback to a small, demonstrable core:
   - in single-column aligned mode, the current partial physical row capped at
     `MAX_ROW_BYTES`.
 - **`MAX_ROW_BYTES` defaults to PostgreSQL's maximum TOAST-able datum size**,
-  not a small constant derived from the image cap. Hex-encoded `bytea` is
+  not a small independent constant. Hex-encoded `bytea` is
   ~2× the decoded size, plus `\x` prefix, column padding, and borders; the
   row cap exists only to prevent unbounded physical-row buffering. Override
   via `PG_BAGER_MAX_ROW_BYTES` only for test or constrained environments.
