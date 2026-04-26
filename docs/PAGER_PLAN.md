@@ -102,7 +102,7 @@ Tightened per review feedback to a small, demonstrable core:
   - Verify: unit tests with env-var fixtures.
 - `scan.rs` — **byte-stream scanner with bounded lookahead**. The previous
   line-based design was wrong: psql emits a `bytea` value as one very long
-  physical line, so reading whole lines defeats `MAX_BYTES`. Instead:
+  physical line, so reading whole lines defeats bounded memory. Instead:
   - Read fixed-size chunks (e.g. 64 KiB) from stdin into a rolling buffer.
   - Search for the literal start sequence `\x` (single backslash, lowercase
     `x`) followed by `[0-9A-Fa-f]`. In a Rust regex literal that pattern is
@@ -112,10 +112,10 @@ Tightened per review feedback to a small, demonstrable core:
     single-column. If the stream is multi-column or ambiguous, switch to
     passthrough mode and send all buffered plus remaining input unchanged to
     the default pager path.
-  - On a match, accumulate hex bytes into a per-token decoder up to
-    `PG_BAGER_MAX_BYTES` (default 4 MiB). If the run exceeds the
-    cap, abort the rewrite for that token, flush the original bytes
-    verbatim, and resume scanning past the run.
+  - On a match, accumulate hex bytes into a per-token decoder while the
+    physical row remains within `PG_BAGER_MAX_ROW_BYTES`. If the row or token
+    exceeds that cap, abort the rewrite for that row, flush the original bytes
+    verbatim to the default pager path, and resume passthrough.
   - When the run ends (next non-hex byte) and the decoded prefix matches
     the PNG magic `89 50 4E 47 0D 0A 1A 0A`, hand off to the layout layer
     with `(original_token: &str, decoded: Vec<u8>)`.
@@ -182,12 +182,12 @@ Tightened per review feedback to a small, demonstrable core:
     aligned, and `\x` (expanded) outputs, plus multi-column fixtures that
     assert byte-for-byte passthrough.
 - `config.rs` — env-driven knobs:
-  - `PG_BAGER_MAX_BYTES` (default 4 MiB) — decoded image cap.
   - `PG_BAGER_MAX_ROW_BYTES` defaults to PostgreSQL's maximum TOAST-able datum
     size (the implementation should define this as a named constant matching
     PostgreSQL's documented maximum field size, approximately 1 GiB). This is
-    the physical row buffer cap for single-column placeholder rewrite; rows
-    beyond it pass through unchanged.
+    the physical row/token buffer cap for single-column placeholder rewrite;
+    rows beyond it pass through unchanged. There is no separate decoded image
+    byte cap in v1.
   - `PG_BAGER_MAX_PIXELS_W/H` — passed to Kitty/iTerm2 for sizing.
   - `PG_BAGER_DISABLE=1` — full passthrough.
   - `PG_BAGER_INNER` — chained/default pager command override (see
@@ -198,8 +198,8 @@ Tightened per review feedback to a small, demonstrable core:
 - Chunked byte-stream loop, **not** line-buffered.
 - Bounded buffering. The scanner holds at most:
   - the rolling read chunk (e.g. 64 KiB);
-  - one in-progress hex token capped at `MAX_BYTES` (decoded), which is
-    `2 * MAX_BYTES` of hex text;
+  - one in-progress hex token capped by the current physical row cap;
+  - decoded bytes for that token, bounded by roughly half the hex token size;
   - in single-column aligned mode, the current partial physical row capped at
     `MAX_ROW_BYTES`.
 - **`MAX_ROW_BYTES` defaults to PostgreSQL's maximum TOAST-able datum size**,
@@ -216,8 +216,9 @@ Tightened per review feedback to a small, demonstrable core:
 - Flush stdout after every row terminator so psql's progressive output
   stays interactive.
 - Verify: feed a 100k-row result set with one ~100 MiB bytea cell;
-  assert RSS stays under (chunk + 2·MAX_BYTES + MAX_ROW_BYTES) plus a
-  small constant, with `MAX_ROW_BYTES` set to the TOAST-size default.
+  assert RSS stays under the rolling chunk plus the row/token buffers and
+  decoded image buffer implied by `MAX_ROW_BYTES`, with `MAX_ROW_BYTES` set to
+  the TOAST-size default.
 
 ## Error handling
 
@@ -229,8 +230,8 @@ Tightened per review feedback to a small, demonstrable core:
   and exit with non-zero status. The stream is unrecoverable.
 - Decode errors (odd-length hex, non-hex character mid-run) → emit
   original bytes; do not abort.
-- Token exceeds `MAX_BYTES` → emit original bytes; log to stderr at most
-  once per run.
+- Token or row exceeds `MAX_ROW_BYTES` → emit original bytes through the
+  default pager path; log to stderr at most once per run.
 - Multi-column or ambiguous output → pass the whole stream through unchanged
   to the default pager path; log once in debug/verbose mode only.
 - Single-column aligned row exceeds `MAX_ROW_BYTES` → fall back to passthrough
@@ -246,7 +247,7 @@ Tightened per review feedback to a small, demonstrable core:
    fixtures; ignores non-PNG bytea (`\xdeadbeef`, JPEG/GIF/WebP magic —
    those are passed through verbatim in v1).
 3. Unit: scanner with a single-row, multi-MiB bytea cell respects
-   `MAX_BYTES` and stays under a memory budget.
+   `MAX_ROW_BYTES` and stays under a memory budget.
 4. Unit/golden: multi-column aligned, unaligned, and expanded fixtures pass
    through byte-for-byte to the default pager path; no image escape is emitted.
 5. Golden: feed canned single-column psql output + a known PNG; assert exact
