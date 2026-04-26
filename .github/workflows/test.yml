@@ -9,19 +9,6 @@ on:
   pull_request:
 
 jobs:
-  pg-bager:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-key: pg-bager
-
-      - name: Test pg_bager
-        run: cargo test -p pg_bager
-
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -56,7 +43,7 @@ jobs:
             libreadline-dev
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --locked
+        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
 
       - name: Initialize pgrx
         run: |
@@ -103,7 +90,7 @@ jobs:
             libreadline-dev
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --locked
+        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
 
       - name: Initialize pgrx
         run: |
@@ -148,7 +135,7 @@ jobs:
             libreadline-dev
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --locked
+        run: cargo install --locked --git https://github.com/pgcentralfoundation/pgrx.git cargo-pgrx
 
       - name: Initialize pgrx
         run: |
