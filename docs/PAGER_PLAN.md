@@ -58,10 +58,10 @@ Tightened per review feedback to a small, demonstrable core:
     image output, the default behavior writes directly to the terminal, which
     gives correct image rendering but no scrollback / search.
   - Passthrough cases (multi-column output, disabled mode, unsupported
-    formats, oversized rows) use the default pager path: `PG_BAGER_INNER` if
+    formats, oversized rows) use the default pager path: `PG_BAGER_FALLBACK` if
     set, otherwise `$PAGER`, falling back to `less -R`, then `cat` if no pager
     executable is available.
-  - Optional: set `PG_BAGER_INNER` to a pager command to chain output for all
+  - Optional: set `PG_BAGER_FALLBACK` to a pager command to chain output for all
     cases. **Caveats**:
     - Most pagers strip or display-as-text terminal control sequences by
       default. `less` requires `-R` ("output raw control characters") to
@@ -70,23 +70,23 @@ Tightened per review feedback to a small, demonstrable core:
       sequences pass through correctly, and `less` repaints the screen
       on scroll which destroys already-rendered images.
     - A known-good v1 invocation for plain text only:
-      `PG_BAGER_INNER='less -R'`. Inline images may render on
+      `PG_BAGER_FALLBACK='less -R'`. Inline images may render on
       first paint and disappear on scroll; this is a `less` limitation,
       not a bug in this binary.
-    - `PG_BAGER_INNER='cat'` is the no-op chain (rarely useful).
+    - `PG_BAGER_FALLBACK='cat'` is the no-op chain (rarely useful).
     - For reliable inline images in single-column output, leave
-      `PG_BAGER_INNER` unset.
+      `PG_BAGER_FALLBACK` unset.
   - Multi-column output always uses the default pager path and receives the
     original, unmodified stream.
 - Verify: integration test runs psql with both `PSQL_PAGER` and
   `\pset pager always` and confirms the binary is invoked. A second
-  test exercises `PG_BAGER_INNER='less -R'` and asserts that the
-  inner process receives the rewritten stream — it does **not** assert
+  test exercises `PG_BAGER_FALLBACK='less -R'` and asserts that the
+  fallback process receives the rewritten stream — it does **not** assert
   that images survive scrolling in `less`, since they don't.
 
 ## Module breakdown (`pager/src/`)
 
-- `main.rs` — argv/env wiring, opens stdin/stdout (or stdin → inner pager
+- `main.rs` — argv/env wiring, opens stdin/stdout (or stdin → fallback pager
   stdin), dispatches to `stream::run`.
 - `term.rs` — detect protocol, env-driven only in v1:
   - `PG_BAGER_PROTOCOL=kitty|iterm2|none` — explicit override.
@@ -190,7 +190,7 @@ Tightened per review feedback to a small, demonstrable core:
     byte cap in v1.
   - `PG_BAGER_MAX_PIXELS_W/H` — passed to Kitty/iTerm2 for sizing.
   - `PG_BAGER_DISABLE=1` — full passthrough.
-  - `PG_BAGER_INNER` — chained/default pager command override (see
+  - `PG_BAGER_FALLBACK` — chained/default pager command override (see
     "Invocation and chained pager" for caveats).
 
 ## Streaming and back-pressure
@@ -267,7 +267,7 @@ Tightened per review feedback to a small, demonstrable core:
 - `pager/README.md`: install, both `PSQL_PAGER` *and* `\pset pager always`
   required, env knobs, supported terminals (Kitty, iTerm2 in v1),
   known limitations (single-column rows only; multi-column output passes
-  through to the default pager path; no scrollback by default; `PG_BAGER_INNER`
+  through to the default pager path; no scrollback by default; `PG_BAGER_FALLBACK`
   exists but does not reliably preserve images through pagers like
   `less`; PNG only in v1).
 - Add a row to top-level `README.md` linking to the pager.
@@ -285,7 +285,7 @@ Tightened per review feedback to a small, demonstrable core:
 4. Single-column layout preservation → verify: borders stay aligned in
    default psql mode, and multi-column queries pass through unchanged to the
    default pager path.
-5. `PG_BAGER_INNER='less -R'` chaining → verify: the rewritten
+5. `PG_BAGER_FALLBACK='less -R'` chaining → verify: the rewritten
    stream reaches `less`'s stdin and text scrollback works. Inline
    images surviving scroll is **not** a v1 acceptance criterion (see
    "Invocation and chained pager" caveats).
