@@ -1,0 +1,47 @@
+name: Publish Docker Image
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: pg_ffmpeg version to publish (without leading v)
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: pg_ffmpeg version to publish (without leading v)
+        required: true
+        type: string
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE: sweatybridge/pg_ffmpeg
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            PG_FFMPEG_VERSION=${{ inputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.version }}
+            ${{ env.IMAGE }}:latest
