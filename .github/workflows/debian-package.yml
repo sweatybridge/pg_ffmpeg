@@ -103,6 +103,8 @@ jobs:
 
   docker:
     needs: release
+    permissions:
+      contents: read
     uses: ./.github/workflows/docker-publish.yml
     with:
       version: ${{ needs.release.outputs.version }}
