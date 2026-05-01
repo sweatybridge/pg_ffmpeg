@@ -80,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v6
 
@@ -98,3 +100,12 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.value }}
           files: debs/*.deb
+
+  docker:
+    needs: release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
+    secrets: inherit
