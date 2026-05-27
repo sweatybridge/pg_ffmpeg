@@ -100,7 +100,7 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.value }}
           overwrite_files: false
-          files: *.deb
+          files: ./*.deb
 
   docker:
     needs: release
