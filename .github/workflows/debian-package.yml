@@ -73,7 +73,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: pg-ffmpeg-pg${{ matrix.pg_version }}-${{ matrix.debian }}
+          name: pg-ffmpeg-pg${{ matrix.pg_version }}-${{ matrix.debian }}-${{ matrix.runner }}
           path: "*.deb"
 
   release:
@@ -93,14 +93,14 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          path: debs
           merge-multiple: true
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.value }}
-          files: debs/*.deb
+          overwrite_files: false
+          files: *.deb
 
   docker:
     needs: release
