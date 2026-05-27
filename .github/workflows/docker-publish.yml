@@ -24,6 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
     env:
       IMAGE: sweatybridge/pg_ffmpeg
     steps:
@@ -39,9 +45,39 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/${{ matrix.arch }}
           push: true
           build-args: |
             PG_FFMPEG_VERSION=${{ inputs.version }}
           tags: |
-            ${{ env.IMAGE }}:${{ inputs.version }}
-            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ inputs.version }}-${{ matrix.arch }}
+            ${{ env.IMAGE }}:latest-${{ matrix.arch }}
+
+  manifest:
+    runs-on: ubuntu-latest
+    needs: docker
+    permissions:
+      contents: read
+    env:
+      IMAGE: sweatybridge/pg_ffmpeg
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:latest-amd64" \
+            "${IMAGE}:latest-arm64"
+        env:
+          VERSION: ${{ inputs.version }}

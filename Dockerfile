@@ -1,7 +1,7 @@
 FROM postgres:18-trixie
 
 ARG PG_FFMPEG_VERSION
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 
 ADD https://github.com/sweatybridge/pg_ffmpeg/releases/download/v${PG_FFMPEG_VERSION}/pg-ffmpeg-pg18_${PG_FFMPEG_VERSION}-1.trixie_${TARGETARCH}.deb /tmp/pg_ffmpeg.deb
 
