@@ -182,7 +182,6 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
 
     // Copy all streams (remux without re-encoding)
     let mut stream_mapping = vec![];
-    let mut output_index = 0usize;
     let mut video_out_idx: Option<usize> = None;
     for input_stream in ictx.streams() {
         let medium = input_stream.parameters().medium();
@@ -190,15 +189,11 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             || medium == ffmpeg_next::media::Type::Audio
             || medium == ffmpeg_next::media::Type::Subtitle
         {
+            let output_index = crate::pipeline::copy_stream(&input_stream, &mut octx);
             if medium == ffmpeg_next::media::Type::Video && video_out_idx.is_none() {
                 video_out_idx = Some(output_index);
             }
-            let mut new_stream = octx
-                .add_stream(ffmpeg_next::codec::Id::None)
-                .unwrap_or_else(|e| error!("failed to add output stream: {e}"));
-            new_stream.set_parameters(input_stream.parameters());
             stream_mapping.push(Some(output_index));
-            output_index += 1;
         } else {
             stream_mapping.push(None);
         }
