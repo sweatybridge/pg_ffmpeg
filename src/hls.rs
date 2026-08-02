@@ -122,15 +122,20 @@ unsafe extern "C" fn hls_io_close2(s: *mut AVFormatContext, pb: *mut AVIOContext
 }
 // --- Still-image detection / raw-byte fetch ---
 
-/// Detect an input whose video stream is a single still frame with no
-/// frame rate. The HLS/mpegts muxer can't wrap such a stream into a
-/// thumbnail-decodable segment, so `hls()` bypasses muxing for these and
-/// stores the original image bytes as a single segment row instead.
+/// Detect an input whose video stream is a single still frame. The
+/// HLS/mpegts muxer can't wrap such a stream into a thumbnail-decodable
+/// segment, so `hls()` bypasses muxing for these and stores the
+/// original image bytes as a single segment row instead.
+///
+/// The image2 / png_pipe / jpeg_pipe demuxers all advertise a non-zero
+/// frame rate by default, so we can't rely on `avg_frame_rate`. Instead
+/// we detect the signature of a still image: a single video frame
+/// (frames <= 1) with no container duration (ictx.duration() == 0).
 fn is_still_image_input(ictx: &ffmpeg_next::format::context::Input) -> bool {
     let Some(video) = ictx.streams().best(ffmpeg_next::media::Type::Video) else {
         return false;
     };
-    video.frames() <= 1 && video.avg_frame_rate().numerator() == 0
+    video.frames() <= 1 && ictx.duration() == 0
 }
 
 /// Slurp the raw bytes backing `url` via FFmpeg's AVIO layer so the same
