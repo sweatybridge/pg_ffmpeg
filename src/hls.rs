@@ -133,7 +133,8 @@ unsafe extern "C" fn hls_io_close2(s: *mut AVFormatContext, pb: *mut AVIOContext
 /// check the input format name: single-image demuxers are named
 /// `image2`, `image2pipe`, or `<codec>_pipe` (e.g. `png_pipe`).
 fn is_still_image_input(ictx: &ffmpeg_next::format::context::Input) -> bool {
-    let name = ictx.format().name();
+    let fmt = ictx.format();
+    let name = fmt.name();
     name.starts_with("image2") || name.ends_with("_pipe")
 }
 
