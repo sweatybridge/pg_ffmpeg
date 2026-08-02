@@ -595,7 +595,11 @@ mod tests {
         // The whole point: thumbnail must be able to decode the segment.
         let thumb = crate::thumbnail::thumbnail(seg_data, 0.0, "png".to_string());
         assert!(!thumb.is_empty(), "thumbnail should produce output");
-        assert_eq!(&thumb[..8], b"\x89PNG\r\n\x1a\n", "thumbnail output should be PNG");
+        assert_eq!(
+            &thumb[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "thumbnail output should be PNG"
+        );
 
         let _ = std::fs::remove_file(&image_path);
     }
