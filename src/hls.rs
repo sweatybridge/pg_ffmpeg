@@ -128,14 +128,13 @@ unsafe extern "C" fn hls_io_close2(s: *mut AVFormatContext, pb: *mut AVIOContext
 /// original image bytes as a single segment row instead.
 ///
 /// The image2 / png_pipe / jpeg_pipe demuxers all advertise a non-zero
-/// frame rate by default, so we can't rely on `avg_frame_rate`. Instead
-/// we detect the signature of a still image: a single video frame
-/// (frames <= 1) with no container duration (ictx.duration() == 0).
+/// frame rate and a non-zero duration by default, so stream metadata
+/// can't reliably distinguish a still from real video. Instead, we
+/// check the input format name: single-image demuxers are named
+/// `image2`, `image2pipe`, or `<codec>_pipe` (e.g. `png_pipe`).
 fn is_still_image_input(ictx: &ffmpeg_next::format::context::Input) -> bool {
-    let Some(video) = ictx.streams().best(ffmpeg_next::media::Type::Video) else {
-        return false;
-    };
-    video.frames() <= 1 && ictx.duration() == 0
+    let name = ictx.format().name();
+    name.starts_with("image2") || name.ends_with("_pipe")
 }
 
 /// Slurp the raw bytes backing `url` via FFmpeg's AVIO layer so the same
