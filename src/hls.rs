@@ -593,7 +593,19 @@ mod tests {
         );
 
         // The whole point: thumbnail must be able to decode the segment.
-        let thumb = crate::thumbnail::thumbnail(seg_data, 0.0, "png".to_string());
+        let thumb = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT ffmpeg.thumbnail($1, 0.0, 'png')",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(seg_data)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<u8>>()
+                .unwrap()
+                .unwrap()
+        });
         assert!(!thumb.is_empty(), "thumbnail should produce output");
         assert_eq!(
             &thumb[..8],
