@@ -3,8 +3,9 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
 use ffmpeg_next::sys::{
-    av_free, av_malloc, avformat_alloc_output_context2, avio_alloc_context, avio_context_free,
-    AVDictionary, AVFormatContext, AVIOContext,
+    av_free, av_malloc, avformat_alloc_output_context2, avio_alloc_context, avio_closep,
+    avio_context_free, avio_open, avio_read_partial, AVDictionary, AVFormatContext, AVIOContext,
+    AVIO_FLAG_READ,
 };
 
 /// Custom write callback: appends into a Vec<u8>.
@@ -119,6 +120,56 @@ unsafe extern "C" fn hls_io_close2(s: *mut AVFormatContext, pb: *mut AVIOContext
     avio_context_free(&mut pb_mut);
     0
 }
+// --- Still-image detection / raw-byte fetch ---
+
+/// Detect an input whose video stream is a single still frame. The
+/// HLS/mpegts muxer can't wrap such a stream into a thumbnail-decodable
+/// segment, so `hls()` bypasses muxing for these and stores the
+/// original image bytes as a single segment row instead.
+///
+/// The image2 / png_pipe / jpeg_pipe demuxers all advertise a non-zero
+/// frame rate and a non-zero duration by default, so stream metadata
+/// can't reliably distinguish a still from real video. Instead, we
+/// check the input format name: single-image demuxers are named
+/// `image2`, `image2pipe`, or `<codec>_pipe` (e.g. `png_pipe`).
+fn is_still_image_input(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    let fmt = ictx.format();
+    let name = fmt.name();
+    name.starts_with("image2") || name.ends_with("_pipe")
+}
+
+/// Slurp the raw bytes backing `url` via FFmpeg's AVIO layer so the same
+/// URL protocol coverage as `format::input(&url)` (file, http, https,
+/// ...) is reused. Bounded by `pg_ffmpeg.max_input_bytes` since the
+/// fetched bytes are later handed to `thumbnail` -> `MemInput` which
+/// enforces the same cap.
+fn fetch_url_bytes(url: &str) -> Vec<u8> {
+    unsafe {
+        let url_c = std::ffi::CString::new(url).unwrap();
+        let mut pb: *mut AVIOContext = ptr::null_mut();
+        let ret = avio_open(&mut pb, url_c.as_ptr(), AVIO_FLAG_READ as c_int);
+        if ret < 0 || pb.is_null() {
+            error!("failed to open url for still-image fetch: {ret}");
+        }
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = avio_read_partial(pb, buf.as_mut_ptr(), buf.len() as c_int);
+            if n == ffmpeg_next::sys::AVERROR_EOF || n < 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+            if let Err(e) = crate::limits::check_input_size(out.len()) {
+                let _ = avio_closep(&mut pb);
+                error!("{e}");
+            }
+        }
+        let _ = avio_closep(&mut pb);
+        out
+    }
+}
+
 // --- Main function ---
 
 #[pg_extern]
@@ -144,6 +195,28 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
     // Open input directly from URL — FFmpeg handles protocol decoding
     let mut ictx = ffmpeg_next::format::input(&url)
         .unwrap_or_else(|e| error!("failed to open input url: {e}"));
+
+    // Still-image inputs (single frame, no frame rate) cannot be wrapped
+    // into a thumbnail-decodable mpegts segment by the HLS muxer. Bypass
+    // muxing and store the original image bytes as one segment so
+    // `ffmpeg.thumbnail` can decode them directly.
+    if is_still_image_input(&ictx) {
+        let data = fetch_url_bytes(url);
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                     VALUES ($1, 0, NULL, $2)",
+                    None,
+                    &[
+                        pgrx::datum::DatumWithOid::from(playlist_id),
+                        pgrx::datum::DatumWithOid::from(data),
+                    ],
+                )
+                .unwrap_or_else(|e| error!("failed to insert still-image segment: {e}"));
+        });
+        return playlist_id;
+    }
 
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
@@ -474,6 +547,78 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&video_path);
+    }
+
+    #[pg_test]
+    fn test_hls_still_image_returns_single_decodable_segment() {
+        // A single PNG is the path that previously produced an
+        // undecodable mpegts blob. `hls()` should now bypass muxing and
+        // store the original image bytes as one segment.
+        let img = crate::test_utils::generate_test_image_bytes("png", 32, 32);
+        let tmp = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        let image_path = tmp.path().to_path_buf();
+        drop(tmp);
+        std::fs::write(&image_path, &img).unwrap();
+
+        let url = format!("file://{}", image_path.display());
+        let playlist_id = crate::hls::hls(&url, 6);
+        assert!(playlist_id > 0);
+
+        let count = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<i32>()
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(count, 1, "still-image input should produce one segment");
+
+        let seg_data = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT data FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<u8>>()
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(
+            seg_data, img,
+            "still-image segment should store the raw original bytes"
+        );
+
+        // The whole point: thumbnail must be able to decode the segment.
+        let thumb = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT ffmpeg.thumbnail($1, 0.0, 'png')",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(seg_data)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<u8>>()
+                .unwrap()
+                .unwrap()
+        });
+        assert!(!thumb.is_empty(), "thumbnail should produce output");
+        assert_eq!(
+            &thumb[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "thumbnail output should be PNG"
+        );
+
+        let _ = std::fs::remove_file(&image_path);
     }
 }
 
