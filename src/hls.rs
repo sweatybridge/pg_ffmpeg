@@ -665,7 +665,7 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
     ictx.reset_stall_deadline();
     let deadline = ictx.deadline_ptr();
     let mut next_stop_poll = Instant::now();
-    let (_, stopped) = remux_hls(
+    let (_, stopped_in_packet_loop) = remux_hls(
         &mut ictx,
         playlist_id,
         segment_duration,
@@ -686,6 +686,7 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
             live_stop_requested(&url)
         },
     );
+    let stopped = stopped_in_packet_loop || live_stop_requested(&url);
 
     release_live_playlist(playlist_id);
     spi.commit_and_chain();
