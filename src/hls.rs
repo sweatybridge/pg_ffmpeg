@@ -1111,11 +1111,10 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
-            for chunk in video.chunks(7 * 188) {
-                if sender_stop.load(Ordering::Relaxed) || stream.write_all(chunk).is_err() {
-                    break;
+            if stream.write_all(&video).is_ok() {
+                while !sender_stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(50));
                 }
-                thread::sleep(Duration::from_millis(10));
             }
         });
 
