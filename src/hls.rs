@@ -663,6 +663,8 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
     spi.commit_and_chain();
 
     let mut ictx = LiveInput::open(&url, stall_timeout);
+    #[cfg(any(test, feature = "pg_test"))]
+    warning!("hls_live diagnostic: input ready");
     if is_still_image_input(&ictx) {
         error!("hls_live does not support still-image inputs; use ffmpeg.hls instead");
     }
@@ -670,6 +672,8 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
     ictx.reset_stall_deadline();
     let deadline = ictx.deadline_ptr();
     let mut next_stop_poll = Instant::now();
+    #[cfg(any(test, feature = "pg_test"))]
+    let mut saw_packet = false;
     let (_, stopped_in_packet_loop) = remux_hls(
         &mut ictx,
         playlist_id,
@@ -677,10 +681,17 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
         first_segment_index,
         true,
         |segment| {
+            #[cfg(any(test, feature = "pg_test"))]
+            warning!("hls_live diagnostic: completed segment");
             store_live_segment(playlist_id, segment);
             spi.commit_and_chain();
         },
         || {
+            #[cfg(any(test, feature = "pg_test"))]
+            if !saw_packet {
+                warning!("hls_live diagnostic: first packet");
+                saw_packet = true;
+            }
             unsafe {
                 (*deadline).deadline = Instant::now() + Duration::from_secs_f64(stall_timeout);
             }
