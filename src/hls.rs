@@ -1,12 +1,107 @@
 use pgrx::prelude::*;
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ops::{Deref, DerefMut};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use ffmpeg_next::sys::{
-    av_free, av_malloc, avformat_alloc_output_context2, avio_alloc_context, avio_closep,
-    avio_context_free, avio_open, avio_read_partial, AVDictionary, AVFormatContext, AVIOContext,
-    AVIO_FLAG_READ,
+    av_dict_free, av_dict_set, av_free, av_malloc, avformat_alloc_context,
+    avformat_alloc_output_context2, avformat_close_input, avformat_find_stream_info,
+    avformat_open_input, avio_alloc_context, avio_closep, avio_context_free, avio_open,
+    avio_read_partial, AVDictionary, AVFormatContext, AVIOContext, AVIOInterruptCB, AVIO_FLAG_READ,
 };
+
+const LIVE_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls,udp,rtp,rtsp";
+
+struct LiveDeadline {
+    deadline: Instant,
+}
+
+unsafe extern "C" fn interrupt_live_input(opaque: *mut c_void) -> c_int {
+    if opaque.is_null() {
+        return 0;
+    }
+    let deadline = &*(opaque as *const LiveDeadline);
+    if Instant::now() >= deadline.deadline {
+        1
+    } else {
+        0
+    }
+}
+
+/// FFmpeg input context whose blocking reads are interrupted at a wall-clock deadline.
+struct LiveInput {
+    ctx: Option<ffmpeg_next::format::context::Input>,
+    _deadline: Box<LiveDeadline>,
+}
+
+impl LiveInput {
+    fn open(url: &str, capture_duration: f64) -> Self {
+        unsafe {
+            let mut deadline = Box::new(LiveDeadline {
+                deadline: Instant::now() + Duration::from_secs_f64(capture_duration),
+            });
+            let mut ps = avformat_alloc_context();
+            if ps.is_null() {
+                error!("failed to allocate live input context");
+            }
+            (*ps).interrupt_callback = AVIOInterruptCB {
+                callback: Some(interrupt_live_input),
+                opaque: &mut *deadline as *mut LiveDeadline as *mut c_void,
+            };
+
+            let key = CString::new("protocol_whitelist").unwrap();
+            let value = CString::new(LIVE_PROTOCOL_WHITELIST).unwrap();
+            let mut options: *mut AVDictionary = ptr::null_mut();
+            if av_dict_set(&mut options, key.as_ptr(), value.as_ptr(), 0) < 0 {
+                avformat_close_input(&mut ps);
+                error!("failed to configure live input protocols");
+            }
+
+            let url = CString::new(url)
+                .unwrap_or_else(|_| error!("live input url contains a NUL byte"));
+            let open_result =
+                avformat_open_input(&mut ps, url.as_ptr(), ptr::null_mut(), &mut options);
+            av_dict_free(&mut options);
+            if open_result < 0 {
+                avformat_close_input(&mut ps);
+                error!("failed to open live input url: {open_result}");
+            }
+
+            let stream_result = avformat_find_stream_info(ps, ptr::null_mut());
+            if stream_result < 0 {
+                avformat_close_input(&mut ps);
+                error!("failed to read live input stream info: {stream_result}");
+            }
+
+            Self {
+                ctx: Some(ffmpeg_next::format::context::Input::wrap(ps)),
+                _deadline: deadline,
+            }
+        }
+    }
+}
+
+impl Deref for LiveInput {
+    type Target = ffmpeg_next::format::context::Input;
+
+    fn deref(&self) -> &Self::Target {
+        self.ctx.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for LiveInput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ctx.as_mut().unwrap()
+    }
+}
+
+impl Drop for LiveInput {
+    fn drop(&mut self) {
+        // Drop the FFmpeg context while its interrupt callback still points at `deadline`.
+        drop(self.ctx.take());
+    }
+}
 
 /// Custom write callback: appends into a Vec<u8>.
 unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int) -> c_int {
@@ -172,13 +267,8 @@ fn fetch_url_bytes(url: &str) -> Vec<u8> {
 
 // --- Main function ---
 
-#[pg_extern]
-fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
-    ffmpeg_next::init().unwrap();
-    ffmpeg_next::format::network::init();
-
-    // Pre-allocate playlist row to get playlist_id
-    let playlist_id = Spi::connect_mut(|client| {
+fn create_playlist(segment_duration: i32) -> i64 {
+    Spi::connect_mut(|client| {
         client
             .update(
                 "INSERT INTO ffmpeg.hls_playlists (target_duration) VALUES ($1) RETURNING id",
@@ -190,34 +280,31 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
             .get_one::<i64>()
             .unwrap_or_else(|e| error!("failed to get playlist id: {e}"))
             .unwrap_or_else(|| error!("playlist id was null"))
+    })
+}
+
+fn store_still_image(url: &str, playlist_id: i64) {
+    let data = fetch_url_bytes(url);
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                 VALUES ($1, 0, NULL, $2)",
+                None,
+                &[
+                    pgrx::datum::DatumWithOid::from(playlist_id),
+                    pgrx::datum::DatumWithOid::from(data),
+                ],
+            )
+            .unwrap_or_else(|e| error!("failed to insert still-image segment: {e}"));
     });
+}
 
-    // Open input directly from URL — FFmpeg handles protocol decoding
-    let mut ictx = ffmpeg_next::format::input(&url)
-        .unwrap_or_else(|e| error!("failed to open input url: {e}"));
-
-    // Still-image inputs (single frame, no frame rate) cannot be wrapped
-    // into a thumbnail-decodable mpegts segment by the HLS muxer. Bypass
-    // muxing and store the original image bytes as one segment so
-    // `ffmpeg.thumbnail` can decode them directly.
-    if is_still_image_input(&ictx) {
-        let data = fetch_url_bytes(url);
-        Spi::connect_mut(|client| {
-            client
-                .update(
-                    "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
-                     VALUES ($1, 0, NULL, $2)",
-                    None,
-                    &[
-                        pgrx::datum::DatumWithOid::from(playlist_id),
-                        pgrx::datum::DatumWithOid::from(data),
-                    ],
-                )
-                .unwrap_or_else(|e| error!("failed to insert still-image segment: {e}"));
-        });
-        return playlist_id;
-    }
-
+fn remux_hls(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    playlist_id: i64,
+    segment_duration: i32,
+) -> i64 {
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
         segment_index: 0,
@@ -320,6 +407,53 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
     playlist_id
+}
+
+#[pg_extern]
+fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
+    ffmpeg_next::init().unwrap();
+    ffmpeg_next::format::network::init();
+
+    let playlist_id = create_playlist(segment_duration);
+    let mut ictx = ffmpeg_next::format::input(&url)
+        .unwrap_or_else(|e| error!("failed to open input url: {e}"));
+
+    // Still-image inputs (single frame, no frame rate) cannot be wrapped
+    // into a thumbnail-decodable mpegts segment by the HLS muxer. Bypass
+    // muxing and store the original image bytes as one segment so
+    // `ffmpeg.thumbnail` can decode them directly.
+    if is_still_image_input(&ictx) {
+        store_still_image(url, playlist_id);
+        return playlist_id;
+    }
+
+    remux_hls(&mut ictx, playlist_id, segment_duration)
+}
+
+/// Capture a live FFmpeg input for a bounded wall-clock duration and store it as HLS.
+///
+/// The deadline covers opening, stream probing, and packet reads so an unavailable or
+/// endless source cannot hold a PostgreSQL backend indefinitely. A local SDP file can
+/// describe dynamic RTP payloads such as H.264 payload type 96.
+#[pg_extern]
+fn hls_live(
+    url: &str,
+    capture_duration: default!(f64, 10.0),
+    segment_duration: default!(i32, 6),
+) -> i64 {
+    if !capture_duration.is_finite() || capture_duration <= 0.0 {
+        error!("capture_duration must be finite and greater than 0");
+    }
+    if segment_duration <= 0 {
+        error!("segment_duration must be greater than 0");
+    }
+
+    ffmpeg_next::init().unwrap();
+    ffmpeg_next::format::network::init();
+
+    let playlist_id = create_playlist(segment_duration);
+    let mut ictx = LiveInput::open(url, capture_duration);
+    remux_hls(&mut ictx, playlist_id, segment_duration)
 }
 
 #[cfg(any(test, feature = "pg_test", feature = "pg_bench"))]
@@ -619,6 +753,65 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&image_path);
+    }
+
+    #[pg_test]
+    fn test_hls_live_stops_udp_input_at_deadline() {
+        use std::net::UdpSocket;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp);
+        generate_video(&video_path, 64, 64, 10, 3, 400_000);
+        let video = std::fs::read(&video_path).unwrap();
+
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            for datagram in video.chunks(7 * 188) {
+                socket.send_to(datagram, ("127.0.0.1", port)).unwrap();
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let url = format!("udp://127.0.0.1:{port}?overrun_nonfatal=1&fifo_size=1000000");
+        let started = Instant::now();
+        let playlist_id = hls_live(&url, 1.5, 1);
+        let elapsed = started.elapsed();
+        sender.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "live capture exceeded its deadline: {elapsed:?}"
+        );
+        let segment_count = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                )
+                .unwrap()
+                .first()
+                .get_one::<i32>()
+                .unwrap()
+                .unwrap()
+        });
+        assert!(segment_count > 0, "live capture should store HLS segments");
+
+        let _ = std::fs::remove_file(&video_path);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "capture_duration must be finite and greater than 0")]
+    fn test_hls_live_rejects_non_positive_duration() {
+        hls_live("udp://127.0.0.1:5001", 0.0, 1);
     }
 }
 

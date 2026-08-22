@@ -15,6 +15,7 @@ All functions are in the `ffmpeg` schema.
 | `trim(data bytea, start_time float8 DEFAULT 0.0, end_time float8 DEFAULT NULL, precise bool DEFAULT false) -> bytea` | Trim media with either keyframe-aligned stream copy or frame-accurate re-encode |
 | `extract_frames(data bytea, interval float8 DEFAULT 1.0, format text DEFAULT 'png', keyframes_only bool DEFAULT false, max_frames int DEFAULT 1000) -> TABLE(timestamp float8, frame bytea)` | Extract bounded frame sets as PNG or JPEG rows |
 | `hls(url text, segment_duration int DEFAULT 6) -> bigint` | Fetch a video via URL, split into HLS segments, and store in `ffmpeg.hls_playlists` / `ffmpeg.hls_segments` |
+| `hls_live(url text, capture_duration float8 DEFAULT 10.0, segment_duration int DEFAULT 6) -> bigint` | Capture a live FFmpeg input for a bounded wall-clock duration and store it as HLS segments |
 | `generate_gif(data bytea, start_time float8 DEFAULT 0.0, duration float8 DEFAULT 5.0, width int DEFAULT NULL, fps int DEFAULT 10, format text DEFAULT 'gif') -> bytea` | Generate animated GIF, APNG, or WebP preview output from video |
 | `waveform(data bytea, width int DEFAULT 800, height int DEFAULT 200, format text DEFAULT 'png', mode text DEFAULT 'waveform') -> bytea` | Render audio waveform or spectrum images |
 | `extract_subtitles(data bytea, format text DEFAULT 'srt', stream_index int DEFAULT NULL) -> text` | Extract supported text subtitles as SRT, ASS, or WebVTT |
@@ -158,6 +159,14 @@ FROM ffmpeg.extract_frames(
 
 -- Split a remote video into HLS segments
 SELECT ffmpeg.hls('https://example.com/video.mp4', segment_duration => 6);
+
+-- Capture ten seconds from a live input. For RTP dynamic payload types,
+-- point this at a local SDP file that describes the codec and port.
+SELECT ffmpeg.hls_live(
+  'file:///etc/pg_ffmpeg/r1-img.sdp',
+  capture_duration => 10.0,
+  segment_duration => 2
+);
 
 -- Render a waveform image
 SELECT ffmpeg.waveform(pg_read_binary_file('/path/to/audio.aac'), width => 1200, height => 300);
