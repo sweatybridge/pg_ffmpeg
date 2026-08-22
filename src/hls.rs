@@ -56,13 +56,8 @@ impl LiveInput {
             let key = CString::new("protocol_whitelist").unwrap();
             let value = CString::new(LIVE_PROTOCOL_WHITELIST).unwrap();
             let timeout_key = CString::new("rw_timeout").unwrap();
-            let timeout_value = CString::new(
-                stall_timeout
-                    .as_micros()
-                    .min(i64::MAX as u128)
-                    .to_string(),
-            )
-            .unwrap();
+            let timeout_value =
+                CString::new(stall_timeout.as_micros().min(i64::MAX as u128).to_string()).unwrap();
             let mut options: *mut AVDictionary = ptr::null_mut();
             if av_dict_set(&mut options, key.as_ptr(), value.as_ptr(), 0) < 0 {
                 av_dict_free(&mut options);
@@ -544,10 +539,12 @@ struct LiveLock(i64);
 
 impl LiveLock {
     fn acquire(url: &str) -> Self {
-        let key = url.as_bytes().iter().fold(
-            0xcbf29ce484222325_u64,
-            |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3),
-        ) as i64;
+        let key = url
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            }) as i64;
         let acquired = unsafe {
             pgrx::direct_function_call::<bool>(
                 pg_sys::pg_try_advisory_lock_int8,
@@ -658,11 +655,7 @@ CREATE PROCEDURE ffmpeg.hls_live(
 LANGUAGE c
 AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
 "#)]
-fn hls_live(
-    url: &str,
-    segment_duration: default!(i32, 6),
-    stall_timeout: default!(f64, 10.0),
-) {
+fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: default!(f64, 10.0)) {
     if segment_duration <= 0 {
         error!("segment_duration must be greater than 0");
     }
