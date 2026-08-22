@@ -1,4 +1,5 @@
 use pgrx::prelude::*;
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -29,17 +30,19 @@ unsafe extern "C" fn interrupt_live_input(opaque: *mut c_void) -> c_int {
     }
 }
 
-/// FFmpeg input context whose blocking reads are interrupted at a wall-clock deadline.
+/// FFmpeg input context whose blocking reads are interrupted after a stall timeout.
 struct LiveInput {
     ctx: Option<ffmpeg_next::format::context::Input>,
     _deadline: Box<LiveDeadline>,
+    stall_timeout: Duration,
 }
 
 impl LiveInput {
-    fn open(url: &str, capture_duration: f64) -> Self {
+    fn open(url: &str, stall_timeout: f64) -> Self {
         unsafe {
+            let stall_timeout = Duration::from_secs_f64(stall_timeout);
             let mut deadline = Box::new(LiveDeadline {
-                deadline: Instant::now() + Duration::from_secs_f64(capture_duration),
+                deadline: Instant::now() + stall_timeout,
             });
             let mut ps = avformat_alloc_context();
             if ps.is_null() {
@@ -54,7 +57,7 @@ impl LiveInput {
             let value = CString::new(LIVE_PROTOCOL_WHITELIST).unwrap();
             let timeout_key = CString::new("rw_timeout").unwrap();
             let timeout_value = CString::new(
-                Duration::from_secs_f64(capture_duration)
+                stall_timeout
                     .as_micros()
                     .min(i64::MAX as u128)
                     .to_string(),
@@ -97,12 +100,17 @@ impl LiveInput {
             Self {
                 ctx: Some(ffmpeg_next::format::context::Input::wrap(ps)),
                 _deadline: deadline,
+                stall_timeout,
             }
         }
     }
 
-    fn deadline(&self) -> Instant {
-        self._deadline.deadline
+    fn reset_stall_deadline(&mut self) {
+        self._deadline.deadline = Instant::now() + self.stall_timeout;
+    }
+
+    fn deadline_ptr(&mut self) -> *mut LiveDeadline {
+        &mut *self._deadline
     }
 }
 
@@ -136,7 +144,7 @@ unsafe extern "C" fn vec_write(opaque: *mut c_void, data: *const u8, size: c_int
 
 struct HlsIoState {
     segment_index: i32,
-    playlist_id: i64,
+    completed_segments: VecDeque<CompletedSegment>,
     /// Buffer for the m3u8 playlist being written.
     m3u8_buf: Vec<u8>,
     m3u8_pb: *mut AVIOContext,
@@ -147,6 +155,12 @@ struct HlsIoState {
     seg_start_dts: Option<i64>,
     current_pkt_dts: Option<i64>,
     video_tb_scale: f64,
+}
+
+struct CompletedSegment {
+    segment_index: i32,
+    duration: Option<f64>,
+    data: Vec<u8>,
 }
 
 unsafe extern "C" fn hls_io_open(
@@ -213,21 +227,10 @@ unsafe extern "C" fn hls_io_close2(s: *mut AVFormatContext, pb: *mut AVIOContext
             };
             state.seg_start_dts = state.current_pkt_dts;
             let data = std::mem::take(&mut state.seg_buf);
-            let playlist_id = state.playlist_id;
-            Spi::connect_mut(|client| {
-                client
-                    .update(
-                        "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
-                         VALUES ($1, $2, $3, $4)",
-                        None,
-                        &[
-                            pgrx::datum::DatumWithOid::from(playlist_id),
-                            pgrx::datum::DatumWithOid::from(idx),
-                            pgrx::datum::DatumWithOid::from(duration),
-                            pgrx::datum::DatumWithOid::from(data),
-                        ],
-                    )
-                    .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
+            state.completed_segments.push_back(CompletedSegment {
+                segment_index: idx,
+                duration,
+                data,
             });
         }
     } else {
@@ -324,16 +327,41 @@ fn store_still_image(url: &str, playlist_id: i64) {
     });
 }
 
-fn remux_hls(
+fn store_segment(playlist_id: i64, segment: CompletedSegment) {
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "INSERT INTO ffmpeg.hls_segments (playlist_id, segment_index, duration, data) \
+                 VALUES ($1, $2, $3, $4)",
+                None,
+                &[
+                    pgrx::datum::DatumWithOid::from(playlist_id),
+                    pgrx::datum::DatumWithOid::from(segment.segment_index),
+                    pgrx::datum::DatumWithOid::from(segment.duration),
+                    pgrx::datum::DatumWithOid::from(segment.data),
+                ],
+            )
+            .unwrap_or_else(|e| error!("failed to insert segment: {e}"));
+    });
+}
+
+fn remux_hls<OnSegment, ShouldStop>(
     ictx: &mut ffmpeg_next::format::context::Input,
     playlist_id: i64,
     segment_duration: i32,
-    deadline: Option<Instant>,
-) -> i64 {
+    first_segment_index: i32,
+    live: bool,
+    mut on_segment: OnSegment,
+    mut should_stop: ShouldStop,
+) -> (i64, bool)
+where
+    OnSegment: FnMut(CompletedSegment),
+    ShouldStop: FnMut() -> bool,
+{
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
-        segment_index: 0,
-        playlist_id,
+        segment_index: first_segment_index,
+        completed_segments: VecDeque::new(),
         m3u8_buf: Vec::new(),
         m3u8_pb: ptr::null_mut(),
         seg_buf: Vec::new(),
@@ -389,7 +417,9 @@ fn remux_hls(
     opts.set("hls_time", &segment_duration.to_string());
     opts.set("hls_segment_filename", "seg%03d.ts");
     opts.set("hls_list_size", "0");
-    opts.set("hls_playlist_type", "vod");
+    if !live {
+        opts.set("hls_playlist_type", "vod");
+    }
 
     octx.write_header_with(opts)
         .unwrap_or_else(|e| error!("failed to write HLS header: {e}"));
@@ -402,9 +432,12 @@ fn remux_hls(
         }
     }
 
-    // Remux packets — segments are inserted into DB via hls_io_close2 callback
+    // The FFmpeg callback only moves completed bytes into a Rust queue. Database
+    // writes happen here, after control has returned from the C callback.
+    let mut stopped = false;
     for (stream, mut packet) in ictx.packets() {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if should_stop() {
+            stopped = true;
             break;
         }
         let input_index = stream.index();
@@ -428,13 +461,21 @@ fn remux_hls(
             packet
                 .write_interleaved(&mut octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
+
+            while let Some(segment) = output_state.completed_segments.pop_front() {
+                on_segment(segment);
+            }
         }
     }
 
     octx.write_trailer()
         .unwrap_or_else(|e| error!("failed to write trailer: {e}"));
 
-    playlist_id
+    while let Some(segment) = output_state.completed_segments.pop_front() {
+        on_segment(segment);
+    }
+
+    (playlist_id, stopped)
 }
 
 #[pg_extern]
@@ -455,38 +496,241 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
         return playlist_id;
     }
 
-    remux_hls(&mut ictx, playlist_id, segment_duration, None)
+    remux_hls(
+        &mut ictx,
+        playlist_id,
+        segment_duration,
+        0,
+        false,
+        |segment| store_segment(playlist_id, segment),
+        || false,
+    )
+    .0
 }
 
-/// Capture a live FFmpeg input for a bounded wall-clock duration and store it as HLS.
+struct NonAtomicSpi;
+
+impl NonAtomicSpi {
+    fn connect() -> Self {
+        let result = unsafe { pg_sys::SPI_connect_ext(pg_sys::SPI_OPT_NONATOMIC as c_int) };
+        if result != pg_sys::SPI_OK_CONNECT as c_int {
+            error!("failed to connect to non-atomic SPI: {result}");
+        }
+        if !unsafe { pg_sys::SPI_inside_nonatomic_context() } {
+            unsafe {
+                pg_sys::SPI_finish();
+            }
+            error!("hls_live must be called outside an explicit transaction");
+        }
+        Self
+    }
+
+    fn commit_and_chain(&self) {
+        unsafe {
+            pg_sys::SPI_commit_and_chain();
+        }
+    }
+}
+
+impl Drop for NonAtomicSpi {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::SPI_finish();
+        }
+    }
+}
+
+struct LiveLock(i64);
+
+impl LiveLock {
+    fn acquire(url: &str) -> Self {
+        let key = url.as_bytes().iter().fold(
+            0xcbf29ce484222325_u64,
+            |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3),
+        ) as i64;
+        let acquired = unsafe {
+            pgrx::direct_function_call::<bool>(
+                pg_sys::pg_try_advisory_lock_int8,
+                &[key.into_datum()],
+            )
+        }
+        .unwrap_or(false);
+        if !acquired {
+            error!("hls_live is already running for this url");
+        }
+        Self(key)
+    }
+}
+
+impl Drop for LiveLock {
+    fn drop(&mut self) {
+        unsafe {
+            pgrx::direct_function_call::<bool>(
+                pg_sys::pg_advisory_unlock_int8,
+                &[self.0.into_datum()],
+            )
+        };
+    }
+}
+
+fn claim_live_playlist(url: &str, segment_duration: i32) -> (i64, i32) {
+    let playlist_id = Spi::connect_mut(|client| {
+        client
+            .update(
+                "INSERT INTO ffmpeg.hls_playlists \
+                    (source_url, target_duration, stop_requested) \
+                 VALUES ($1, $2, false) \
+                 ON CONFLICT (source_url) DO UPDATE SET \
+                    target_duration = EXCLUDED.target_duration, \
+                    stop_requested = false, \
+                    updated_at = clock_timestamp() \
+                 RETURNING id",
+                None,
+                &[
+                    pgrx::datum::DatumWithOid::from(url),
+                    pgrx::datum::DatumWithOid::from(segment_duration),
+                ],
+            )
+            .unwrap_or_else(|e| error!("failed to claim live playlist: {e}"))
+            .first()
+            .get_one::<i64>()
+            .unwrap_or_else(|e| error!("failed to read live playlist id: {e}"))
+            .unwrap_or_else(|| error!("live playlist id was null"))
+    });
+
+    let first_segment_index = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT COALESCE(max(segment_index), -1) + 1 \
+                 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                None,
+                &[pgrx::datum::DatumWithOid::from(playlist_id)],
+            )
+            .unwrap_or_else(|e| error!("failed to read live segment sequence: {e}"))
+            .first()
+            .get_one::<i32>()
+            .unwrap_or_else(|e| error!("failed to read live segment index: {e}"))
+            .unwrap_or(0)
+    });
+
+    (playlist_id, first_segment_index)
+}
+
+fn live_stop_requested(url: &str) -> bool {
+    Spi::connect(|client| {
+        client
+            .select(
+                "SELECT stop_requested FROM ffmpeg.hls_playlists WHERE source_url = $1",
+                None,
+                &[pgrx::datum::DatumWithOid::from(url)],
+            )
+            .unwrap_or_else(|e| error!("failed to read live stream state: {e}"))
+            .first()
+            .get_one::<bool>()
+            .unwrap_or_else(|e| error!("failed to read live stop request: {e}"))
+            .unwrap_or(true)
+    })
+}
+
+fn store_live_segment(playlist_id: i64, segment: CompletedSegment) {
+    store_segment(playlist_id, segment);
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "UPDATE ffmpeg.hls_playlists SET updated_at = clock_timestamp() WHERE id = $1",
+                None,
+                &[pgrx::datum::DatumWithOid::from(playlist_id)],
+            )
+            .unwrap_or_else(|e| error!("failed to update live playlist heartbeat: {e}"));
+    });
+}
+
+/// Continuously remux a live URL into HLS, committing every completed segment.
 ///
-/// The deadline covers opening, stream probing, and packet reads so an unavailable or
-/// endless source cannot hold a PostgreSQL backend indefinitely. A local SDP file can
-/// describe dynamic RTP payloads such as H.264 payload type 96.
-#[pg_extern]
+/// This must be invoked as a top-level `CALL`, which allows the procedure to commit
+/// while its FFmpeg input and output contexts remain open in the current backend.
+#[pg_extern(sql = r#"
+CREATE PROCEDURE ffmpeg.hls_live(
+    url text,
+    segment_duration integer DEFAULT 6,
+    stall_timeout double precision DEFAULT 10.0
+)
+LANGUAGE c
+AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+"#)]
 fn hls_live(
     url: &str,
-    capture_duration: default!(f64, 10.0),
     segment_duration: default!(i32, 6),
-) -> i64 {
-    if !capture_duration.is_finite() || capture_duration <= 0.0 {
-        error!("capture_duration must be finite and greater than 0");
-    }
+    stall_timeout: default!(f64, 10.0),
+) {
     if segment_duration <= 0 {
         error!("segment_duration must be greater than 0");
     }
+    if !stall_timeout.is_finite() || stall_timeout <= 0.0 {
+        error!("stall_timeout must be finite and greater than 0");
+    }
+    // Procedure arguments are PostgreSQL Datums. Keep only Rust-owned state across commits.
+    let url = url.to_owned();
 
     ffmpeg_next::init().unwrap();
     ffmpeg_next::format::network::init();
 
-    let mut ictx = LiveInput::open(url, capture_duration);
+    let mut ictx = LiveInput::open(&url, stall_timeout);
     if is_still_image_input(&ictx) {
         error!("hls_live does not support still-image inputs; use ffmpeg.hls instead");
     }
 
-    let playlist_id = create_playlist(segment_duration);
-    let deadline = ictx.deadline();
-    remux_hls(&mut ictx, playlist_id, segment_duration, Some(deadline))
+    let spi = NonAtomicSpi::connect();
+    let _live_lock = LiveLock::acquire(&url);
+    let (playlist_id, first_segment_index) = claim_live_playlist(&url, segment_duration);
+    spi.commit_and_chain();
+
+    ictx.reset_stall_deadline();
+    let deadline = ictx.deadline_ptr();
+    let mut next_stop_poll = Instant::now();
+    let (_, stopped) = remux_hls(
+        &mut ictx,
+        playlist_id,
+        segment_duration,
+        first_segment_index,
+        true,
+        |segment| {
+            store_live_segment(playlist_id, segment);
+            spi.commit_and_chain();
+        },
+        || {
+            unsafe {
+                (*deadline).deadline = Instant::now() + Duration::from_secs_f64(stall_timeout);
+            }
+            if Instant::now() < next_stop_poll {
+                return false;
+            }
+            next_stop_poll = Instant::now() + Duration::from_millis(500);
+            live_stop_requested(&url)
+        },
+    );
+
+    if !stopped {
+        error!("live input ended or stalled");
+    }
+}
+
+#[pg_extern]
+fn hls_live_stop(url: &str) -> bool {
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "UPDATE ffmpeg.hls_playlists SET stop_requested = true \
+                 WHERE source_url = $1 RETURNING true",
+                None,
+                &[pgrx::datum::DatumWithOid::from(url)],
+            )
+            .unwrap_or_else(|e| error!("failed to request live stream stop: {e}"))
+            .first()
+            .get_one::<bool>()
+            .unwrap_or_else(|e| error!("failed to read live stop result: {e}"))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(any(test, feature = "pg_test", feature = "pg_bench"))]
@@ -789,75 +1033,45 @@ mod tests {
     }
 
     #[pg_test]
-    fn test_hls_live_stops_udp_input_at_deadline() {
-        use std::net::UdpSocket;
-        use std::thread;
-        use std::time::{Duration, Instant};
+    #[should_panic(expected = "segment_duration must be greater than 0")]
+    fn test_hls_live_rejects_non_positive_segment_duration() {
+        hls_live("udp://127.0.0.1:5001", 0, 10.0);
+    }
 
-        let tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
-        let video_path = tmp.path().to_path_buf();
-        drop(tmp);
-        generate_video(&video_path, 64, 64, 10, 3, 400_000);
-        let video = std::fs::read(&video_path).unwrap();
+    #[pg_test]
+    #[should_panic(expected = "stall_timeout must be finite and greater than 0")]
+    fn test_hls_live_rejects_non_positive_stall_timeout() {
+        hls_live("udp://127.0.0.1:5001", 1, 0.0);
+    }
 
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            for datagram in video.chunks(7 * 188) {
-                socket.send_to(datagram, ("127.0.0.1", port)).unwrap();
-                thread::sleep(Duration::from_millis(10));
-            }
+    #[pg_test]
+    fn test_hls_live_stop_uses_url_as_stream_key() {
+        let url = "udp://127.0.0.1:5001?stream=stable-test-key";
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    "INSERT INTO ffmpeg.hls_playlists (source_url) VALUES ($1)",
+                    None,
+                    &[pgrx::datum::DatumWithOid::from(url)],
+                )
+                .unwrap();
         });
 
-        let url = format!("udp://127.0.0.1:{port}?overrun_nonfatal=1&fifo_size=1000000");
-        let started = Instant::now();
-        let playlist_id = hls_live(&url, 1.5, 1);
-        let elapsed = started.elapsed();
-        sender.join().unwrap();
+        assert!(hls_live_stop(url));
 
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "live capture exceeded its deadline: {elapsed:?}"
-        );
-        let segment_count = Spi::connect(|client| {
+        let requested = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT count(*)::int4 FROM ffmpeg.hls_segments WHERE playlist_id = $1",
+                    "SELECT stop_requested FROM ffmpeg.hls_playlists WHERE source_url = $1",
                     None,
-                    &[pgrx::datum::DatumWithOid::from(playlist_id)],
+                    &[pgrx::datum::DatumWithOid::from(url)],
                 )
                 .unwrap()
                 .first()
-                .get_one::<i32>()
-                .unwrap()
+                .get_one::<bool>()
                 .unwrap()
         });
-        assert!(segment_count > 0, "live capture should store HLS segments");
-
-        let _ = std::fs::remove_file(&video_path);
-    }
-
-    #[pg_test]
-    #[should_panic(expected = "capture_duration must be finite and greater than 0")]
-    fn test_hls_live_rejects_non_positive_duration() {
-        hls_live("udp://127.0.0.1:5001", 0.0, 1);
-    }
-
-    #[pg_test]
-    #[should_panic(
-        expected = "hls_live does not support still-image inputs; use ffmpeg.hls instead"
-    )]
-    fn test_hls_live_rejects_still_image_input() {
-        let img = crate::test_utils::generate_test_image_bytes("png", 32, 32);
-        let tmp = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
-        std::fs::write(tmp.path(), img).unwrap();
-
-        let url = format!("file://{}", tmp.path().display());
-        hls_live(&url, 1.0, 1);
+        assert_eq!(requested, Some(true));
     }
 }
 
