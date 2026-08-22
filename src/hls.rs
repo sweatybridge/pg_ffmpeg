@@ -1104,7 +1104,8 @@ mod tests {
         let sender = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            stream.read(&mut request).unwrap();
+            let request_len = stream.read(&mut request).unwrap();
+            assert!(request_len > 0, "live source received an empty request");
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n",
