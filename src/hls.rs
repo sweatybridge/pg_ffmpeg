@@ -417,7 +417,9 @@ where
     opts.set("hls_time", &segment_duration.to_string());
     opts.set("hls_segment_filename", "seg%03d.ts");
     opts.set("hls_list_size", "0");
-    if !live {
+    if live {
+        opts.set("hls_flags", "split_by_time");
+    } else {
         opts.set("hls_playlist_type", "vod");
     }
 
@@ -663,8 +665,6 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
     spi.commit_and_chain();
 
     let mut ictx = LiveInput::open(&url, stall_timeout);
-    #[cfg(any(test, feature = "pg_test"))]
-    warning!("hls_live diagnostic: input ready");
     if is_still_image_input(&ictx) {
         error!("hls_live does not support still-image inputs; use ffmpeg.hls instead");
     }
@@ -672,8 +672,6 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
     ictx.reset_stall_deadline();
     let deadline = ictx.deadline_ptr();
     let mut next_stop_poll = Instant::now();
-    #[cfg(any(test, feature = "pg_test"))]
-    let mut saw_packet = false;
     let (_, stopped_in_packet_loop) = remux_hls(
         &mut ictx,
         playlist_id,
@@ -681,17 +679,10 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
         first_segment_index,
         true,
         |segment| {
-            #[cfg(any(test, feature = "pg_test"))]
-            warning!("hls_live diagnostic: completed segment");
             store_live_segment(playlist_id, segment);
             spi.commit_and_chain();
         },
         || {
-            #[cfg(any(test, feature = "pg_test"))]
-            if !saw_packet {
-                warning!("hls_live diagnostic: first packet");
-                saw_packet = true;
-            }
             unsafe {
                 (*deadline).deadline = Instant::now() + Duration::from_secs_f64(stall_timeout);
             }
@@ -1116,14 +1107,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let stop_sender = Arc::new(AtomicBool::new(false));
-        let source_accepted = Arc::new(AtomicBool::new(false));
-        let source_sent = Arc::new(AtomicBool::new(false));
         let sender_stop = Arc::clone(&stop_sender);
-        let sender_accepted = Arc::clone(&source_accepted);
-        let sender_sent = Arc::clone(&source_sent);
         let sender = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            sender_accepted.store(true, Ordering::Relaxed);
             let mut request = [0_u8; 4096];
             let request_len = stream.read(&mut request).unwrap();
             assert!(request_len > 0, "live source received an empty request");
@@ -1133,7 +1119,6 @@ mod tests {
                 )
                 .unwrap();
             if stream.write_all(&video).is_ok() {
-                sender_sent.store(true, Ordering::Relaxed);
                 while !sender_stop.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(50));
                 }
@@ -1220,17 +1205,6 @@ mod tests {
             }
         }
 
-        let backend_state_sql = format!(
-            "SELECT concat_ws('/', state, COALESCE(wait_event_type, 'CPU'), \
-                    COALESCE(wait_event, 'running')) \
-             FROM pg_stat_activity \
-             WHERE pid = (SELECT owner_pid FROM ffmpeg.hls_playlists \
-                          WHERE source_url = '{quoted_url}')"
-        );
-        let backend_state = psql_command(&backend_state_sql, &database, &user, postgres_port)
-            .output()
-            .unwrap();
-
         let stop_sql = format!("SELECT ffmpeg.hls_live_stop('{quoted_url}')");
         let stop_output = psql_command(&stop_sql, &database, &user, postgres_port)
             .output()
@@ -1251,11 +1225,7 @@ mod tests {
 
         assert!(
             visible_while_running,
-            "another session did not see a segment before CALL returned \
-             (source accepted: {}, source sent: {}, backend: {}): {}",
-            source_accepted.load(Ordering::Relaxed),
-            source_sent.load(Ordering::Relaxed),
-            String::from_utf8_lossy(&backend_state.stdout).trim(),
+            "another session did not see a segment before CALL returned: {}",
             String::from_utf8_lossy(&call_output.stderr)
         );
         assert!(
