@@ -1098,7 +1098,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        let database = Spi::get_one::<String>("SELECT current_database()")
+        let database = Spi::get_one::<String>("SELECT current_database()::text")
             .unwrap()
             .unwrap();
         let user = Spi::get_one::<String>("SELECT current_user::text")
