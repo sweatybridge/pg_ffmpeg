@@ -1105,9 +1105,14 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let stop_sender = Arc::new(AtomicBool::new(false));
+        let source_accepted = Arc::new(AtomicBool::new(false));
+        let source_sent = Arc::new(AtomicBool::new(false));
         let sender_stop = Arc::clone(&stop_sender);
+        let sender_accepted = Arc::clone(&source_accepted);
+        let sender_sent = Arc::clone(&source_sent);
         let sender = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            sender_accepted.store(true, Ordering::Relaxed);
             let mut request = [0_u8; 4096];
             let request_len = stream.read(&mut request).unwrap();
             assert!(request_len > 0, "live source received an empty request");
@@ -1117,6 +1122,7 @@ mod tests {
                 )
                 .unwrap();
             if stream.write_all(&video).is_ok() {
+                sender_sent.store(true, Ordering::Relaxed);
                 while !sender_stop.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(50));
                 }
@@ -1203,6 +1209,17 @@ mod tests {
             }
         }
 
+        let backend_state_sql = format!(
+            "SELECT concat_ws('/', state, COALESCE(wait_event_type, 'CPU'), \
+                    COALESCE(wait_event, 'running')) \
+             FROM pg_stat_activity \
+             WHERE pid = (SELECT owner_pid FROM ffmpeg.hls_playlists \
+                          WHERE source_url = '{quoted_url}')"
+        );
+        let backend_state = psql_command(&backend_state_sql, &database, &user, postgres_port)
+            .output()
+            .unwrap();
+
         let stop_sql = format!("SELECT ffmpeg.hls_live_stop('{quoted_url}')");
         let stop_output = psql_command(&stop_sql, &database, &user, postgres_port)
             .output()
@@ -1223,7 +1240,11 @@ mod tests {
 
         assert!(
             visible_while_running,
-            "another session did not see a segment before CALL returned: {}",
+            "another session did not see a segment before CALL returned \
+             (source accepted: {}, source sent: {}, backend: {}): {}",
+            source_accepted.load(Ordering::Relaxed),
+            source_sent.load(Ordering::Relaxed),
+            String::from_utf8_lossy(&backend_state.stdout).trim(),
             String::from_utf8_lossy(&call_output.stderr)
         );
         assert!(
