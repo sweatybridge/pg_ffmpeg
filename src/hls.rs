@@ -52,10 +52,29 @@ impl LiveInput {
 
             let key = CString::new("protocol_whitelist").unwrap();
             let value = CString::new(LIVE_PROTOCOL_WHITELIST).unwrap();
+            let timeout_key = CString::new("rw_timeout").unwrap();
+            let timeout_value = CString::new(
+                Duration::from_secs_f64(capture_duration)
+                    .as_micros()
+                    .min(i64::MAX as u128)
+                    .to_string(),
+            )
+            .unwrap();
             let mut options: *mut AVDictionary = ptr::null_mut();
             if av_dict_set(&mut options, key.as_ptr(), value.as_ptr(), 0) < 0 {
                 avformat_close_input(&mut ps);
                 error!("failed to configure live input protocols");
+            }
+            if av_dict_set(
+                &mut options,
+                timeout_key.as_ptr(),
+                timeout_value.as_ptr(),
+                0,
+            ) < 0
+            {
+                av_dict_free(&mut options);
+                avformat_close_input(&mut ps);
+                error!("failed to configure live input timeout");
             }
 
             let url =
@@ -79,6 +98,10 @@ impl LiveInput {
                 _deadline: deadline,
             }
         }
+    }
+
+    fn deadline(&self) -> Instant {
+        self._deadline.deadline
     }
 }
 
@@ -304,6 +327,7 @@ fn remux_hls(
     ictx: &mut ffmpeg_next::format::context::Input,
     playlist_id: i64,
     segment_duration: i32,
+    deadline: Option<Instant>,
 ) -> i64 {
     // Allocate HLS output context with streaming I/O callbacks
     let mut output_state = Box::new(HlsIoState {
@@ -379,6 +403,9 @@ fn remux_hls(
 
     // Remux packets — segments are inserted into DB via hls_io_close2 callback
     for (stream, mut packet) in ictx.packets() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         let input_index = stream.index();
         if let Some(Some(out_idx)) = stream_mapping.get(input_index) {
             let in_tb = stream.time_base();
@@ -427,7 +454,7 @@ fn hls(url: &str, segment_duration: default!(i32, 6)) -> i64 {
         return playlist_id;
     }
 
-    remux_hls(&mut ictx, playlist_id, segment_duration)
+    remux_hls(&mut ictx, playlist_id, segment_duration, None)
 }
 
 /// Capture a live FFmpeg input for a bounded wall-clock duration and store it as HLS.
@@ -453,7 +480,8 @@ fn hls_live(
 
     let playlist_id = create_playlist(segment_duration);
     let mut ictx = LiveInput::open(url, capture_duration);
-    remux_hls(&mut ictx, playlist_id, segment_duration)
+    let deadline = ictx.deadline();
+    remux_hls(&mut ictx, playlist_id, segment_duration, Some(deadline))
 }
 
 #[cfg(any(test, feature = "pg_test", feature = "pg_bench"))]
