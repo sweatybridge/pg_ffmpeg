@@ -818,6 +818,32 @@ pub(crate) fn generate_video(
 mod tests {
     use super::*;
 
+    fn psql_command(sql: &str, database: &str, user: &str, port: i32) -> std::process::Command {
+        let psql = std::env::current_exe()
+            .expect("failed to find postgres executable")
+            .with_file_name("psql");
+        let mut command = std::process::Command::new(psql);
+        command.args([
+            "-X",
+            "-A",
+            "-t",
+            "-w",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-U",
+            user,
+            "-d",
+            database,
+            "-c",
+            sql,
+        ]);
+        command
+    }
+
     fn generate_test_video(path: &std::path::Path) {
         generate_video(path, 64, 64, 10, 3, 400_000);
     }
@@ -1065,6 +1091,119 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(requested, Some(true));
+    }
+
+    #[pg_test]
+    fn test_hls_live_commits_segments_before_call_returns() {
+        use std::net::UdpSocket;
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        let video_path = tmp.path().to_path_buf();
+        drop(tmp);
+        generate_video(&video_path, 64, 64, 10, 3, 400_000);
+        let video = std::fs::read(&video_path).unwrap();
+
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let database = Spi::get_one::<String>("SELECT current_database()")
+            .unwrap()
+            .unwrap();
+        let user = Spi::get_one::<String>("SELECT current_user")
+            .unwrap()
+            .unwrap();
+        let postgres_port = unsafe { pg_sys::PostPortNumber };
+        let url = format!("udp://127.0.0.1:{port}?overrun_nonfatal=1&fifo_size=1000000");
+        let quoted_url = url.replace('\'', "''");
+
+        let call_sql = format!("CALL ffmpeg.hls_live('{quoted_url}', 1, 3.0)");
+        let mut call = psql_command(&call_sql, &database, &user, postgres_port)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stop_sender = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop_sender);
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            while !sender_stop.load(Ordering::Relaxed) {
+                for datagram in video.chunks(7 * 188) {
+                    if sender_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    socket.send_to(datagram, ("127.0.0.1", port)).unwrap();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+
+        let count_sql = format!(
+            "SELECT count(*) FROM ffmpeg.hls_segments s \
+             JOIN ffmpeg.hls_playlists p ON p.id = s.playlist_id \
+             WHERE p.source_url = '{quoted_url}'"
+        );
+        let visibility_deadline = Instant::now() + Duration::from_secs(10);
+        let mut visible_while_running = false;
+        while Instant::now() < visibility_deadline {
+            thread::sleep(Duration::from_millis(100));
+            if call.try_wait().unwrap().is_some() {
+                break;
+            }
+            let observed = psql_command(&count_sql, &database, &user, postgres_port)
+                .output()
+                .unwrap();
+            if observed.status.success()
+                && String::from_utf8_lossy(&observed.stdout)
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(0)
+                    > 0
+            {
+                visible_while_running = true;
+                break;
+            }
+        }
+
+        let stop_sql = format!("SELECT ffmpeg.hls_live_stop('{quoted_url}')");
+        let stop_output = psql_command(&stop_sql, &database, &user, postgres_port)
+            .output()
+            .unwrap();
+
+        let exit_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < exit_deadline && call.try_wait().unwrap().is_none() {
+            thread::sleep(Duration::from_millis(100));
+        }
+        if call.try_wait().unwrap().is_none() {
+            call.kill().unwrap();
+        }
+        let call_output = call.wait_with_output().unwrap();
+
+        stop_sender.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+        let _ = std::fs::remove_file(&video_path);
+
+        assert!(
+            visible_while_running,
+            "another session did not see a segment before CALL returned: {}",
+            String::from_utf8_lossy(&call_output.stderr)
+        );
+        assert!(
+            stop_output.status.success(),
+            "failed to request live stop: {}",
+            String::from_utf8_lossy(&stop_output.stderr)
+        );
+        assert!(
+            call_output.status.success(),
+            "live CALL did not stop cleanly: {}",
+            String::from_utf8_lossy(&call_output.stderr)
+        );
     }
 }
 
