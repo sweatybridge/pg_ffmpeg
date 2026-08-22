@@ -1083,7 +1083,8 @@ mod tests {
 
     #[pg_test]
     fn test_hls_live_commits_segments_before_call_returns() {
-        use std::net::UdpSocket;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
         use std::process::Stdio;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1095,9 +1096,27 @@ mod tests {
         generate_video(&video_path, 64, 64, 10, 30, 400_000);
         let video = std::fs::read(&video_path).unwrap();
 
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let stop_sender = Arc::new(AtomicBool::new(false));
+        let sender_stop = Arc::clone(&stop_sender);
+        let sender = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            for chunk in video.chunks(7 * 188) {
+                if sender_stop.load(Ordering::Relaxed) || stream.write_all(chunk).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
 
         let database = Spi::get_one::<String>("SELECT current_database()::text")
             .unwrap()
@@ -1106,7 +1125,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let postgres_port = unsafe { pg_sys::PostPortNumber };
-        let url = format!("udp://127.0.0.1:{port}?overrun_nonfatal=1&fifo_size=1000000");
+        let url = format!("http://127.0.0.1:{port}/live.ts");
         let quoted_url = url.replace('\'', "''");
 
         let call_sql = format!("CALL ffmpeg.hls_live('{quoted_url}', 1, 3.0)");
@@ -1152,21 +1171,6 @@ mod tests {
                 String::from_utf8_lossy(&call_output.stderr)
             );
         }
-        thread::sleep(Duration::from_millis(200));
-
-        let stop_sender = Arc::new(AtomicBool::new(false));
-        let sender_stop = Arc::clone(&stop_sender);
-        let sender = thread::spawn(move || {
-            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            for datagram in video.chunks(7 * 188) {
-                if sender_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                socket.send_to(datagram, ("127.0.0.1", port)).unwrap();
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
-
         let count_sql = format!(
             "SELECT count(*) FROM ffmpeg.hls_segments s \
              JOIN ffmpeg.hls_playlists p ON p.id = s.playlist_id \
