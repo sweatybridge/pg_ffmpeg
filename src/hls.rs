@@ -13,6 +13,8 @@ use ffmpeg_next::sys::{
 };
 
 const LIVE_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls,udp,rtp,rtsp";
+const LIVE_PROBE_BYTES: i64 = 1_000_000;
+const LIVE_ANALYZE_DURATION_US: i64 = 2_000_000;
 
 struct LiveDeadline {
     deadline: Instant,
@@ -48,6 +50,9 @@ impl LiveInput {
             if ps.is_null() {
                 error!("failed to allocate live input context");
             }
+            // Endless inputs cannot rely on EOF to finish stream discovery.
+            (*ps).probesize = LIVE_PROBE_BYTES;
+            (*ps).max_analyze_duration = LIVE_ANALYZE_DURATION_US;
             (*ps).interrupt_callback = AVIOInterruptCB {
                 callback: Some(interrupt_live_input),
                 opaque: &mut *deadline as *mut LiveDeadline as *mut c_void,
