@@ -1116,10 +1116,47 @@ mod tests {
             .spawn()
             .unwrap();
 
+        let readiness_sql = format!(
+            "SELECT count(*) FROM ffmpeg.hls_playlists \
+             WHERE source_url = '{quoted_url}' AND owner_pid IS NOT NULL"
+        );
+        let readiness_deadline = Instant::now() + Duration::from_secs(10);
+        let mut call_ready = false;
+        while Instant::now() < readiness_deadline {
+            if call.try_wait().unwrap().is_some() {
+                break;
+            }
+            let observed = psql_command(&readiness_sql, &database, &user, postgres_port)
+                .output()
+                .unwrap();
+            if observed.status.success()
+                && String::from_utf8_lossy(&observed.stdout)
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(0)
+                    > 0
+            {
+                call_ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if !call_ready {
+            if call.try_wait().unwrap().is_none() {
+                call.kill().unwrap();
+            }
+            let call_output = call.wait_with_output().unwrap();
+            let _ = std::fs::remove_file(&video_path);
+            panic!(
+                "live CALL did not commit its playlist claim: {}",
+                String::from_utf8_lossy(&call_output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+
         let stop_sender = Arc::new(AtomicBool::new(false));
         let sender_stop = Arc::clone(&stop_sender);
         let sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(500));
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
             for datagram in video.chunks(7 * 188) {
                 if sender_stop.load(Ordering::Relaxed) {
