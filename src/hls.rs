@@ -1120,14 +1120,12 @@ mod tests {
         let sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            while !sender_stop.load(Ordering::Relaxed) {
-                for datagram in video.chunks(7 * 188) {
-                    if sender_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    socket.send_to(datagram, ("127.0.0.1", port)).unwrap();
-                    thread::sleep(Duration::from_millis(10));
+            for datagram in video.chunks(7 * 188) {
+                if sender_stop.load(Ordering::Relaxed) {
+                    break;
                 }
+                socket.send_to(datagram, ("127.0.0.1", port)).unwrap();
+                thread::sleep(Duration::from_millis(10));
             }
         });
 
