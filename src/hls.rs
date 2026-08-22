@@ -1092,7 +1092,7 @@ mod tests {
         let tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
         let video_path = tmp.path().to_path_buf();
         drop(tmp);
-        generate_video(&video_path, 64, 64, 10, 3, 400_000);
+        generate_video(&video_path, 64, 64, 10, 30, 400_000);
         let video = std::fs::read(&video_path).unwrap();
 
         let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1119,7 +1119,7 @@ mod tests {
         let stop_sender = Arc::new(AtomicBool::new(false));
         let sender_stop = Arc::clone(&stop_sender);
         let sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(500));
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
             for datagram in video.chunks(7 * 188) {
                 if sender_stop.load(Ordering::Relaxed) {
