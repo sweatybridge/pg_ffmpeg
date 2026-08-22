@@ -58,8 +58,8 @@ impl LiveInput {
                 error!("failed to configure live input protocols");
             }
 
-            let url = CString::new(url)
-                .unwrap_or_else(|_| error!("live input url contains a NUL byte"));
+            let url =
+                CString::new(url).unwrap_or_else(|_| error!("live input url contains a NUL byte"));
             let open_result =
                 avformat_open_input(&mut ps, url.as_ptr(), ptr::null_mut(), &mut options);
             av_dict_free(&mut options);
