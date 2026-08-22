@@ -437,7 +437,22 @@ where
     // The FFmpeg callback only moves completed bytes into a Rust queue. Database
     // writes happen here, after control has returned from the C callback.
     let mut stopped = false;
+    #[cfg(any(test, feature = "pg_test"))]
+    let mut packet_count = 0_u64;
     for (stream, mut packet) in ictx.packets() {
+        #[cfg(any(test, feature = "pg_test"))]
+        {
+            packet_count += 1;
+            if live && matches!(packet_count, 1 | 10 | 100) {
+                warning!(
+                    "hls_live diagnostic: before packet {packet_count}, stream {}, dts {:?}, pts {:?}, key {}",
+                    stream.index(),
+                    packet.dts(),
+                    packet.pts(),
+                    packet.is_key()
+                );
+            }
+        }
         if should_stop() {
             stopped = true;
             break;
@@ -463,6 +478,11 @@ where
             packet
                 .write_interleaved(&mut octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
+
+            #[cfg(any(test, feature = "pg_test"))]
+            if live && matches!(packet_count, 1 | 10 | 100) {
+                warning!("hls_live diagnostic: after packet {packet_count}");
+            }
 
             while let Some(segment) = output_state.completed_segments.pop_front() {
                 on_segment(segment);
