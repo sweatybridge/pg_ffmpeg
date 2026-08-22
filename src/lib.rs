@@ -82,6 +82,23 @@ mod tests {
     fn test_extension_loads() {
         // Extension loaded successfully if we get here.
     }
+
+    #[pg_test]
+    fn test_hls_live_is_continuous_procedure_keyed_by_url() {
+        let matches_contract = Spi::get_one::<bool>(
+            "SELECT p.prokind = 'p' \
+                    AND p.pronargs = 4 \
+                    AND p.proargnames[1] = 'url' \
+                    AND NOT ('capture_duration' = ANY(p.proargnames)) \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'ffmpeg' AND p.proname = 'hls_live'",
+        )
+        .unwrap()
+        .unwrap_or(false);
+
+        assert!(matches_contract);
+    }
 }
 
 #[cfg(test)]
