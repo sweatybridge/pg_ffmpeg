@@ -162,6 +162,7 @@ SELECT ffmpeg.hls('https://example.com/video.mp4', segment_duration => 6);
 
 -- Capture ten seconds from a live input. For RTP dynamic payload types,
 -- point this at a local SDP file that describes the codec and port.
+-- Still-image inputs are rejected; use ffmpeg.hls() for those.
 SELECT ffmpeg.hls_live(
   'file:///etc/pg_ffmpeg/r1-img.sdp',
   capture_duration => 10.0,

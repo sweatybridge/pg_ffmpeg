@@ -62,6 +62,7 @@ impl LiveInput {
             .unwrap();
             let mut options: *mut AVDictionary = ptr::null_mut();
             if av_dict_set(&mut options, key.as_ptr(), value.as_ptr(), 0) < 0 {
+                av_dict_free(&mut options);
                 avformat_close_input(&mut ps);
                 error!("failed to configure live input protocols");
             }
@@ -478,8 +479,12 @@ fn hls_live(
     ffmpeg_next::init().unwrap();
     ffmpeg_next::format::network::init();
 
-    let playlist_id = create_playlist(segment_duration);
     let mut ictx = LiveInput::open(url, capture_duration);
+    if is_still_image_input(&ictx) {
+        error!("hls_live does not support still-image inputs; use ffmpeg.hls instead");
+    }
+
+    let playlist_id = create_playlist(segment_duration);
     let deadline = ictx.deadline();
     remux_hls(&mut ictx, playlist_id, segment_duration, Some(deadline))
 }
@@ -840,6 +845,19 @@ mod tests {
     #[should_panic(expected = "capture_duration must be finite and greater than 0")]
     fn test_hls_live_rejects_non_positive_duration() {
         hls_live("udp://127.0.0.1:5001", 0.0, 1);
+    }
+
+    #[pg_test]
+    #[should_panic(
+        expected = "hls_live does not support still-image inputs; use ffmpeg.hls instead"
+    )]
+    fn test_hls_live_rejects_still_image_input() {
+        let img = crate::test_utils::generate_test_image_bytes("png", 32, 32);
+        let tmp = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        std::fs::write(tmp.path(), img).unwrap();
+
+        let url = format!("file://{}", tmp.path().display());
+        hls_live(&url, 1.0, 1);
     }
 }
 
