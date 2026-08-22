@@ -417,9 +417,7 @@ where
     opts.set("hls_time", &segment_duration.to_string());
     opts.set("hls_segment_filename", "seg%03d.ts");
     opts.set("hls_list_size", "0");
-    if live {
-        opts.set("hls_flags", "split_by_time");
-    } else {
+    if !live {
         opts.set("hls_playlist_type", "vod");
     }
 
@@ -437,22 +435,7 @@ where
     // The FFmpeg callback only moves completed bytes into a Rust queue. Database
     // writes happen here, after control has returned from the C callback.
     let mut stopped = false;
-    #[cfg(any(test, feature = "pg_test"))]
-    let mut packet_count = 0_u64;
     for (stream, mut packet) in ictx.packets() {
-        #[cfg(any(test, feature = "pg_test"))]
-        {
-            packet_count += 1;
-            if live && matches!(packet_count, 1 | 10 | 100) {
-                warning!(
-                    "hls_live diagnostic: before packet {packet_count}, stream {}, dts {:?}, pts {:?}, key {}",
-                    stream.index(),
-                    packet.dts(),
-                    packet.pts(),
-                    packet.is_key()
-                );
-            }
-        }
         if should_stop() {
             stopped = true;
             break;
@@ -478,11 +461,6 @@ where
             packet
                 .write_interleaved(&mut octx)
                 .unwrap_or_else(|e| error!("failed to write packet: {e}"));
-
-            #[cfg(any(test, feature = "pg_test"))]
-            if live && matches!(packet_count, 1 | 10 | 100) {
-                warning!("hls_live diagnostic: after packet {packet_count}");
-            }
 
             while let Some(segment) = output_state.completed_segments.pop_front() {
                 on_segment(segment);
@@ -782,12 +760,10 @@ pub(crate) fn generate_video(
     encoder.set_time_base((1, fps));
 
     let mut encoder = encoder.open().expect("failed to open encoder");
-    let out_time_base = {
-        stream.set_parameters(&encoder);
-        stream.time_base()
-    };
+    stream.set_parameters(&encoder);
 
     octx.write_header().expect("failed to write header");
+    let out_time_base = octx.stream(0).unwrap().time_base();
 
     let mut packet = ffmpeg_next::Packet::empty();
 
