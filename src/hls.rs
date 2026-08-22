@@ -535,52 +535,24 @@ impl Drop for NonAtomicSpi {
     }
 }
 
-struct LiveLock(i64);
-
-impl LiveLock {
-    fn acquire(url: &str) -> Self {
-        let key = url
-            .as_bytes()
-            .iter()
-            .fold(0xcbf29ce484222325_u64, |hash, byte| {
-                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-            }) as i64;
-        let acquired = unsafe {
-            pgrx::direct_function_call::<bool>(
-                pg_sys::pg_try_advisory_lock_int8,
-                &[key.into_datum()],
-            )
-        }
-        .unwrap_or(false);
-        if !acquired {
-            error!("hls_live is already running for this url");
-        }
-        Self(key)
-    }
-}
-
-impl Drop for LiveLock {
-    fn drop(&mut self) {
-        unsafe {
-            pgrx::direct_function_call::<bool>(
-                pg_sys::pg_advisory_unlock_int8,
-                &[self.0.into_datum()],
-            )
-        };
-    }
-}
-
 fn claim_live_playlist(url: &str, segment_duration: i32) -> (i64, i32) {
     let playlist_id = Spi::connect_mut(|client| {
         client
             .update(
                 "INSERT INTO ffmpeg.hls_playlists \
-                    (source_url, target_duration, stop_requested) \
-                 VALUES ($1, $2, false) \
+                    (source_url, target_duration, stop_requested, owner_pid) \
+                 VALUES ($1, $2, false, pg_backend_pid()) \
                  ON CONFLICT (source_url) DO UPDATE SET \
                     target_duration = EXCLUDED.target_duration, \
                     stop_requested = false, \
+                    owner_pid = pg_backend_pid(), \
                     updated_at = clock_timestamp() \
+                 WHERE hls_playlists.owner_pid IS NULL \
+                    OR hls_playlists.owner_pid = pg_backend_pid() \
+                    OR NOT EXISTS ( \
+                        SELECT 1 FROM pg_stat_activity a \
+                        WHERE a.pid = hls_playlists.owner_pid AND a.state = 'active' \
+                    ) \
                  RETURNING id",
                 None,
                 &[
@@ -592,7 +564,7 @@ fn claim_live_playlist(url: &str, segment_duration: i32) -> (i64, i32) {
             .first()
             .get_one::<i64>()
             .unwrap_or_else(|e| error!("failed to read live playlist id: {e}"))
-            .unwrap_or_else(|| error!("live playlist id was null"))
+            .unwrap_or_else(|| error!("hls_live is already running for this url"))
     });
 
     let first_segment_index = Spi::connect(|client| {
@@ -611,6 +583,19 @@ fn claim_live_playlist(url: &str, segment_duration: i32) -> (i64, i32) {
     });
 
     (playlist_id, first_segment_index)
+}
+
+fn release_live_playlist(playlist_id: i64) {
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "UPDATE ffmpeg.hls_playlists SET owner_pid = NULL, updated_at = clock_timestamp() \
+                 WHERE id = $1 AND owner_pid = pg_backend_pid()",
+                None,
+                &[pgrx::datum::DatumWithOid::from(playlist_id)],
+            )
+            .unwrap_or_else(|e| error!("failed to release live playlist: {e}"));
+    });
 }
 
 fn live_stop_requested(url: &str) -> bool {
@@ -668,15 +653,14 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
     ffmpeg_next::init().unwrap();
     ffmpeg_next::format::network::init();
 
+    let spi = NonAtomicSpi::connect();
+    let (playlist_id, first_segment_index) = claim_live_playlist(&url, segment_duration);
+    spi.commit_and_chain();
+
     let mut ictx = LiveInput::open(&url, stall_timeout);
     if is_still_image_input(&ictx) {
         error!("hls_live does not support still-image inputs; use ffmpeg.hls instead");
     }
-
-    let spi = NonAtomicSpi::connect();
-    let _live_lock = LiveLock::acquire(&url);
-    let (playlist_id, first_segment_index) = claim_live_playlist(&url, segment_duration);
-    spi.commit_and_chain();
 
     ictx.reset_stall_deadline();
     let deadline = ictx.deadline_ptr();
@@ -702,6 +686,9 @@ fn hls_live(url: &str, segment_duration: default!(i32, 6), stall_timeout: defaul
             live_stop_requested(&url)
         },
     );
+
+    release_live_playlist(playlist_id);
+    spi.commit_and_chain();
 
     if !stopped {
         error!("live input ended or stalled");

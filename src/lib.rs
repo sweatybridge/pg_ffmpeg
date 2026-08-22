@@ -58,6 +58,7 @@ CREATE TABLE hls_playlists (
     source_url         text UNIQUE,
     target_duration    int NOT NULL DEFAULT 0,
     stop_requested     bool NOT NULL DEFAULT false,
+    owner_pid          int,
     updated_at         timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
