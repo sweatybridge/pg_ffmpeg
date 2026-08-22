@@ -174,6 +174,11 @@ CALL ffmpeg.hls_live(
 -- From another session:
 SELECT ffmpeg.hls_live_stop('file:///etc/pg_ffmpeg/r1-img.sdp');
 
+-- hls_live runs in the caller's backend and does not start a worker. The URL is
+-- the stable stream key: retries reuse its playlist and continue the segment index.
+-- An unexpected end or stall_timeout raises an error so a durable caller can
+-- retry. Segment retention is caller-owned; this procedure never deletes rows.
+
 -- Render a waveform image
 SELECT ffmpeg.waveform(pg_read_binary_file('/path/to/audio.aac'), width => 1200, height => 300);
 

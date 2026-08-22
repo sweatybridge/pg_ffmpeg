@@ -1101,7 +1101,7 @@ mod tests {
         let database = Spi::get_one::<String>("SELECT current_database()")
             .unwrap()
             .unwrap();
-        let user = Spi::get_one::<String>("SELECT current_user")
+        let user = Spi::get_one::<String>("SELECT current_user::text")
             .unwrap()
             .unwrap();
         let postgres_port = unsafe { pg_sys::PostPortNumber };
