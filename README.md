@@ -15,6 +15,8 @@ All functions are in the `ffmpeg` schema.
 | `trim(data bytea, start_time float8 DEFAULT 0.0, end_time float8 DEFAULT NULL, precise bool DEFAULT false) -> bytea` | Trim media with either keyframe-aligned stream copy or frame-accurate re-encode |
 | `extract_frames(data bytea, interval float8 DEFAULT 1.0, format text DEFAULT 'png', keyframes_only bool DEFAULT false, max_frames int DEFAULT 1000) -> TABLE(timestamp float8, frame bytea)` | Extract bounded frame sets as PNG or JPEG rows |
 | `hls(url text, segment_duration int DEFAULT 6) -> bigint` | Fetch a video via URL, split into HLS segments, and store in `ffmpeg.hls_playlists` / `ffmpeg.hls_segments` |
+| `CALL hls_live(url text, segment_duration int DEFAULT 6, stall_timeout float8 DEFAULT 10.0)` | Continuously remux one stable stream URL, committing each completed HLS segment while keeping the FFmpeg connection open |
+| `hls_live_stop(url text) -> bool` | Request that the live procedure identified by URL stop |
 | `generate_gif(data bytea, start_time float8 DEFAULT 0.0, duration float8 DEFAULT 5.0, width int DEFAULT NULL, fps int DEFAULT 10, format text DEFAULT 'gif') -> bytea` | Generate animated GIF, APNG, or WebP preview output from video |
 | `waveform(data bytea, width int DEFAULT 800, height int DEFAULT 200, format text DEFAULT 'png', mode text DEFAULT 'waveform') -> bytea` | Render audio waveform or spectrum images |
 | `extract_subtitles(data bytea, format text DEFAULT 'srt', stream_index int DEFAULT NULL) -> text` | Extract supported text subtitles as SRT, ASS, or WebVTT |
@@ -158,6 +160,24 @@ FROM ffmpeg.extract_frames(
 
 -- Split a remote video into HLS segments
 SELECT ffmpeg.hls('https://example.com/video.mp4', segment_duration => 6);
+
+-- Continuously capture a stable live URL. CALL must be top-level (not inside
+-- an explicit transaction) because every completed segment is committed and
+-- becomes visible while the same FFmpeg connection remains open. For RTP
+-- dynamic payload types, the URL can point at a local SDP file.
+CALL ffmpeg.hls_live(
+  url => 'file:///etc/pg_ffmpeg/r1-img.sdp',
+  segment_duration => 2,
+  stall_timeout => 10.0
+);
+
+-- From another session:
+SELECT ffmpeg.hls_live_stop('file:///etc/pg_ffmpeg/r1-img.sdp');
+
+-- hls_live runs in the caller's backend and does not start a worker. The URL is
+-- the stable stream key: retries reuse its playlist and continue the segment index.
+-- An unexpected end or stall_timeout raises an error so a durable caller can
+-- retry. Segment retention is caller-owned; this procedure never deletes rows.
 
 -- Render a waveform image
 SELECT ffmpeg.waveform(pg_read_binary_file('/path/to/audio.aac'), width => 1200, height => 300);
