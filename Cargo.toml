@@ -20,7 +20,7 @@ pg_bench = ["tempfile", "dep:pgrx-bench"]
 hwaccel_tests = []
 
 [dependencies]
-ffmpeg-next = "8"
+ffmpeg-next = "9"
 pgrx = "0.19.2"
 pgrx-bench = { version = "0.19.2", optional = true }
 serde_json = "1"
