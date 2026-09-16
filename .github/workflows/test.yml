@@ -28,30 +28,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config \
-            libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
-            libreadline-dev
-
-      - name: Install cargo-pgrx
-        run: cargo install --locked cargo-pgrx
-
-      - name: Initialize pgrx
-        run: |
-          set +e
-          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
-          if [ $? -ne 0 ]; then
-            cargo pgrx init --pg${{ matrix.pg_version }} download
-          fi
+      - name: Setup pgrx
+        uses: ./.github/actions/setup-pgrx-test
+        with:
+          pg_version: ${{ matrix.pg_version }}
 
       - name: Clippy
         run: cargo clippy --all-targets --features pg${{ matrix.pg_version }} --no-default-features -- -D warnings
@@ -75,30 +55,10 @@ jobs:
           cache-key: pg${{ matrix.pg_version }}-bench-ffmpeg8
           cache-directories: /home/runner/.pgrx
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config \
-            libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
-            libreadline-dev
-
-      - name: Install cargo-pgrx
-        run: cargo install --locked cargo-pgrx
-
-      - name: Initialize pgrx
-        run: |
-          set +e
-          v=$(cargo pgrx info version pg${{ matrix.pg_version }})
-          if [ $? -ne 0 ]; then
-            cargo pgrx init --pg${{ matrix.pg_version }} download
-          fi
+      - name: Setup pgrx
+        uses: ./.github/actions/setup-pgrx-test
+        with:
+          pg_version: ${{ matrix.pg_version }}
 
       - name: Bench
         run: cargo pgrx bench "pg${{ matrix.pg_version }}"
@@ -120,30 +80,10 @@ jobs:
           components: clippy, rustfmt
           cache-key: pg16-hwaccel-ffmpeg8
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config \
-            libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
-            libreadline-dev
-
-      - name: Install cargo-pgrx
-        run: cargo install --locked cargo-pgrx
-
-      - name: Initialize pgrx
-        run: |
-          set +e
-          v=$(cargo pgrx info version pg16)
-          if [ $? -ne 0 ]; then
-            cargo pgrx init --pg16 download
-          fi
+      - name: Setup pgrx
+        uses: ./.github/actions/setup-pgrx-test
+        with:
+          pg_version: '18'
 
       - name: HW acceleration tests
         run: cargo pgrx test pg16 --features hwaccel_tests
