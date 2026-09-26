@@ -36,3 +36,5 @@ runs:
         if [ $? -ne 0 ]; then
           cargo pgrx init --pg${{ inputs.pg_version }} download
         fi
+        set -e
+        echo "$(dirname "$(cargo pgrx info pg-config pg${{ inputs.pg_version }})")" >> "$GITHUB_PATH"
