@@ -76,8 +76,80 @@ jobs:
           name: pg-ffmpeg-pg${{ matrix.pg_version }}-${{ matrix.debian }}-${{ matrix.runner }}
           path: "*.deb"
 
+  build-ubuntu:
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: [16, 17, 18]
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-key: deb-pg${{ matrix.pg_version }}-${{ matrix.runner }}-ffmpeg8
+          cache-directories: /home/runner/.pgrx
+
+      - name: Setup pgrx
+        uses: ./.github/actions/setup-pgrx-test
+        with:
+          pg_version: ${{ matrix.pg_version }}
+
+      - name: Build extension
+        run: |
+          . "$HOME/.cargo/env"
+          cargo pgrx package \
+            --features "pg${{ matrix.pg_version }}" \
+            --no-default-features
+
+      - name: Create Debian package
+        run: |
+          . "$HOME/.cargo/env"
+          PKG_VERSION=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          PG_VERSION=${{ matrix.pg_version }}
+          DEBIAN_CODENAME=jammy
+          ARCH=$(dpkg --print-architecture)
+          PKG_NAME="pg-ffmpeg-pg${PG_VERSION}"
+          PKG_DIR="${PKG_NAME}_${PKG_VERSION}-1~${DEBIAN_CODENAME}_${ARCH}"
+
+          # cargo pgrx package outputs to target/release/pg_ffmpeg-pg$VER/
+          SRC_DIR="target/release/pg_ffmpeg-pg${PG_VERSION}"
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          cp -a "${SRC_DIR}/." "${PKG_DIR}/"
+
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: ${PKG_NAME}
+          Version: ${PKG_VERSION}-1
+          Section: database
+          Priority: optional
+          Architecture: ${ARCH}
+          Depends: postgresql-${PG_VERSION}, libavcodec62 | libavcodec61 | libavcodec60 | libavcodec59 | libavcodec58, libavformat62 | libavformat61 | libavformat60 | libavformat59 | libavformat58, libavutil60 | libavutil59 | libavutil58 | libavutil57 | libavutil56, libswscale9 | libswscale8 | libswscale7 | libswscale6 | libswscale5, libswresample6 | libswresample5 | libswresample4 | libswresample3, libavfilter11 | libavfilter10 | libavfilter9 | libavfilter8 | libavfilter7, libavdevice62 | libavdevice61 | libavdevice60 | libavdevice59 | libavdevice58
+          Maintainer: pg_ffmpeg contributors
+          Description: FFmpeg media processing functions for PostgreSQL
+           pg_ffmpeg provides PostgreSQL functions for media processing
+           using FFmpeg, including media info extraction, thumbnail
+           generation, transcoding, audio extraction, and HLS support.
+          EOF
+
+          # Remove leading spaces from control file
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+
+          dpkg-deb --build "${PKG_DIR}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pg-ffmpeg-pg${{ matrix.pg_version }}-jammy-${{ matrix.runner }}
+          path: "*.deb"
+
   release:
-    needs: build
+    needs: [build, build-ubuntu]
     runs-on: ubuntu-latest
     permissions:
       contents: write
